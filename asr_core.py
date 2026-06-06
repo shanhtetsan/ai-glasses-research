@@ -53,7 +53,8 @@ def _extract_sentence(event_obj: Any) -> Tuple[Optional[str], Optional[bool]]:
             return obj.get("text"), None
     return None, None
 
-# ====== 仅热词触发的“全清零复位”配置 ======
+# ====== 仅热词触发的"全清零复位"配置 ======
+# ====== Configuration for "full reset" triggered only by hotwords ======
 INTERRUPT_KEYWORDS = set(
     os.getenv("INTERRUPT_KEYWORDS", "停下,别说了,停止").split(",")
 )
@@ -67,7 +68,17 @@ def _normalize_cn(s: str) -> str:
         s = (s or "").strip().lower()
     return s
 
+def has_hotword(text: str) -> bool:
+    t = _normalize_cn(text)
+    if not t:
+        return False
+    for w in INTERRUPT_KEYWORDS:
+        if w and _normalize_cn(w) in t:
+            return True
+    return False
+
 # ============ ASR 全局总闸 ============
+# ============ ASR global master switch ============
 _current_recognition: Optional[object] = None
 _rec_lock = asyncio.Lock()
 
@@ -84,16 +95,22 @@ async def stop_current_recognition():
     if r:
         try:
             r.stop()  # DashScope SDK 的实时识别停止
+            # Stop the DashScope SDK real-time recognition
         except Exception:
             pass
 
 # ============ ASR 回调 ============
+# ============ ASR callback ============
 class ASRCallback:
     """
     设计目标：
-    1) “停下 / 别说了 …”等热词一出现 → 立刻全清零复位（恢复到刚启动后的状态）。
+    Design goals:
+    1) "停下 / 别说了 …"等热词一出现 → 立刻全清零复位（恢复到刚启动后的状态）。
+    1) When hotwords like "stop / be quiet" appear → immediately full reset (restore to just-started state).
     2) 除此之外【不接受打断】；AI 正在播报时，用户说话只做展示，不触发新一轮。
+    2) Otherwise, NO interruptions accepted; when AI is speaking, user speech is only displayed, does not trigger a new round.
     3) 不再用 partial 叠加字符串；partial 只用于 UI 临时展示；只有 final sentence 用于驱动 AI。
+    3) No longer accumulates partial strings; partial is only for temporary UI display; only final sentences drive the AI.
     """
 
     def __init__(
@@ -109,9 +126,10 @@ class ASRCallback:
     ):
         self._on_sdk_error = on_sdk_error
         self._post = post
-        self._last_partial_for_ui: str = ""   # 只用于 UI 展示
-        self._last_final_text: str = ""       # 以句末 final 为准
+        self._last_partial_for_ui: str = ""   # 只用于 UI 展示 / only for UI display
+        self._last_final_text: str = ""       # 以句末 final 为准 / based on sentence-end final
         self._hot_interrupted: bool = False   # 本句是否因热词触发过复位（防抖）
+        # whether this sentence has triggered a reset via hotword (debounce)
 
         self._ui_partial = ui_broadcast_partial
         self._ui_final   = ui_broadcast_final
@@ -158,6 +176,7 @@ class ASRCallback:
             return
 
         # ---------- ① 热词优先：命中就全清零并短路，绝不送 LLM ----------
+        # ---------- ① Hotword first: if matched, full reset and short-circuit, never send to LLM ----------
         if not self._hot_interrupted and self._has_hotword(text):
             self._hot_interrupted = True
 
@@ -172,6 +191,7 @@ class ASRCallback:
             return
 
         # ---------- ② partial：仅用于 UI 展示 ----------
+        # ---------- ② partial: for UI display only ----------
         self._last_partial_for_ui = text
         try:
             print(f"[ASR PARTIAL] len={len(text)} text='{_shorten(text)}'", flush=True)
@@ -180,6 +200,7 @@ class ASRCallback:
             pass
 
         # ---------- ③ final：仅 final 驱动 LLM（若未在播报） ----------
+        # ---------- ③ final: only final sentences drive the LLM (if not currently playing) ----------
         if is_end is True:
             final_text = text
             try:
@@ -199,6 +220,7 @@ class ASRCallback:
                     pass
 
             # 复位进入下一句
+            # Reset for the next sentence
             self._last_partial_for_ui = ""
             self._last_final_text = ""
             self._hot_interrupted = False

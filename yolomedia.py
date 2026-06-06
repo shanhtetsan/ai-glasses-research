@@ -20,11 +20,24 @@ import math
 import cv2
 import numpy as np
 import mediapipe as mp
-from mediapipe.framework.formats import landmark_pb2
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Colors
+try:
+    from mediapipe.framework.formats import landmark_pb2
+except Exception:
+    landmark_pb2 = None  # type: ignore
+
+try:
+    from ultralytics import YOLO
+    from ultralytics.utils.plotting import Colors
+except ImportError:
+    YOLO = Colors = None  # type: ignore
+
 import bridge_io
-import pygame  # 用于播放本地音频文件
+try:
+    import pygame  # 用于播放本地音频文件
+    _PYGAME_OK = True
+except ImportError:
+    pygame = None  # type: ignore
+    _PYGAME_OK = False
 
 from audio_player import play_audio_threadsafe
 PERF_DEBUG = False        # 打印调试信息（False 关闭）
@@ -156,17 +169,26 @@ AUDIO_FILES = {
 GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
 
 # 初始化pygame音频
-pygame.mixer.init()
+try:
+    if _PYGAME_OK:
+        pygame.mixer.init()
+except Exception:
+    pass
 
 # ========= 窗口 =========
 WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
 
 # ======== MediaPipe 别名 ========
-BaseOptions           = mp.tasks.BaseOptions
-VisionRunningMode     = mp.tasks.vision.RunningMode
-HandLandmarker        = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-HAND_CONNECTIONS      = mp.solutions.hands.HAND_CONNECTIONS
+try:
+    BaseOptions           = mp.tasks.BaseOptions
+    VisionRunningMode     = mp.tasks.vision.RunningMode
+    HandLandmarker        = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    HAND_CONNECTIONS      = mp.solutions.hands.HAND_CONNECTIONS
+    _MP_TASKS_OK = True
+except Exception:
+    BaseOptions = VisionRunningMode = HandLandmarker = HandLandmarkerOptions = HAND_CONNECTIONS = None  # type: ignore
+    _MP_TASKS_OK = False
 
 # ======== HandLandmarker 回调缓存 ========
 _last_result = None  # (result, timestamp_ms)
