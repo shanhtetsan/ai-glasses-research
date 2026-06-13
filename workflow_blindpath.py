@@ -1625,7 +1625,7 @@ class BlindPathNavigator:
         elif step['type'] == 'forward_pass':
             # Simplified: advance to next step immediately
             self.avoidance_step_index += 1
-            return "Walk forward a few steps past the obstacle, then say ‘done’."
+            return "Walk forward a few steps past the obstacle, then say 'done'."
             
         elif step['type'] == 'sidestep_return':
             direction = step['direction']

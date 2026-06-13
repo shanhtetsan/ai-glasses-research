@@ -473,10 +473,10 @@ class CrossStreetNavigator:
         return float(angle), float(offset)
 
     def _draw_line_vertical_angle(self, image, center, angle_deg, length_ratio=0.7, color=(255, 255, 0), thickness=3):
-        “””
+        """
         Uses vertical direction as the 0° reference; angle_deg>0 means left tilt, <0 means right tilt.
         Draws a line passing through center.
-        “””
+        """
         H, W = image.shape[:2]
         half_len = int(0.5 * length_ratio * min(H, W))
         rad = np.radians(angle_deg)
@@ -515,13 +515,13 @@ class CrossStreetNavigator:
             s += (dash + gap)
 
     def _offset_from_centerline(self, center_pt, angle_vertical_deg, width, height, y_ratio=0.75) -> float:
-        “””
+        """
         Compute left/right offset based on the cyan normal centerline:
         - angle_vertical_deg: angle with vertical=0° (same coordinate system as _draw_line_vertical_angle)
         - center_pt: mask centroid (cx, cy)
         - y_ratio: lookahead row height as a fraction of image height, default 0.75 (more stable lower down)
         Returns: normalised offset (positive=right, negative=left), consistent with original offset convention.
-        “””
+        """
         if center_pt is None:
             return 0.0
         x0, y0 = center_pt

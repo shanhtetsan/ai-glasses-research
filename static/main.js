@@ -342,7 +342,7 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
         background-image: none !important;
       }
       /* fallback: clear any inline dashed/dotted styles */
-      [style*=”dashed”], [style*=”dotted”] {
+      [style*="dashed"], [style*="dotted"] {
         border-style: none !important;
         outline: none !important;
       }

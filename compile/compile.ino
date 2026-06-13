@@ -16,8 +16,8 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "YOUR_WIFI_SSID";
-const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID   = "PromisingGuys";
+const char* WIFI_PASS   = "aloekanal2026";
 const char* SERVER_HOST = "192.168.12.157";
 const uint16_t SERVER_PORT = 8081;
 

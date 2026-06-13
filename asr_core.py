@@ -53,7 +53,7 @@ def _extract_sentence(event_obj: Any) -> Tuple[Optional[str], Optional[bool]]:
             return obj.get("text"), None
     return None, None
 
-# ====== “Full reset” configuration triggered only by hotwords ======
+# ====== "Full reset" configuration triggered only by hotwords ======
 INTERRUPT_KEYWORDS = set(
     os.getenv("INTERRUPT_KEYWORDS", "停下,别说了,停止").split(",")
 )
@@ -89,12 +89,12 @@ async def stop_current_recognition():
 
 # ============ ASR callback ============
 class ASRCallback:
-    “””
+    """
     Design goals:
-    1) Any hotword (“stop”, “shut up”, etc.) → immediately full-reset (restore state to just-launched).
+    1) Any hotword ("stop", "shut up", etc.) → immediately full-reset (restore state to just-launched).
     2) Outside of hotwords, no interruption: while AI is speaking, user input is shown in the UI but does not trigger a new round.
     3) No more partial string concatenation — partials are for UI only; only final sentences drive the AI.
-    “””
+    """
 
     def __init__(
         self,

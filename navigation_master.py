@@ -58,12 +58,12 @@ class MajorityFilter:
 
 # ========== Traffic light detection ==========
 class TrafficLightDetector:
-    “””
+    """
     Traffic light detector:
     1) Prefers yoloe_backend-style detection (if available).
     2) Fallback: uses HSV colour heuristics on the upper half of the frame to find bright red/yellow/green blobs.
     Output: ('red'|'green'|'yellow'|'unknown', meta)
-    “””
+    """
     def __init__(self):
         self.has_backend = False
         self.backend = None
@@ -77,13 +77,13 @@ class TrafficLightDetector:
             self.backend = None
 
     def _try_backend(self, bgr: np.ndarray) -> Tuple[str, Dict[str, Any]]:
-        “””
+        """
         Attempt to call the yoloe_backend-style interface with lenient dispatch:
         - First tries backend.detect(image, target_classes=['traffic light'])
         - Falls back to backend.infer_image(image) and filters for 'traffic light'
         - Returns 'unknown' if both fail.
         Expected result entries should contain a bbox or mask; extend colour classification logic as needed.
-        “””
+        """
         if not self.has_backend or self.backend is None:
             return "unknown", {"reason": "backend_not_available"}
 
@@ -135,9 +135,9 @@ class TrafficLightDetector:
         return color, {"bbox": best, "count": len(res), "boxes": boxes}
 
     def _classify_color_hsv(self, roi_bgr: np.ndarray) -> str:
-        “””Simple HSV threshold-based red/yellow/green classification on the ROI; picks the dominant colour by area.”””
+        """Simple HSV threshold-based red/yellow/green classification on the ROI; picks the dominant colour by area."""
         if roi_bgr is None or roi_bgr.size == 0:
-            return “unknown”
+            return "unknown"
         hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
 
         # Red range (two segments)
@@ -173,14 +173,14 @@ class TrafficLightDetector:
         return candidates[0][0]
 
     def detect(self, bgr: np.ndarray) -> Tuple[str, Dict[str, Any]]:
-        “””
+        """
         Main entry: try backend first; fall back to upper-half HSV blob detection (no bounding box required).
-        “””
+        """
         # 1) Try backend
         if self.has_backend:
             color, meta = self._try_backend(bgr)
-            if color != “unknown”:
-                return color, {“method”: “backend”, **meta}
+            if color != "unknown":
+                return color, {"method": "backend", **meta}
 
         # 2) Fallback: upper half HSV clustering + connected components, find largest blob
         H, W = bgr.shape[:2]
@@ -193,7 +193,7 @@ class TrafficLightDetector:
 
         # Rough color classification
         col = self._classify_color_hsv(roi)
-        return col, {“method”: “fallback”, “note”: “no_backend”, “bright_ratio”: float(np.mean(bright > 0))}
+        return col, {"method": "fallback", "note": "no_backend", "bright_ratio": float(np.mean(bright > 0))}
 
 # ========== Visual utilities ==========
 def _color_bgr(name: str) -> Tuple[int, int, int]:
