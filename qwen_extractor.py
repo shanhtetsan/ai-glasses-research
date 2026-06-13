@@ -4,7 +4,7 @@ from typing import List, Tuple
 import os
 from openai import OpenAI
 
-# —— 本地优先映射（可随时扩充/改名）——
+# Local-first mapping (can be extended or renamed at any time)
 LOCAL_CN2EN = {
     "红牛": "Red_Bull",
     "ad钙奶": "AD_milk",
@@ -18,9 +18,9 @@ LOCAL_CN2EN = {
 }
 
 def _make_client() -> OpenAI:
-    # 复用你百炼兼容端点；支持从环境变量读取
+    # Reuse DashScope-compatible endpoint; supports env var override
     base_url = os.getenv("DASHSCOPE_COMPAT_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    api_key  = "sk-a9440db694924559ae4ebdc2023d2b9a"
+    api_key  = "YOUR_DASHSCOPE_API_KEY"
     return OpenAI(api_key=api_key, base_url=base_url)
 
 PROMPT_SYS = (
@@ -32,18 +32,18 @@ PROMPT_SYS = (
 
 def extract_english_label(query_cn: str) -> Tuple[str, str]:
     """
-    返回 (label_en, source)；source ∈ {'local', 'qwen', 'fallback'}
+    Returns (label_en, source); source ∈ {'local', 'qwen', 'fallback'}
     """
     q = (query_cn or "").strip().lower()
     if q in LOCAL_CN2EN:
         return LOCAL_CN2EN[q], "local"
 
-    # 简单规则：去掉前缀修饰词
+    # Simple rule: strip prefix modifiers
     for k, v in LOCAL_CN2EN.items():
         if k in q:
             return v, "local"
 
-    # 调用 Qwen Turbo（兼容 Chat Completions）
+    # Call Qwen Turbo (Chat Completions compatible)
     try:
         client = _make_client()
         msgs = [
@@ -56,9 +56,9 @@ def extract_english_label(query_cn: str) -> Tuple[str, str]:
             stream=False
         )
         label = (rsp.choices[0].message.content or "").strip()
-        # 清洗一下
+        # Clean up the result
         label = label.replace(".", "").replace(",", "").replace("  ", " ").strip()
-        # 兜底：空就回 'bottle'
+        # Fallback: return 'bottle' if empty
         return (label or "bottle"), "qwen"
     except Exception:
         return "bottle", "fallback"

@@ -1,5 +1,5 @@
 // ===== all_in_one_merged.ino — XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (ICM42688 SPI) =====
-// ===== 版本: v2.4-SPIIMU - ICM42688 改为 SPI，避开 I2S 干扰；WAV chunked 播放保持 =====
+
 
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -12,13 +12,13 @@ struct WavFmt;
 #include <cstring>      // memcmp
 #include <WiFiUdp.h>
 #include <WiFiClient.h> 
-#include <SPI.h>        // <<< 改成 SPI
+#include <Wire.h>
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "aiglass";
-const char* WIFI_PASS   = "xu137227";
-const char* SERVER_HOST = "47.100.161.139";
+const char* WIFI_SSID   = "YOUR_WIFI_SSID";
+const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
+const char* SERVER_HOST = "192.168.12.157";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -31,14 +31,14 @@ static const char* AUD_WS_PATH = "/ws_audio";
 framesize_t g_frame_size = FRAMESIZE_VGA;
 #define JPEG_QUALITY  17
 #define FB_COUNT      2
-volatile int g_target_fps = 0; // 新增：0=不限，>0 则按该FPS限速发送
+volatile int g_target_fps = 0;
 
-// 【新增】视频传输性能监控
-volatile unsigned long frame_captured_count = 0;  // 采集帧计数
-volatile unsigned long frame_sent_count = 0;      // 发送帧计数
-volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
-volatile unsigned long last_stats_time = 0;       // 上次统计时间
-volatile unsigned long ws_send_fail_count = 0;    // WebSocket发送失败计数
+
+volatile unsigned long frame_captured_count = 0;  
+volatile unsigned long frame_sent_count = 0;      
+volatile unsigned long frame_dropped_count = 0;   
+volatile unsigned long last_stats_time = 0;       
+volatile unsigned long ws_send_fail_count = 0;  
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -54,13 +54,12 @@ const int AUDIO_QUEUE_DEPTH = 10;
 #define I2S_SPK_DIN  9
 const int TTS_RATE = 16000;
 
-// ===== IMU (ICM42688 over SPI) / UDP =====
-// 使用 D0~D3 作为 SPI
-#define IMU_SPI_SCK   1   // D0
-#define IMU_SPI_MOSI  2   // D1
-#define IMU_SPI_MISO  3   // D2
-#define IMU_SPI_CS    4   // D3
-const char* UDP_HOST  = "47.100.161.139";
+// ===== IMU (MPU-6050 over I2C) / UDP =====
+// Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
+// Change these if you wired the GY-521 to different pins.
+#define IMU_I2C_SDA   5   // D4
+#define IMU_I2C_SCL   6   // D5
+const char* UDP_HOST  = "192.168.12.157";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -70,7 +69,7 @@ WebsocketsClient wsCam;
 WebsocketsClient wsAud;
 volatile bool cam_ws_ready = false;
 volatile bool aud_ws_ready = false;
-volatile bool snapshot_in_progress = false; // 抓拍期间暂停实时采集
+volatile bool snapshot_in_progress = false; // Pause live capture during a high-res snapshot
 
 typedef camera_fb_t* fb_ptr_t;
 QueueHandle_t qFrames;
@@ -128,8 +127,8 @@ bool init_camera() {
   sensor_t * s = esp_camera_sensor_get();
   if (s) {
 
-    s->set_hmirror(s, 1);  // ★ 新增：水平镜像，与人眼左右一致（1=开，0=关）
-    s->set_vflip(s, 0);    // ★ 新增：垂直翻转；若镜头“倒装”，改为 1
+    s->set_hmirror(s, 1);  // ★ Horizontal mirror to match natural left/right (1=on, 0=off)
+    s->set_vflip(s, 0);    // ★ Vertical flip; set to 1 if lens is mounted upside-down
 
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
@@ -147,12 +146,12 @@ bool init_camera() {
 inline void enqueue_frame(camera_fb_t* fb) {
   if (!fb) return;
   if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
-    // 队列满，丢弃最旧的帧
+
     fb_ptr_t drop = nullptr;
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
       if (drop) {
         esp_camera_fb_return(drop);
-        frame_dropped_count++;  // 统计丢帧
+        frame_dropped_count++;  
       }
     }
     xQueueSend(qFrames, &fb, 0);
@@ -182,14 +181,14 @@ void taskCamCapture(void*) {
         vTaskDelay(pdMS_TO_TICKS(2));
       }
       
-      // 每5秒打印一次采集统计
+      // Print capture stats every 5s
       unsigned long now = millis();
       if (now - last_log > 5000) {
         int queue_waiting = uxQueueMessagesWaiting(qFrames);
-        Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n", 
+        Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n",
                       frame_captured_count, queue_waiting, capture_fail_count);
         last_log = now;
-        capture_fail_count = 0;  // 重置失败计数
+        capture_fail_count = 0;  // Reset failure count
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(20));
@@ -207,7 +206,7 @@ void taskCamSend(void*) {
     fb_ptr_t fb = nullptr;
     if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
       if (fb && cam_ws_ready) {
-        // 发送节流：若设置了目标FPS，则按周期发，丢弃多余帧由 qFrames 机制承担
+        // Frame-rate throttle: if target FPS is set, pace sends accordingly; extra frames discarded by qFrames
         if (g_target_fps > 0) {
           const int period_ms = 1000 / g_target_fps;
           TickType_t now = xTaskGetTickCount();
@@ -224,7 +223,7 @@ void taskCamSend(void*) {
           frame_sent_count++;
           last_sent_time = millis();
           
-          // 监控发送耗时
+
           if (send_time > 100) {
             Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
           }
@@ -239,7 +238,7 @@ void taskCamSend(void*) {
         
         esp_camera_fb_return(fb);
         
-        // 每5秒打印一次发送统计
+        // Print send stats every 5s
         unsigned long now = millis();
         if (now - last_log > 5000) {
           unsigned long gap = now - last_sent_time;
@@ -252,7 +251,7 @@ void taskCamSend(void*) {
         esp_camera_fb_return(fb); 
       }
     } else {
-      // 队列接收超时，检查是否长时间没有帧
+
       unsigned long now = millis();
       if (cam_ws_ready && last_sent_time > 0 && (now - last_sent_time) > 3000) {
         Serial.printf("[CAM-SEND] WARNING: No frame sent for %lu ms\n", now - last_sent_time);
@@ -339,7 +338,7 @@ static inline void mono16_to_stereo32_msb(const int16_t* in, size_t nSamp, int32
   }
 }
 
-// === chunked 读取辅助 ===
+// === chunked ===
 static bool read_line(WiFiClient& cli, String& line, uint32_t timeout_ms=3000){
   line = "";
   uint32_t t0 = millis();
@@ -460,7 +459,7 @@ static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaini
   }
 }
 
-// ---- HTTP 播放任务
+// ---- HTTP
 static TaskHandle_t taskHttpPlayHandle = nullptr;
 static volatile bool http_play_running = false;
 
@@ -630,7 +629,7 @@ void taskHttpPlay(void*){
 
     static uint32_t current_out_rate = 0;
     if (current_out_rate != sampleRate) {
-      // 重新配置I2S输出采样率以匹配服务端WAV
+
       i2sOut.begin(I2S_MODE_STD, (int)sampleRate, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
       current_out_rate = sampleRate;
       Serial.printf("[I2S OUT] reconfig to %u Hz\n", sampleRate);
@@ -640,7 +639,7 @@ void taskHttpPlay(void*){
       uint8_t inbuf[2048];
       size_t  filled = 0;
 
-      // 根据采样率计算20ms字节数（mono,16bit）
+      // Compute 20ms byte count based on sample rate (mono, 16-bit)
       uint32_t bytes20 = (sampleRate * 2 * 20) / 1000; // 16k=640,12k=480,8k=320
       if (bytes20 < 2) bytes20 = 2;
 
@@ -690,7 +689,7 @@ void stopStreamWav(){
 }
 
 // ====================================================================
-// TTS（二进制分片）保留但默认不启用
+// TTS
 // ====================================================================
 void taskTTSPlay(void*){
   static int32_t stereo32Buf[1024*2];
@@ -733,90 +732,85 @@ void taskTTSPlay(void*){
 inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
 
 // ====================================================================
-// IMU (ICM42688 over SPI) 50Hz via UDP
+// IMU (MPU-6050 over I2C, bare Wire) 50 Hz via UDP
 // ====================================================================
+// No third-party library — avoids the sensor_t typedef collision with
+// esp_camera.h that Adafruit_Sensor.h causes.
 
-// --- ICM42688-P registers (Bank0) ---
-#define REG_WHO_AM_I      0x75  // expect 0x47
-#define REG_BANK_SEL      0x76
-#define REG_PWR_MGMT0     0x4E  // 0x0F => accel+gyro LN
-#define REG_TEMP_H        0x1D  // then ACC(1F..24), GYR(25..2A)
-#define BURST_FIRST       REG_TEMP_H
-#define BURST_COUNT       14
+#define MPU_ADDR          0x68  // I2C address when ADO=LOW (GY-521 default)
+#define MPU_REG_WHO_AM_I  0x75  // read-only ID register; MPU-6050 returns 0x68
+#define MPU_REG_PWR_MGMT1 0x6B  // bit6=SLEEP; write 0x00 to wake the chip
+#define MPU_REG_GYRO_CFG  0x1B  // bits[4:3]=FS_SEL; 0x18 → ±2000 dps
+#define MPU_REG_ACCEL_CFG 0x1C  // bits[4:3]=AFS_SEL; 0x18 → ±16 g
+#define MPU_REG_ACCEL_OUT 0x3B  // first of 14 burst bytes: AX AY AZ TEMP GX GY GZ
 
-// scale (常见默认为 ±16g / ±2000 dps)
-static const float ACC_LSB_PER_G   = 2048.0f;   // 1 g = 2048 LSB
-static const float GYR_LSB_PER_DPS = 16.4f;     // 1 dps = 16.4 LSB
-static const float G               = 9.80665f;
-static const float TEMP_SENS       = 132.48f;   // °C/LSB
-static const float TEMP_OFFSET     = 25.0f;
+// At ±16 g: 2048 LSB per g.  Multiply by (9.80665 / 2048) to get m/s².
+// At ±2000 dps: 16.4 LSB per dps.  Divide by 16.4 to get deg/s.
+static const float MPU_ACCEL_SCALE = 9.80665f / 2048.0f;
+static const float MPU_GYRO_SCALE  = 1.0f / 16.4f;
 
-static inline void imu_cs_low()  { digitalWrite(IMU_SPI_CS, LOW);  }
-static inline void imu_cs_high() { digitalWrite(IMU_SPI_CS, HIGH); }
-
-uint8_t imu_read8(uint8_t reg){
-  imu_cs_low();
-  SPI.transfer(reg | 0x80);
-  uint8_t v = SPI.transfer(0x00);
-  imu_cs_high();
-  return v;
-}
-void imu_write8(uint8_t reg, uint8_t val){
-  imu_cs_low();
-  SPI.transfer(reg & 0x7F);
-  SPI.transfer(val);
-  imu_cs_high();
-}
-void imu_readn(uint8_t start_reg, uint8_t* dst, size_t n){
-  imu_cs_low();
-  SPI.transfer(start_reg | 0x80);
-  for (size_t i=0;i<n;i++) dst[i] = SPI.transfer(0x00);
-  imu_cs_high();
+static void mpu_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
 }
 
-bool imu_init_spi(){
-  SPI.begin(IMU_SPI_SCK, IMU_SPI_MISO, IMU_SPI_MOSI, IMU_SPI_CS);
-  pinMode(IMU_SPI_CS, OUTPUT);
-  imu_cs_high();
+static uint8_t mpu_read1(uint8_t reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);  // repeated-START keeps bus active for the read
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+static void mpu_read14(uint8_t* dst) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(MPU_REG_ACCEL_OUT);
+  Wire.endTransmission(false);  // repeated-START — do not release bus
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)14);
+  for (uint8_t i = 0; i < 14; i++)
+    dst[i] = Wire.available() ? Wire.read() : 0;
+}
+
+bool imu_init_i2c() {
+  Wire.begin(IMU_I2C_SDA, IMU_I2C_SCL);
   delay(5);
 
-  uint8_t who = imu_read8(REG_WHO_AM_I);
-  Serial.printf("[IMU] WHO_AM_I=0x%02X (expect 0x47)\n", who);
-  if (who != 0x47) return false;
+  uint8_t who = mpu_read1(MPU_REG_WHO_AM_I);
+  Serial.printf("[IMU] WHO_AM_I=0x%02X (expect 0x68)\n", who);
+  if (who != 0x68) return false;
 
-  imu_write8(REG_PWR_MGMT0, 0x0F); // accel+gyro LN
+  mpu_write(MPU_REG_PWR_MGMT1, 0x00);  // clear SLEEP bit — chip starts sampling
   delay(10);
+  mpu_write(MPU_REG_GYRO_CFG,  0x18);  // FS_SEL=3  → ±2000 dps
+  mpu_write(MPU_REG_ACCEL_CFG, 0x18);  // AFS_SEL=3 → ±16 g
+  Serial.println("[IMU] MPU-6050 init OK (I2C)");
   return true;
 }
 
-bool imu_read_once(float& tempC, float& ax, float& ay, float& az, float& gx, float& gy, float& gz){
-  uint8_t raw[BURST_COUNT];
-  imu_readn(BURST_FIRST, raw, sizeof(raw));
+bool imu_read_once(float& tempC, float& ax, float& ay, float& az,
+                   float& gx,   float& gy, float& gz) {
+  uint8_t raw[14];
+  mpu_read14(raw);
 
-  auto s16 = [&](int idx)->int16_t {
-    return (int16_t)((raw[idx] << 8) | raw[idx+1]);
+  // All values are 16-bit signed big-endian (high byte first).
+  auto s16 = [](uint8_t hi, uint8_t lo) -> int16_t {
+    return (int16_t)((uint16_t)hi << 8 | lo);
   };
 
-  int16_t tr  = s16(0);
-  int16_t axr = s16(2);
-  int16_t ayr = s16(4);
-  int16_t azr = s16(6);
-  int16_t gxr = s16(8);
-  int16_t gyr = s16(10);
-  int16_t gzr = s16(12);
-
-  tempC = (float)tr / TEMP_SENS + TEMP_OFFSET;
-  ax = ((float)axr / ACC_LSB_PER_G) * G;
-  ay = ((float)ayr / ACC_LSB_PER_G) * G;
-  az = ((float)azr / ACC_LSB_PER_G) * G;
-  gx =  (float)gxr / GYR_LSB_PER_DPS;
-  gy =  (float)gyr / GYR_LSB_PER_DPS;
-  gz =  (float)gzr / GYR_LSB_PER_DPS;
-
+  ax = s16(raw[0],  raw[1])  * MPU_ACCEL_SCALE;  // m/s²
+  ay = s16(raw[2],  raw[3])  * MPU_ACCEL_SCALE;
+  az = s16(raw[4],  raw[5])  * MPU_ACCEL_SCALE;
+  // raw[6..7] = raw temperature — MPU-6050 datasheet formula:
+  tempC = s16(raw[6], raw[7]) / 340.0f + 36.53f;
+  gx = s16(raw[8],  raw[9])  * MPU_GYRO_SCALE;   // deg/s
+  gy = s16(raw[10], raw[11]) * MPU_GYRO_SCALE;
+  gz = s16(raw[12], raw[13]) * MPU_GYRO_SCALE;
   return true;
 }
 
-// 轻微平滑，便于观察；不改变 UDP 字段名
+// EMA smoothing on accel only; does not change the UDP field names.
 static const float EMA_ALPHA = 0.20f;
 bool  ema_inited = false;
 float ax_f=0, ay_f=0, az_f=0;
@@ -825,9 +819,8 @@ void taskImuLoop(void*){
   for(;;){
     static bool inited = false;
     if (!inited){
-      inited = imu_init_spi();
+      inited = imu_init_i2c();
       if (!inited){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
-      Serial.println("[IMU] init OK (SPI)");
     }
 
     float tempC, ax, ay, az, gx, gy, gz;
@@ -884,7 +877,7 @@ void setup() {
   init_i2s_in();
   init_i2s_out();
 
-  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 增加到3个缓冲，减少丢帧
+  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
@@ -899,7 +892,7 @@ void setup() {
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
       cam_ws_ready = true;  
       Serial.println("[WS-CAM] open");
-      // 重置统计
+      // Reset statistics
       frame_sent_count = 0;
       frame_dropped_count = 0;
       ws_send_fail_count = 0;
@@ -925,13 +918,13 @@ void setup() {
         if (apply_framesize(fs)) Serial.printf("[CAM] framesize set to %s\n", v.c_str());
         else Serial.printf("[CAM] framesize set failed: %s\n", v.c_str());
       }
-      else if (cmd.startsWith("SET:QUALITY=")) {     // 新增：动态画质
+      else if (cmd.startsWith("SET:QUALITY=")) {     // Dynamic JPEG quality
         int q = cmd.substring(strlen("SET:QUALITY=")).toInt();
         q = constrain(q, 5, 40);
         sensor_t* s = esp_camera_sensor_get();
         if (s) { s->set_quality(s, q); Serial.printf("[CAM] quality=%d\n", q); }
       }
-      else if (cmd.startsWith("SET:FPS=")) {         // 新增：发送节流FPS
+      else if (cmd.startsWith("SET:FPS=")) {         // Send throttle FPS
         int f = cmd.substring(strlen("SET:FPS=")).toInt();
         g_target_fps = (f <= 0 ? 0 : constrain(f, 5, 60));
         Serial.printf("[CAM] target_fps=%d\n", g_target_fps);
@@ -944,11 +937,11 @@ void setup() {
         sensor_t* s = esp_camera_sensor_get();
         framesize_t old_fs = g_frame_size;
         int old_q = JPEG_QUALITY;
-        // 目标分辨率：XGA（若需更高可改为 SXGA/UXGA，视PSRAM稳定性）
+        // Target resolution: SXGA (increase to UXGA if PSRAM stability allows)
         framesize_t target_fs = FRAMESIZE_SXGA;
         if (s) {
           s->set_framesize(s, target_fs);
-          s->set_quality(s, 18); // 数值越小越清晰
+          s->set_quality(s, 18); // Lower value = higher quality
         }
         vTaskDelay(pdMS_TO_TICKS(500));
         camera_fb_t* fb = esp_camera_fb_get();

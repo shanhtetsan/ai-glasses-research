@@ -6,17 +6,17 @@ from typing import Optional, Set, List, Tuple, Any, Dict
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-# ===== 下行 WAV 流基础参数 =====
-STREAM_SR = 8000  # 改为8kHz，ESP32支持
+# ===== Downstream WAV stream basic parameters =====
+STREAM_SR = 8000  # 8 kHz — supported by ESP32
 STREAM_CH = 1
 STREAM_SW = 2
 BYTES_PER_20MS_16K = STREAM_SR * STREAM_SW * 20 // 1000  # 320B (8kHz)
 
-# ===== AI 播放任务总闸 =====
+# ===== AI playback task master switch =====
 current_ai_task: Optional[asyncio.Task] = None
 
 async def cancel_current_ai():
-    """取消当前大模型语音任务，并等待其退出。"""
+    """Cancel the current LLM audio task and wait for it to exit."""
     global current_ai_task
     task = current_ai_task
     current_ai_task = None
@@ -33,14 +33,14 @@ def is_playing_now() -> bool:
     t = current_ai_task
     return (t is not None) and (not t.done())
 
-# ===== /stream.wav 连接管理 =====
+# ===== /stream.wav connection management =====
 @dataclass(frozen=True)
 class StreamClient:
     q: asyncio.Queue
     abort_event: asyncio.Event
 
 stream_clients: "Set[StreamClient]" = set()
-STREAM_QUEUE_MAX = 96  # 小缓冲，避免积压
+STREAM_QUEUE_MAX = 96  # Small buffer to prevent backlog
 
 def _wav_header_unknown_size(sr=16000, ch=1, sw=2) -> bytes:
     import struct
@@ -58,10 +58,10 @@ def _wav_header_unknown_size(sr=16000, ch=1, sw=2) -> bytes:
 
 async def hard_reset_audio(reason: str = ""):
     """
-    **一键清场**：丢弃所有播放器连接（abort_event置位）+ 取消当前AI任务。
-    这样旧的音频不会再有任何去处，也没有任何任务继续产出。
+    Hard reset: abort all stream connections (set abort_event) and cancel the current AI task.
+    Old audio has nowhere to go, and no task continues producing output.
     """
-    # 1) 断开所有正在播放的 HTTP 连接
+    # 1) Disconnect all active HTTP streaming connections
     for sc in list(stream_clients):
         try:
             sc.abort_event.set()
@@ -69,21 +69,21 @@ async def hard_reset_audio(reason: str = ""):
             pass
     stream_clients.clear()
 
-    # 2) 取消当前AI任务
+    # 2) Cancel the current AI task
     await cancel_current_ai()
 
-    # 3) 日志
+    # 3) Log
     if reason:
         print(f"[HARD-RESET] {reason}")
 
 async def broadcast_pcm16_realtime(pcm16: bytes):
-    """以 20ms 节拍把 pcm16 发送给所有仍存活的连接；队列满丢尾，保持实时。"""
-    # 【新增】录制音频（在分发之前整体录制，避免分片）
+    """Send pcm16 at 20 ms pacing to all active connections; drop the tail when the queue is full to stay real-time."""
+    # Record audio as a whole before distributing to avoid fragmentation
     try:
         import sync_recorder
-        sync_recorder.record_audio(pcm16, text="[Omni对话]")
+        sync_recorder.record_audio(pcm16, text="[Omni chat]")
     except Exception:
-        pass  # 静默失败，不影响播放
+        pass  # Silent failure — does not affect playback
     
     loop = asyncio.get_event_loop()
     next_tick = loop.time()
@@ -116,11 +116,11 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
             next_tick = now
         off += take
 
-# ===== FastAPI 路由注册器 =====
+# ===== FastAPI route registrar =====
 def register_stream_route(app):
     @app.get("/stream.wav")
     async def stream_wav(_: Request):
-        # —— 强制单连接（或少数连接），先拉闸所有旧连接 ——
+        # Force single connection (or few connections): cut all existing connections first
         for sc in list(stream_clients):
             try: sc.abort_event.set()
             except Exception: pass

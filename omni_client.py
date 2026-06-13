@@ -1,150 +1,161 @@
 # omni_client.py
 # -*- coding: utf-8 -*-
-import os
-import base64
-import asyncio
-import soundfile as sf
-import io
-import numpy as np
-import torch
+#
+# Changes vs original:
+#   - DashScope / OpenAI-compatible remote client commented out (kept as fallback)
+#   - stream_chat() now runs Qwen2.5-Omni-3B locally on MPS, TEXT ONLY
+#   - Audio output (return_audio) is disabled here; TTS handled via macOS 'say'
+#     in app_main.py._say_to_pcm8k → broadcast_pcm16_realtime
+#   - OmniStreamPiece interface unchanged so app_main.py needs no adjustments
+#   - device_map="mps" (NOT "auto") avoids meta-device disk offload on Apple Silicon
+#
+import os, base64, asyncio, io
 from typing import AsyncGenerator, Dict, Any, List, Optional
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
-# ===== Original: Alibaba DashScope compatible mode =====
-# API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-a9440db694924559ae4ebdc2023d2b9a")
-# if not API_KEY:
-#     raise RuntimeError("未设置 DASHSCOPE_API_KEY")
-# QWEN_MODEL = "qwen-omni-turbo"
+# ===== [DASHSCOPE FALLBACK] Remote Qwen-Omni via OpenAI-compatible API =====
+# Uncomment this block and comment out the local section below to switch back.
 # from openai import OpenAI
-# oai_client = OpenAI(
-#     api_key=API_KEY,
+# _API_KEY  = os.getenv("DASHSCOPE_API_KEY", "YOUR_DASHSCOPE_API_KEY")
+# _QWEN_MODEL = "qwen-omni-turbo"
+# _oai_client = OpenAI(
+#     api_key=_API_KEY,
 #     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 # )
+# ===========================================================================
 
-# ===== Fallback: OpenAI API (comment in if local model quality is insufficient) =====
-# API_KEY = os.getenv("OPENAI_API_KEY")
-# if not API_KEY:
-#     raise RuntimeError("OPENAI_API_KEY is not set")
-# MODEL = "gpt-4o-audio-preview"
-# from openai import OpenAI
-# oai_client = OpenAI(api_key=API_KEY)
+import torch
+from PIL import Image
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
-# ===== Current: Local Qwen2.5-Omni-7B (free, no API key needed) =====
-# Why: No DashScope access from US, OpenAI costs money.
-# Qwen2.5-Omni-7B runs locally on MacBook M5 24GB via MPS.
-# Same architecture as original — text + audio output in one model call.
+_MODEL_ID = os.getenv("QWEN_OMNI_MODEL", "Qwen/Qwen2.5-Omni-3B")
 
-MODEL_NAME = os.getenv("QWEN_OMNI_MODEL", "Qwen/Qwen2.5-Omni-7B")
-SPEAKER = os.getenv("QWEN_OMNI_SPEAKER", "Chelsie")  # options: Chelsie, Ethan
-SAMPLE_RATE = 24000
-
-print(f"[OMNI] Loading local model: {MODEL_NAME}")
-_processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_NAME)
+print(f"[OMNI] Loading local model {_MODEL_ID!r} → MPS float16 …")
 _model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-    MODEL_NAME,
+    _MODEL_ID,
     torch_dtype=torch.float16,
-    device_map="auto",
+    device_map="mps",      # force MPS — "auto" falls back to meta/CPU and offloads to disk
 )
-print(f"[OMNI] Model loaded successfully")
+_processor = Qwen2_5OmniProcessor.from_pretrained(_MODEL_ID)
+print("[OMNI] Local model ready.")
 
 
 class OmniStreamPiece:
-    """Unified incremental output: text delta and/or audio chunk (base64 encoded WAV)."""
-    # 对外的统一增量数据：text/audio 二选一或同时。
+    """Unified incremental payload: text_delta and/or audio_b64."""
     def __init__(self, text_delta: Optional[str] = None, audio_b64: Optional[str] = None):
         self.text_delta = text_delta
         self.audio_b64  = audio_b64
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _decode_data_url(data_url: str) -> Optional[Image.Image]:
+    """Parse a base64 data: URL into a PIL RGB Image."""
+    try:
+        if data_url.startswith("data:"):
+            _, b64 = data_url.split(",", 1)
+        else:
+            b64 = data_url
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    except Exception:
+        return None
+
+
+def _build_qwen_messages(
+    content_list: List[Dict[str, Any]],
+) -> tuple:
+    """
+    Convert OpenAI-style content_list to (qwen_messages, pil_images).
+    Image entries become {"type": "image"} placeholders; PIL objects go
+    in the separate list that the processor maps to those placeholders.
+    """
+    qwen_content: List[Dict[str, Any]] = []
+    pil_images: List[Image.Image] = []
+
+    for item in content_list:
+        t = item.get("type")
+        if t == "image_url":
+            url = (item.get("image_url") or {}).get("url", "")
+            img = _decode_data_url(url)
+            if img is not None:
+                pil_images.append(img)
+                qwen_content.append({"type": "image"})   # placeholder; processor fills in
+        elif t == "text":
+            qwen_content.append({"type": "text", "text": item.get("text", "")})
+
+    messages = [{"role": "user", "content": qwen_content}]
+    return messages, pil_images
+
+
+# ---------------------------------------------------------------------------
+# Main streaming interface (unchanged signature for app_main.py)
+# ---------------------------------------------------------------------------
+
 async def stream_chat(
     content_list: List[Dict[str, Any]],
-    voice: str = SPEAKER,
-    audio_format: str = "wav",
+    voice: str = "Cherry",       # retained for interface compat — unused here (TTS via 'say')
+    audio_format: str = "wav",   # same
 ) -> AsyncGenerator[OmniStreamPiece, None]:
     """
-    Run one round of multimodal inference using local Qwen2.5-Omni.
-    发起一轮本地 Qwen2.5-Omni 多模态推理：
-    - content_list: list of text/image_url dicts (OpenAI chat format)
-    - Yields OmniStreamPiece with text_delta and/or audio_b64
+    Local Qwen2.5-Omni-3B text-only inference.
 
-    Note: Qwen2.5-Omni does not support true streaming locally.
-    We generate the full response then yield it as a single piece.
-    This keeps the interface identical to the original streaming design.
+    generation_mode="text" → talker/token2wav are skipped entirely.
+    Audio is produced separately by _say_to_pcm8k in app_main.py.
+
+    Yields exactly one OmniStreamPiece(text_delta=<response>, audio_b64=None).
+    The rest of the pipeline (ui_broadcast, broadcast_pcm16_realtime) is unchanged.
+
+    # ---- DASHSCOPE FALLBACK (stream from remote API) ----
+    # completion = _oai_client.chat.completions.create(
+    #     model=_QWEN_MODEL,
+    #     messages=[{"role": "user", "content": content_list}],
+    #     modalities=["text", "audio"],
+    #     audio={"voice": voice, "format": audio_format},
+    #     stream=True,
+    #     stream_options={"include_usage": True},
+    # )
+    # for chunk in completion:
+    #     text_delta = audio_b64 = None
+    #     if getattr(chunk, "choices", None):
+    #         c0 = chunk.choices[0]
+    #         delta = getattr(c0, "delta", None)
+    #         if delta and getattr(delta, "content", None):
+    #             text_delta = delta.content
+    #         if delta and getattr(delta, "audio", None):
+    #             aud = delta.audio
+    #             audio_b64 = aud.get("data") if isinstance(aud, dict) else getattr(aud, "data", None)
+    #     if (text_delta is not None) or (audio_b64 is not None):
+    #         yield OmniStreamPiece(text_delta=text_delta, audio_b64=audio_b64)
+    # ---- END DASHSCOPE FALLBACK ----
     """
+    messages, pil_images = _build_qwen_messages(content_list)
 
-    # Build conversation in Qwen2.5-Omni format
-    # 构建 Qwen2.5-Omni 格式的对话
-    conversation = [
-        {
-            "role": "system",
-            "content": [{
-                "type": "text",
-                "text": "You are a helpful AI assistant for visually impaired users. Give short, clear responses."
-            }]
-        }
-    ]
+    text_prompt = _processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
-    # Convert content_list to Qwen format
-    # 将 content_list 转换为 Qwen 格式
-    user_content = []
-    for item in content_list:
-        if item.get("type") == "text":
-            user_content.append({"type": "text", "text": item["text"]})
-        elif item.get("type") == "image_url":
-            # Extract base64 image / 提取 base64 图像
-            url = item.get("image_url", {}).get("url", "")
-            if url.startswith("data:image"):
-                user_content.append({"type": "image", "image": url})
+    proc_inputs = _processor(
+        text=text_prompt,
+        images=pil_images if pil_images else None,
+        padding=True,
+        return_tensors="pt",
+    ).to("mps")
 
-    conversation.append({"role": "user", "content": user_content})
-
-    # Run inference in executor to avoid blocking the event loop
-    # 在 executor 中运行推理，避免阻塞事件循环
+    prompt_len = proc_inputs.input_ids.shape[1]
     loop = asyncio.get_event_loop()
 
-    def _infer():
-        text = _processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            tokenize=False
-        )
-        inputs = _processor(text=text, return_tensors="pt")
+    def _generate() -> str:
+        with torch.no_grad():
+            output_ids = _model.generate(
+                **proc_inputs,
+                thinker_max_new_tokens=256,
+                generation_mode="text",   # skips talker + token2wav entirely
+            )
+        new_ids = output_ids[0][prompt_len:]
+        return _processor.decode(new_ids, skip_special_tokens=True).strip()
 
-        # Move inputs to same device as model
-        # 将输入移到与模型相同的设备
-        device = next(_model.parameters()).device
-        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    response_text = await loop.run_in_executor(None, _generate)
 
-        text_ids, audio = _model.generate(
-            **inputs,
-            speaker=voice,
-            return_audio=True,
-            max_new_tokens=200,
-        )
-
-        # Decode text / 解码文本
-        full_text = _processor.batch_decode(text_ids, skip_special_tokens=True)
-        response_text = full_text[0] if full_text else ""
-
-        # Extract just the assistant response
-        # 仅提取 assistant 的回复
-        if "assistant\n" in response_text:
-            response_text = response_text.split("assistant\n")[-1].strip()
-
-        # Convert audio to base64 WAV
-        # 将音频转换为 base64 WAV
-        audio_b64 = None
-        if audio is not None:
-            audio_np = audio.reshape(-1).detach().cpu().numpy()
-            buf = io.BytesIO()
-            sf.write(buf, audio_np, samplerate=SAMPLE_RATE, format="WAV", subtype="PCM_16")
-            buf.seek(0)
-            audio_b64 = base64.b64encode(buf.read()).decode("ascii")
-
-        return response_text, audio_b64
-
-    response_text, audio_b64 = await loop.run_in_executor(None, _infer)
-
-    # Yield as single piece (text + audio together)
-    # 作为单个片段产出（文本 + 音频一起）
-    yield OmniStreamPiece(text_delta=response_text, audio_b64=audio_b64)
+    if response_text:
+        yield OmniStreamPiece(text_delta=response_text, audio_b64=None)

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-斑马线感知监控器
-基于面积变化的斑马线检测和语音提示
-不涉及状态切换，只提供语音引导
+Crosswalk awareness monitor.
+Area-change-based crosswalk detection and voice guidance.
+Does not trigger state transitions — provides voice guidance only.
 """
 import time
 import numpy as np
@@ -14,79 +14,79 @@ logger = logging.getLogger(__name__)
 
 
 class CrosswalkAwarenessMonitor:
-    """斑马线感知监控器 - 纯语音提示模块"""
-    
+    """Crosswalk awareness monitor — voice-only guidance module"""
+
     def __init__(self):
-        # 面积阈值（固定锚点）
+        # Area thresholds (fixed anchors)
         self.THRESHOLDS = {
-            'discover': 0.01,      # 1% - 发现
-            'approaching': 0.08,   # 8% - 靠近
-            'near': 0.18,          # 18% - 很近
-            'arrival': 0.25,       # 25% - 到达（可以过马路）
+            'discover': 0.01,      # 1%  - spotted
+            'approaching': 0.08,   # 8%  - approaching
+            'near': 0.18,          # 18% - close
+            'arrival': 0.25,       # 25% - arrived (ready to cross)
         }
-        
-        # 已播报的阈值（避免重复）
+
+        # Broadcasted thresholds (to avoid repetition)
         self.broadcasted_thresholds = set()
-        
-        # 面积历史记录
-        self.area_history = deque(maxlen=30)  # 保存最近30帧
-        
-        # 时间记录
+
+        # Area history
+        self.area_history = deque(maxlen=30)  # keep last 30 frames
+
+        # Timestamp tracking
         self.last_broadcast_time = 0
         self.arrival_first_broadcast_time = 0
-        
-        # 状态标志
-        self.in_arrival_state = False  # 是否在"可以过马路"状态
-        self.last_position_zone = None  # 上次播报的方位
-        
-        # 播报间隔配置（可调整参数 - 数值越小播报越频繁）
-        # 【参数调整】将所有间隔除以1.5，提高播报频率1.5倍
+
+        # State flags
+        self.in_arrival_state = False  # Whether we're in "ready to cross" state
+        self.last_position_zone = None  # Last broadcasted direction zone
+
+        # Announcement interval config (smaller = more frequent)
+        # [Tuned] All intervals divided by 1.5 — increases announcement frequency 1.5×
         self.REPEAT_INTERVALS = {
-            'approaching': 6.7,   # 靠近阶段：每6.7秒重复（原10秒÷1.5）
-            'near': 3.3,          # 很近阶段：每3.3秒重复（原5秒÷1.5）
-            'arrival': 5.3,       # 到达阶段：每5.3秒重复（原8秒÷1.5）
+            'approaching': 6.7,   # Approaching stage: repeat every 6.7s (original 10s ÷ 1.5)
+            'near': 3.3,          # Close stage: repeat every 3.3s (original 5s ÷ 1.5)
+            'arrival': 5.3,       # Arrived stage: repeat every 5.3s (original 8s ÷ 1.5)
         }
-        # 提示：如需调整频率，修改这些数值即可
-        # - 数值越小 = 播报越频繁
-        # - 数值越大 = 播报越稀疏
-        
-        # 无遮挡判断阈值
-        self.OCCLUSION_THRESHOLD = 0.30  # 重叠>30%认为有遮挡
-    
+        # Tip: adjust the values above to change announcement frequency
+        # - Smaller value = more frequent announcements
+        # - Larger value = less frequent announcements
+
+        # Occlusion detection threshold
+        self.OCCLUSION_THRESHOLD = 0.30  # Overlap >30% is considered occluded
+
     def process_frame(self, crosswalk_mask, blind_path_mask=None) -> Optional[Dict[str, Any]]:
         """
-        处理每帧的斑马线检测
-        
-        返回：
+        Process crosswalk detection for the current frame.
+
+        Returns:
         {
-            'voice_text': 语音文本,
-            'priority': 优先级,
-            'should_broadcast': 是否应该播报,
-            'area': 当前面积,
-            'position': 方位描述,
-            'visualization': 可视化信息（用于外部绘制）
+            'voice_text': voice prompt text,
+            'priority': priority level,
+            'should_broadcast': whether to broadcast,
+            'area': current area ratio,
+            'position': position description,
+            'visualization': visualization info (for external rendering)
         }
-        或 None（无需播报）
+        or None (nothing to broadcast)
         """
-        # 如果没有斑马线，重置状态
+        # Reset state when no crosswalk detected
         if crosswalk_mask is None:
             self._reset_if_needed()
             return None
-        
-        # 1. 计算面积
+
+        # 1. Compute area
         total_pixels = crosswalk_mask.size
         crosswalk_pixels = np.sum(crosswalk_mask > 0)
         area_ratio = crosswalk_pixels / total_pixels
-        
-        # 2. 计算中心位置
+
+        # 2. Compute center position
         y_coords, x_coords = np.where(crosswalk_mask > 0)
         if len(y_coords) == 0:
             return None
-        
+
         center_x_ratio = np.mean(x_coords) / crosswalk_mask.shape[1]
         center_y_ratio = np.mean(y_coords) / crosswalk_mask.shape[0]
-        
-        # 3. 记录历史
+
+        # 3. Record history
         current_time = time.time()
         self.area_history.append({
             'area': area_ratio,
@@ -94,234 +94,234 @@ class CrosswalkAwarenessMonitor:
             'center_y': center_y_ratio,
             'time': current_time
         })
-        
-        # 4. 检查遮挡
+
+        # 4. Check occlusion
         has_occlusion = self._check_occlusion(crosswalk_mask, blind_path_mask)
-        
-        # 5. 判断当前阶段和生成语音
-        return self._generate_guidance(area_ratio, center_x_ratio, center_y_ratio, 
+
+        # 5. Determine current stage and generate voice
+        return self._generate_guidance(area_ratio, center_x_ratio, center_y_ratio,
                                        has_occlusion, current_time)
-    
+
     def _check_occlusion(self, crosswalk_mask, blind_path_mask) -> bool:
-        """检查斑马线是否被盲道遮挡"""
+        """Check whether the crosswalk is occluded by the tactile path."""
         if blind_path_mask is None:
             return False
-        
+
         crosswalk_area = crosswalk_mask > 0
         blind_path_area = blind_path_mask > 0
-        
-        # 计算重叠
+
+        # Compute overlap
         overlap = np.logical_and(crosswalk_area, blind_path_area)
         overlap_ratio = np.sum(overlap) / max(np.sum(crosswalk_area), 1)
-        
-        # 重叠超过阈值认为有遮挡
+
+        # Overlap exceeding threshold counts as occluded
         return overlap_ratio > self.OCCLUSION_THRESHOLD
-    
+
     def _get_position_description(self, center_x_ratio) -> str:
-        """获取方位描述（3分法）"""
+        """Get position description (three-zone split)."""
         if center_x_ratio < 0.40:
-            return "在画面左侧"
+            return "on the left"
         elif center_x_ratio < 0.60:
-            return "在画面中间"
+            return "in the center"
         else:
-            return "在画面右侧"
-    
-    def _generate_guidance(self, area_ratio, center_x_ratio, center_y_ratio, 
+            return "on the right"
+
+    def _generate_guidance(self, area_ratio, center_x_ratio, center_y_ratio,
                           has_occlusion, current_time) -> Optional[Dict[str, Any]]:
-        """生成引导语音"""
-        
-        # 检查面积是否稳定（避免抖动）
+        """Generate guidance voice output."""
+
+        # Check if area is stable (avoid jitter)
         if not self._is_area_stable(area_ratio):
             return None
-        
+
         position_desc = self._get_position_description(center_x_ratio)
-        
-        # 阶段1：发现阶段（0.01-0.08）
+
+        # Stage 1: Spotted (0.01–0.08)
         if area_ratio >= self.THRESHOLDS['discover'] and area_ratio < self.THRESHOLDS['approaching']:
             if self.THRESHOLDS['discover'] not in self.broadcasted_thresholds:
                 self.broadcasted_thresholds.add(self.THRESHOLDS['discover'])
                 return {
-                    'voice_text': f"远处发现斑马线,{position_desc}",
-                    'priority': 55,  # 提高到55，超过盲道方向指令(50)
+                    'voice_text': f"Crosswalk spotted in the distance,{position_desc}",
+                    'priority': 55,  # Raised to 55 to exceed blind-path direction commands (50)
                     'should_broadcast': True,
                     'area': area_ratio,
                     'position': position_desc
                 }
-        
-        # 阶段2：靠近阶段（0.08-0.18）
+
+        # Stage 2: Approaching (0.08–0.18)
         elif area_ratio >= self.THRESHOLDS['approaching'] and area_ratio < self.THRESHOLDS['near']:
-            # 首次播报
+            # First announcement
             if self.THRESHOLDS['approaching'] not in self.broadcasted_thresholds:
                 self.broadcasted_thresholds.add(self.THRESHOLDS['approaching'])
                 self.last_broadcast_time = current_time
                 self.last_position_zone = position_desc
                 return {
-                    'voice_text': f"正在靠近斑马线,{position_desc}",
-                    'priority': 55,  # 提高到55
+                    'voice_text': f"Approaching crosswalk,{position_desc}",
+                    'priority': 55,  # Raised to 55
                     'should_broadcast': True,
                     'area': area_ratio,
                     'position': position_desc
                 }
-            # 重复播报（每10秒或方位变化）
+            # Repeat announcement (every 10s or when position changes)
             elif (current_time - self.last_broadcast_time >= self.REPEAT_INTERVALS['approaching'] or
                   position_desc != self.last_position_zone):
                 self.last_broadcast_time = current_time
                 self.last_position_zone = position_desc
                 return {
-                    'voice_text': f"正在靠近斑马线,{position_desc}",
-                    'priority': 55,  # 提高到55
+                    'voice_text': f"Approaching crosswalk,{position_desc}",
+                    'priority': 55,  # Raised to 55
                     'should_broadcast': True,
                     'area': area_ratio,
                     'position': position_desc
                 }
-        
-        # 阶段3：很近阶段（0.18-0.25）
+
+        # Stage 3: Getting close (0.18–0.25)
         elif area_ratio >= self.THRESHOLDS['near'] and area_ratio < self.THRESHOLDS['arrival']:
-            # 首次播报
+            # First announcement
             if self.THRESHOLDS['near'] not in self.broadcasted_thresholds:
                 self.broadcasted_thresholds.add(self.THRESHOLDS['near'])
                 self.last_broadcast_time = current_time
                 self.last_position_zone = position_desc
                 return {
-                    'voice_text': f"接近斑马线,{position_desc}",
+                    'voice_text': f"Crosswalk getting close,{position_desc}",
                     'priority': 60,
                     'should_broadcast': True,
                     'area': area_ratio,
                     'position': position_desc
                 }
-            # 重复播报（每5秒或方位变化）
+            # Repeat announcement (every 5s or when position changes)
             elif (current_time - self.last_broadcast_time >= self.REPEAT_INTERVALS['near'] or
                   position_desc != self.last_position_zone):
                 self.last_broadcast_time = current_time
                 self.last_position_zone = position_desc
                 return {
-                    'voice_text': f"接近斑马线,{position_desc}",
+                    'voice_text': f"Crosswalk getting close,{position_desc}",
                     'priority': 60,
                     'should_broadcast': True,
                     'area': area_ratio,
                     'position': position_desc
                 }
-        
-        # 阶段4：到达阶段（area ≥ 0.25，无遮挡）
+
+        # Stage 4: Arrived (area ≥ 0.25, not occluded)
         elif area_ratio >= self.THRESHOLDS['arrival']:
-            # 必须无遮挡才能提示过马路
+            # Occlusion must be clear before announcing crossing readiness
             if has_occlusion:
-                # 有遮挡，暂不提示过马路，停留在阶段3
-                logger.info(f"[斑马线] 面积达到{area_ratio:.2f}但被遮挡，暂不提示过马路")
+                # Occluded — do not announce crossing yet, remain in stage 3
+                logger.info(f"[CROSSWALK] Area {area_ratio:.2f} reached but occluded — holding back crossing announcement")
                 return None
-            
-            # 首次到达
+
+            # First time reaching this stage
             if not self.in_arrival_state:
                 self.in_arrival_state = True
                 self.arrival_first_broadcast_time = current_time
                 self.last_broadcast_time = current_time
-                logger.info(f"[斑马线] 到达状态：area={area_ratio:.2f}, 无遮挡")
+                logger.info(f"[CROSSWALK] Arrived: area={area_ratio:.2f}, not occluded")
                 return {
-                    'voice_text': "斑马线到了可以过马路",
+                    'voice_text': "Crosswalk reached, you can cross now.",
                     'priority': 80,
                     'should_broadcast': True,
                     'area': area_ratio,
-                    'position': '到达'
+                    'position': 'Arrived'
                 }
-            # 重复播报（每8秒）
+            # Repeat announcement (every 8s)
             elif current_time - self.last_broadcast_time >= self.REPEAT_INTERVALS['arrival']:
                 self.last_broadcast_time = current_time
                 return {
-                    'voice_text': "斑马线到了可以过马路",
+                    'voice_text': "Crosswalk reached, you can cross now.",
                     'priority': 80,
                     'should_broadcast': True,
                     'area': area_ratio,
-                    'position': '到达'
+                    'position': 'Arrived'
                 }
-            # 超时处理（30秒后自动退出到达状态）
+            # Timeout: auto-exit arrival state after 30s
             elif current_time - self.arrival_first_broadcast_time > 30.0:
-                logger.info("[斑马线] 到达状态超时30秒，自动退出")
+                logger.info("[CROSSWALK] Arrived state timed out after 30s, auto-exit")
                 self.in_arrival_state = False
                 return None
-        
-        # 降级处理：如果从到达状态面积减小
+
+        # Fallback: if area drops from the arrival state
         if self.in_arrival_state and area_ratio < 0.20:
-            logger.info(f"[斑马线] 面积降至{area_ratio:.2f}，退出到达状态")
+            logger.info(f"[CROSSWALK] Area dropped to {area_ratio:.2f}, exiting arrival state")
             self.in_arrival_state = False
-            # 清除部分已播报标记，允许重新播报
+            # Clear some broadcasted markers to allow re-announcement
             self.broadcasted_thresholds.discard(self.THRESHOLDS['arrival'])
-        
+
         return None
-    
+
     def _is_area_stable(self, area_ratio, stability_frames=5) -> bool:
-        """检查面积是否稳定（避免抖动触发）"""
+        """Check whether area is stable (to avoid jitter triggers)."""
         if len(self.area_history) < stability_frames:
-            return True  # 初始阶段，认为稳定
-        
+            return True  # Early stage: assume stable
+
         recent_areas = [h['area'] for h in list(self.area_history)[-stability_frames:]]
-        
-        # 检查最近N帧是否都在当前面积附近（±20%）
+
+        # Check that recent N frames are all within ±20% of current area
         for recent_area in recent_areas:
             if abs(recent_area - area_ratio) / max(area_ratio, 0.001) > 0.20:
                 return False
-        
+
         return True
-    
+
     def _reset_if_needed(self):
-        """重置状态（斑马线消失时）"""
+        """Reset state when crosswalk disappears."""
         if len(self.area_history) > 0:
-            logger.info("[斑马线] 斑马线消失，重置状态")
-        
+            logger.info("[CROSSWALK] Crosswalk disappeared, resetting state")
+
         self.broadcasted_thresholds.clear()
         self.area_history.clear()
         self.in_arrival_state = False
         self.last_position_zone = None
-    
+
     def reset(self):
-        """完全重置"""
+        """Full reset."""
         self.broadcasted_thresholds.clear()
         self.area_history.clear()
         self.in_arrival_state = False
         self.last_broadcast_time = 0
         self.arrival_first_broadcast_time = 0
         self.last_position_zone = None
-        logger.info("[斑马线] 感知监控器已重置")
-    
+        logger.info("[CROSSWALK] Awareness monitor reset")
+
     def is_in_arrival_state(self) -> bool:
-        """是否在到达状态（用于外部判断是否暂停盲道语音）"""
+        """Whether in arrival state (used externally to pause blind-path voice)."""
         return self.in_arrival_state
-    
+
     def get_current_area(self) -> float:
-        """获取当前面积"""
+        """Get current crosswalk area ratio."""
         if len(self.area_history) > 0:
             return self.area_history[-1]['area']
         return 0.0
-    
+
     def get_visualization_data(self, crosswalk_mask, area_ratio, center_x_ratio, center_y_ratio, has_occlusion) -> Dict[str, Any]:
         """
-        获取可视化数据
-        返回包含所有可视化元素的字典
+        Get visualization data.
+        Returns a dict with all visualization elements.
         """
         if crosswalk_mask is None:
             return {}
-        
-        # 确定当前阶段（统一使用橙色）
+
+        # Determine current stage (all orange)
         if area_ratio >= self.THRESHOLDS['arrival']:
-            stage = "到达"
-            stage_color = "rgba(255, 165, 0, 0.5)"  # 橙色
+            stage = "Arrived"
+            stage_color = "rgba(255, 165, 0, 0.5)"   # orange
         elif area_ratio >= self.THRESHOLDS['near']:
-            stage = "接近"
-            stage_color = "rgba(255, 165, 0, 0.45)"  # 橙色
+            stage = "Close"
+            stage_color = "rgba(255, 165, 0, 0.45)"  # orange
         elif area_ratio >= self.THRESHOLDS['approaching']:
-            stage = "靠近"
-            stage_color = "rgba(255, 165, 0, 0.40)"  # 橙色
+            stage = "Approaching"
+            stage_color = "rgba(255, 165, 0, 0.40)"  # orange
         else:
-            stage = "发现"
-            stage_color = "rgba(255, 165, 0, 0.35)"  # 橙色
-        
-        # 方位描述
+            stage = "Spotted"
+            stage_color = "rgba(255, 165, 0, 0.35)"  # orange
+
+        # Position description
         position = self._get_position_description(center_x_ratio)
-        
+
         return {
             'area_ratio': area_ratio,
             'stage': stage,
             'stage_color': stage_color,
-            'position': position.replace("在画面", ""),  # 去掉"在画面"前缀
+            'position': position,
             'center_x_ratio': center_x_ratio,
             'center_y_ratio': center_y_ratio,
             'has_occlusion': has_occlusion,
@@ -329,14 +329,13 @@ class CrosswalkAwarenessMonitor:
         }
 
 
-# 辅助函数
+# Helper functions
 def split_combined_voice(combined_text: str) -> list:
     """
-    将组合语音拆分为多个独立语音
-    例如："远处发现斑马线,在画面左侧" → ["远处发现斑马线", "在画面左侧"]
+    Split a combined voice string into individual prompts.
+    Example: "Crosswalk spotted in the distance,on the left" → ["Crosswalk spotted in the distance", "on the left"]
     """
     if ',' in combined_text:
         parts = combined_text.split(',')
         return [p.strip() for p in parts if p.strip()]
     return [combined_text]
-

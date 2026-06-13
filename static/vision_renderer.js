@@ -1,4 +1,4 @@
-// vision_renderer.js - 前端可视化渲染器
+// vision_renderer.js - frontend visualisation renderer
 
 class VisionRenderer {
     constructor(canvasId) {
@@ -7,7 +7,6 @@ class VisionRenderer {
         this.ws = null;
         this.currentData = null;
         
-        // UI配色方案
         this.colors = {
             primaryBlue: '#00C8FF',
             secondaryPurple: '#9664FF',
@@ -21,7 +20,6 @@ class VisionRenderer {
             glassBg: 'rgba(20, 20, 20, 0.3)',
         };
         
-        // 动画状态
         this.animations = {
             flashAlpha: 0,
             messageAlpha: 1,
@@ -34,7 +32,6 @@ class VisionRenderer {
     }
     
     setupCanvas() {
-        // 设置画布大小
         const resizeCanvas = () => {
             const rect = this.canvas.getBoundingClientRect();
             this.canvas.width = rect.width;
@@ -57,7 +54,6 @@ class VisionRenderer {
         this.ws.onclose = () => {
             console.log('[VisionRenderer] Disconnected');
             this.updateConnectionStatus(false);
-            // 自动重连
             setTimeout(() => this.connect(), 2000);
         };
         
@@ -100,84 +96,56 @@ class VisionRenderer {
         const ctx = this.ctx;
         const W = this.canvas.width;
         const H = this.canvas.height;
-        
-        // 渲染手部骨骼
+
         if (data.hand_detected && data.hand_landmarks) {
             this.drawHandSkeleton(data.hand_landmarks);
-            
-            // 手部边界框
             if (data.hand_box) {
                 this.drawBox(data.hand_box, this.colors.accentCyan, 1);
             }
-            
-            // 握持评分
             this.drawTextWithBg(
-                `握持评分 Grasp Score: ${data.grasp_score.toFixed(2)}`,
+                `Grasp Score: ${data.grasp_score.toFixed(2)}`,
                 10, 60, 18, this.colors.accentCyan
             );
         }
-        
-        // 渲染检测到的物体
+
         if (data.mode === 'SEGMENT' && data.objects) {
             data.objects.forEach((obj, index) => {
                 const isSelected = index === data.selected_object_index;
                 const color = isSelected ? this.colors.success : this.colors.primaryBlue;
-                
-                // 绘制轮廓
                 if (obj.contour) {
                     this.drawContour(obj.contour, color, isSelected ? 3 : 2);
                 }
-                
-                // 选中物体的标记
                 if (isSelected && obj.center) {
                     this.drawTargetMarker(obj.center.x, obj.center.y);
                 }
             });
-            
-            // 倒计时
             if (data.countdown !== null) {
                 this.drawCountdown(data.countdown);
             }
         }
-        
-        // 闪烁动画
+
         if (data.mode === 'FLASH' && data.flash_progress !== null) {
             this.renderFlashAnimation(data.flash_progress);
         }
-        
-        // 追踪模式
+
         if (data.mode === 'TRACK') {
-            // 追踪多边形
             if (data.tracking_polygon) {
                 this.drawPolygon(data.tracking_polygon, this.colors.success, 2);
             }
-            
-            // 中心点
             if (data.tracking_center) {
                 this.drawCircle(data.tracking_center.x, data.tracking_center.y, 6, this.colors.success);
             }
-            
-            // 对齐箭头
             if (data.hand_center && data.tracking_center) {
-                this.drawMeasureArrow(
-                    data.hand_center,
-                    data.tracking_center
-                );
+                this.drawMeasureArrow(data.hand_center, data.tracking_center);
             }
-            
-            // 面积比和引导
             if (data.area_ratio !== null) {
                 this.drawAreaRatio(data.area_ratio, data.guidance);
             }
         }
-        
-        // 进度条
+
         this.drawTechProgressBars(data.align_score, data.range_score);
-        
-        // FPS
         this.drawFPS(data.fps);
-        
-        // 状态消息
+
         if (data.status_message) {
             this.drawStatusMessage(data.status_message);
         }
@@ -186,18 +154,17 @@ class VisionRenderer {
     drawHandSkeleton(landmarks) {
         const ctx = this.ctx;
         const color = this.colors.secondaryPurple;
-        
-        // MediaPipe手部连接
+
+        // MediaPipe hand connections
         const connections = [
-            [0, 1], [1, 2], [2, 3], [3, 4],  // 拇指
-            [0, 5], [5, 6], [6, 7], [7, 8],  // 食指
-            [0, 9], [9, 10], [10, 11], [11, 12],  // 中指
-            [0, 13], [13, 14], [14, 15], [15, 16],  // 无名指
-            [0, 17], [17, 18], [18, 19], [19, 20],  // 小指
-            [5, 9], [9, 13], [13, 17]  // 掌心
+            [0, 1], [1, 2], [2, 3], [3, 4],          // thumb
+            [0, 5], [5, 6], [6, 7], [7, 8],           // index
+            [0, 9], [9, 10], [10, 11], [11, 12],      // middle
+            [0, 13], [13, 14], [14, 15], [15, 16],    // ring
+            [0, 17], [17, 18], [18, 19], [19, 20],    // pinky
+            [5, 9], [9, 13], [13, 17]                 // palm
         ];
-        
-        // 绘制连接线
+
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         connections.forEach(([i, j]) => {
@@ -208,8 +175,7 @@ class VisionRenderer {
                 ctx.stroke();
             }
         });
-        
-        // 绘制关键点
+
         landmarks.forEach(point => {
             this.drawCircle(point.x, point.y, 3, color, true);
         });
@@ -218,30 +184,27 @@ class VisionRenderer {
     drawTextWithBg(text, x, y, fontSize = 18, color = this.colors.white, bgColor = this.colors.glassBg) {
         const ctx = this.ctx;
         const padding = 10;
-        
-        ctx.font = `${fontSize}px Arial, "Microsoft YaHei"`;
+
+        ctx.font = `${fontSize}px Arial, sans-serif`;
         const metrics = ctx.measureText(text);
         const textWidth = metrics.width;
         const textHeight = fontSize;
-        
-        // 绘制背景
+
         ctx.fillStyle = bgColor;
-        ctx.fillRect(x - padding, y - textHeight - padding, 
+        ctx.fillRect(x - padding, y - textHeight - padding,
                      textWidth + 2 * padding, textHeight + 2 * padding);
-        
-        // 绘制边框
+
         ctx.strokeStyle = this.colors.primaryBlue;
         ctx.lineWidth = 1;
-        ctx.strokeRect(x - padding, y - textHeight - padding, 
+        ctx.strokeRect(x - padding, y - textHeight - padding,
                        textWidth + 2 * padding, textHeight + 2 * padding);
-        
-        // 绘制文字
+
         ctx.fillStyle = color;
         ctx.fillText(text, x, y);
     }
     
     drawCountdown(seconds) {
-        const text = `检测到物体 Object detected, ${seconds.toFixed(1)}s`;
+        const text = `Object detected, ${seconds.toFixed(1)}s`;
         const x = 10;
         const y = 100;
         this.drawTextWithBg(text, x, y, 22, this.colors.warning);
@@ -251,18 +214,15 @@ class VisionRenderer {
         const ctx = this.ctx;
         const W = this.canvas.width;
         const H = this.canvas.height;
-        
-        // 计算闪烁透明度
+
         const cycleProgress = progress * 2;
         const alpha = 0.3 + 0.3 * Math.sin(cycleProgress * Math.PI);
-        
-        // 全屏闪烁效果
+
         ctx.fillStyle = this.colors.accentCyan + Math.floor(alpha * 255).toString(16).padStart(2, '0');
         ctx.fillRect(0, 0, W, H);
-        
-        // 锁定文字
-        this.drawTextWithBg('正在锁定目标... Locking target...', 
-                           W/2 - 150, H/2, 24, this.colors.accentCyan);
+
+        this.drawTextWithBg('Locking target…',
+                           W/2 - 100, H/2, 24, this.colors.accentCyan);
     }
     
     drawTechProgressBars(alignScore, rangeScore) {
@@ -273,29 +233,24 @@ class VisionRenderer {
         const gap = 20;
         const x0 = 20;
         const y0 = H - 2 * barH - gap - 60;
-        
-        // 对齐进度条
-        this.drawProgressBar(x0, y0, barW, barH, alignScore, 
-                            '对齐 Align', this.colors.primaryBlue);
-        
-        // 距离进度条
-        this.drawProgressBar(x0, y0 + barH + gap, barW, barH, rangeScore, 
-                            '距离(≈1) Distance(≈1)', this.colors.accentCyan);
+
+        this.drawProgressBar(x0, y0, barW, barH, alignScore,
+                            'Align', this.colors.primaryBlue);
+
+        this.drawProgressBar(x0, y0 + barH + gap, barW, barH, rangeScore,
+                            'Distance(≈1)', this.colors.accentCyan);
     }
     
     drawProgressBar(x, y, width, height, value, label, color) {
         const ctx = this.ctx;
-        
-        // 背景
+
         ctx.fillStyle = this.colors.darkBg;
         ctx.fillRect(x, y, width, height);
-        
-        // 边框
+
         ctx.strokeStyle = color;
         ctx.lineWidth = 1;
         ctx.strokeRect(x, y, width, height);
-        
-        // 填充（渐变）
+
         const fillWidth = width * Math.max(0, Math.min(1, value));
         if (fillWidth > 0) {
             const gradient = ctx.createLinearGradient(x, y, x + fillWidth, y);
@@ -304,8 +259,7 @@ class VisionRenderer {
             ctx.fillStyle = gradient;
             ctx.fillRect(x, y, fillWidth, height);
         }
-        
-        // 标签
+
         this.drawTextWithBg(label, x, y - 10, 14, color);
     }
     
@@ -350,10 +304,9 @@ class VisionRenderer {
     }
     
     drawTargetMarker(x, y) {
-        // 双圆圈标记
         this.drawCircle(x, y, 8, this.colors.success, false);
         this.drawCircle(x, y, 12, this.colors.success, false);
-        this.drawTextWithBg('目标 Target', x + 15, y - 5, 16, this.colors.success);
+        this.drawTextWithBg('Target', x + 15, y - 5, 16, this.colors.success);
     }
     
     drawMeasureArrow(p1, p2) {
@@ -361,8 +314,7 @@ class VisionRenderer {
         const dx = p2.x - p1.x;
         const dy = p2.y - p1.y;
         const distance = Math.sqrt(dx * dx + dy * dy);
-        
-        // 绘制线
+
         ctx.strokeStyle = this.colors.white;
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 5]);
@@ -371,8 +323,7 @@ class VisionRenderer {
         ctx.lineTo(p2.x, p2.y);
         ctx.stroke();
         ctx.setLineDash([]);
-        
-        // 绘制箭头
+
         const angle = Math.atan2(dy, dx);
         const arrowLength = 15;
         const arrowAngle = Math.PI / 6;
@@ -390,7 +341,6 @@ class VisionRenderer {
         );
         ctx.stroke();
         
-        // 显示距离
         const midX = (p1.x + p2.x) / 2;
         const midY = (p1.y + p2.y) / 2;
         ctx.fillStyle = this.colors.white;
@@ -400,17 +350,17 @@ class VisionRenderer {
     
     drawAreaRatio(ratio, guidance) {
         const y = 120;
-        const text = `面积比 Area Ratio: ${ratio.toFixed(2)}`;
+        const text = `Area Ratio: ${ratio.toFixed(2)}`;
         this.drawTextWithBg(text, 10, y, 18, this.colors.lightGray);
-        
+
         if (guidance) {
             const guidanceText = {
-                'forward': '向前靠近 Move Forward',
-                'backward': '后退 Move Back',
-                'maintain': '保持 Maintain'
+                'forward': 'Move Forward',
+                'backward': 'Move Back',
+                'maintain': 'Maintain'
             };
             const guidanceColor = guidance === 'maintain' ? this.colors.success : this.colors.warning;
-            this.drawTextWithBg(guidanceText[guidance] || guidance, 
+            this.drawTextWithBg(guidanceText[guidance] || guidance,
                                10, y + 40, 20, guidanceColor);
         }
     }
@@ -424,20 +374,18 @@ class VisionRenderer {
     drawStatusMessage(message) {
         const W = this.canvas.width;
         const H = this.canvas.height;
-        
-        // 根据消息类型选择颜色
+
         let color = this.colors.white;
-        if (message.includes('追踪丢失') || message.includes('lost')) {
+        if (message.includes('lost') || message.includes('tracking lost')) {
             color = this.colors.error;
-        } else if (message.includes('刷新') || message.includes('refreshed')) {
+        } else if (message.includes('refreshed')) {
             color = this.colors.success;
         }
-        
+
         this.drawTextWithBg(message, W/2 - 200, H - 50, 20, color);
     }
 }
 
-// 初始化渲染器
 document.addEventListener('DOMContentLoaded', () => {
     window.visionRenderer = new VisionRenderer('canvas');
 }); 
