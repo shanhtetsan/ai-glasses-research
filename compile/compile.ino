@@ -8,6 +8,7 @@
 #include "ESP_I2S.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 struct WavFmt;
 #include <cstring>      // memcmp
 #include <WiFiUdp.h>
@@ -16,10 +17,13 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PromisingGuys";
-const char* WIFI_PASS   = "aloekanal2026";
-const char* SERVER_HOST = "192.168.12.157";
+const char* WIFI_SSID   = "PRST";
+const char* WIFI_PASS   = "phone12345";
+const char* SERVER_HOST = "192.0.0.2";
 const uint16_t SERVER_PORT = 8081;
+const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+const uint32_t WIFI_RETRY_DELAY_MS = 3000;
+const bool USE_GATEWAY_AS_SERVER = true;  // Mac Internet Sharing: server runs on Wi-Fi gateway.
 
 static const char* CAM_WS_PATH = "/ws/camera";
 static const char* AUD_WS_PATH = "/ws_audio";
@@ -59,10 +63,104 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.12.157";
+const char* UDP_HOST  = SERVER_HOST;
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
+String resolved_server_host = SERVER_HOST;
+
+const char* wifi_status_name(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS: return "IDLE";
+    case WL_NO_SSID_AVAIL: return "NO_SSID_AVAILABLE";
+    case WL_SCAN_COMPLETED: return "SCAN_COMPLETED";
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
+  }
+}
+
+void print_wifi_scan_for_target() {
+  Serial.printf("[WiFi] scanning for SSID '%s'...\n", WIFI_SSID);
+  int n = WiFi.scanNetworks(false, true);
+  if (n <= 0) {
+    Serial.println("[WiFi] scan found no networks");
+    return;
+  }
+
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid == WIFI_SSID) {
+      found = true;
+      Serial.printf(
+        "[WiFi] found target SSID, RSSI=%d dBm, channel=%d, encryption=%d\n",
+        WiFi.RSSI(i),
+        WiFi.channel(i),
+        WiFi.encryptionType(i)
+      );
+    }
+  }
+  if (!found) {
+    Serial.println("[WiFi] target SSID not found. Check hotspot name and 2.4 GHz compatibility.");
+  }
+  WiFi.scanDelete();
+}
+
+void connect_wifi_forever() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  Serial.printf("[WiFi] MAC=%s\n", WiFi.macAddress().c_str());
+  Serial.printf("[WiFi] target SSID='%s'\n", WIFI_SSID);
+  Serial.printf("[NET] configured server=%s:%u camera=%s audio=%s udp=%s:%d gateway_mode=%d\n",
+                SERVER_HOST, SERVER_PORT, CAM_WS_PATH, AUD_WS_PATH, UDP_HOST, UDP_PORT,
+                USE_GATEWAY_AS_SERVER ? 1 : 0);
+
+  for (;;) {
+    print_wifi_scan_for_target();
+
+    WiFi.disconnect(true, true);
+    delay(300);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    Serial.print("[WiFi] connecting");
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+      delay(300);
+      Serial.print(".");
+    }
+
+    wl_status_t status = WiFi.status();
+    if (status == WL_CONNECTED) {
+      Serial.printf("\n[WiFi] OK ip=%s gateway=%s rssi=%d dBm\n",
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.gatewayIP().toString().c_str(),
+                    WiFi.RSSI());
+      resolved_server_host = USE_GATEWAY_AS_SERVER
+        ? WiFi.gatewayIP().toString()
+        : String(SERVER_HOST);
+      Serial.printf("[NET] resolved server=%s:%u\n",
+                    resolved_server_host.c_str(),
+                    SERVER_PORT);
+      return;
+    }
+
+    Serial.printf("\n[WiFi] failed after %lu ms, status=%s (%d). Retrying in %lu ms...\n",
+                  WIFI_CONNECT_TIMEOUT_MS,
+                  wifi_status_name(status),
+                  (int)status,
+                  WIFI_RETRY_DELAY_MS);
+    delay(WIFI_RETRY_DELAY_MS);
+  }
+}
 
 // ===== WS / Queues / I2S =====
 WebsocketsClient wsCam;
@@ -80,7 +178,7 @@ typedef struct {
 } AudioChunk;
 QueueHandle_t qAudio;
 
-#define TTS_QUEUE_DEPTH 48
+#define TTS_QUEUE_DEPTH 12
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 volatile bool tts_playing = false;
@@ -88,6 +186,48 @@ volatile bool tts_playing = false;
 I2SClass i2sIn;   // PDM RX (Mic)
 I2SClass i2sOut;  // STD TX (Speaker)
 volatile bool run_audio_stream = false;
+
+void print_network_runtime_status(const char* reason) {
+  Serial.printf(
+    "[NET] %s wifi=%s ip=%s gateway=%s target=%s:%u rssi=%d\n",
+    reason,
+    wifi_status_name(WiFi.status()),
+    WiFi.localIP().toString().c_str(),
+    WiFi.gatewayIP().toString().c_str(),
+    resolved_server_host.c_str(),
+    SERVER_PORT,
+    WiFi.RSSI()
+  );
+}
+
+void print_memory_status(const char* reason) {
+  Serial.printf(
+    "[MEM] %s heap_free=%u heap_min=%u internal_free=%u psram_free=%u psram_size=%u\n",
+    reason,
+    ESP.getFreeHeap(),
+    ESP.getMinFreeHeap(),
+    heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+    ESP.getFreePsram(),
+    ESP.getPsramSize()
+  );
+}
+
+bool create_task_checked(TaskFunction_t task,
+                         const char* name,
+                         uint32_t stack_words,
+                         UBaseType_t priority,
+                         BaseType_t core) {
+  BaseType_t ok = xTaskCreatePinnedToCore(task, name, stack_words, NULL, priority, NULL, core);
+  if (ok != pdPASS) {
+    Serial.printf("[MEM] task create failed name=%s stack_words=%u core=%d\n",
+                  name,
+                  stack_words,
+                  (int)core);
+    print_memory_status("task-create-failed");
+    return false;
+  }
+  return true;
+}
 
 // ====================================================================
 // Camera
@@ -550,10 +690,10 @@ void taskHttpPlay(void*){
   while (http_play_running) {
     if (!cli.connected()) {
       Serial.println("[AUDIO] HTTP connect...");
-      if (!cli.connect(SERVER_HOST, SERVER_PORT)) { delay(500); continue; }
+      if (!cli.connect(resolved_server_host.c_str(), SERVER_PORT)) { delay(500); continue; }
       String req =
         String("GET /stream.wav HTTP/1.1\r\n") +
-        "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
+        "Host: " + resolved_server_host + ":" + String(SERVER_PORT) + "\r\n" +
         "Connection: keep-alive\r\n\r\n";
       cli.print(req);
     }
@@ -844,7 +984,7 @@ void taskImuLoop(void*){
       ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
 
     if (n > 0) {
-      udp.beginPacket(UDP_HOST, UDP_PORT);
+      udp.beginPacket(resolved_server_host.c_str(), UDP_PORT);
       udp.write((const uint8_t*)buf, n);
       udp.endPacket();
     }
@@ -857,36 +997,45 @@ void taskImuLoop(void*){
 // ====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(1000);
+  print_memory_status("boot");
+  if (!psramFound()) {
+    Serial.println("[MEM] PSRAM not found. Re-upload with FQBN esp32:esp32:XIAO_ESP32S3:PSRAM=opi");
+  }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WiFi] connecting");
-  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
-  Serial.println(" OK " + WiFi.localIP().toString());
+  connect_wifi_forever();
+  print_memory_status("after-wifi");
 
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
+  print_memory_status("after-camera");
 
   udp.begin(0);
 
   init_i2s_in();
   init_i2s_out();
+  print_memory_status("after-i2s");
 
   qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
+  if (!qFrames || !qAudio || !qTTS) {
+    Serial.printf("[MEM] queue create failed qFrames=%p qAudio=%p qTTS=%p\n", qFrames, qAudio, qTTS);
+    print_memory_status("queue-create-failed");
+    delay(1500);
+    esp_restart();
+  }
+  print_memory_status("after-queues");
 
-  xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
-  xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
+  if (!create_task_checked(taskCamCapture, "cam_cap", 10240, 4, 1) ||
+      !create_task_checked(taskCamSend,    "cam_snd",  8192, 3, 1) ||
+      !create_task_checked(taskMicCapture, "mic_cap",  4096, 2, 0) ||
+      !create_task_checked(taskMicUpload,  "mic_upl",  4096, 2, 1) ||
+      !create_task_checked(taskImuLoop,    "imu_loop", 4096, 2, 0) ||
+      !create_task_checked(taskTTSPlay,    "tts_play", 4096, 2, 0)) {
+    delay(1500);
+    esp_restart();
+  }
+  print_memory_status("after-tasks");
 
   wsCam.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
@@ -985,20 +1134,59 @@ void setup() {
 }
 
 void loop() {
+  static unsigned long last_net_status = 0;
+  static unsigned long cam_retry_count = 0;
+  static unsigned long aud_retry_count = 0;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[WiFi] lost connection, status=%s (%d). Reconnecting...\n",
+                  wifi_status_name(WiFi.status()),
+                  (int)WiFi.status());
+    cam_ws_ready = false;
+    aud_ws_ready = false;
+    run_audio_stream = false;
+    stopStreamWav();
+    wsCam.close();
+    wsAud.close();
+    connect_wifi_forever();
+  }
+
+  unsigned long now = millis();
+  if (now - last_net_status > 10000) {
+    print_network_runtime_status("runtime");
+    last_net_status = now;
+  }
+
   if (!wsCam.available()) {
-    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
+    if (wsCam.connect(resolved_server_host.c_str(), SERVER_PORT, CAM_WS_PATH)) {
       Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
+      cam_retry_count = 0;
+    } else {
+      cam_retry_count++;
+      Serial.printf("[WS-CAM] retry #%lu target=%s:%u in 1s...\n",
+                    cam_retry_count,
+                    resolved_server_host.c_str(),
+                    SERVER_PORT);
+      delay(1000);
+    }
   }
 
   if (!wsAud.available()) {
-    if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
+    if (wsAud.connect(resolved_server_host.c_str(), SERVER_PORT, AUD_WS_PATH)) {
       Serial.println("[WS-AUD] connected");
+      aud_retry_count = 0;
       delay(50);
       run_audio_stream = true;
       wsAud.send("START");
       startStreamWav();   // /stream.wav (chunked)
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
+    } else {
+      aud_retry_count++;
+      Serial.printf("[WS-AUD] retry #%lu target=%s:%u in 2s...\n",
+                    aud_retry_count,
+                    resolved_server_host.c_str(),
+                    SERVER_PORT);
+      delay(2000);
+    }
   }
 
   wsCam.poll();

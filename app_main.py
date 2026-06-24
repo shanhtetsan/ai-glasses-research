@@ -64,10 +64,13 @@ except Exception:
 # ---- Local Whisper ASR (replaces DashScope) ----
 # ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
 SAMPLE_RATE = 16000
+from asr_config import load_whisper_config
 import whisper as _whisper_lib
-print("[ASR] Loading Whisper 'base' model …")
-_whisper_model = _whisper_lib.load_model("base")
-print("[ASR] Whisper model ready.")
+_whisper_config = load_whisper_config()
+print(f"[ASR] Loading Whisper {_whisper_config.model!r} model …")
+_whisper_model = _whisper_lib.load_model(_whisper_config.model)
+lang_label = _whisper_config.language or "auto"
+print(f"[ASR] Whisper model ready. language={lang_label}")
 
 # ---- Import our modules ----
 from audio_stream import (
@@ -78,7 +81,25 @@ from audio_stream import (
     is_playing_now,
     current_ai_task,
 )
-from omni_client import stream_chat, OmniStreamPiece
+try:
+    from omni_client import stream_chat, OmniStreamPiece
+except Exception as e:
+    _omni_import_error = e
+    print(f"[OMNI] Disabled: {e}", flush=True)
+
+    class OmniStreamPiece:
+        """Fallback piece used when local Omni cannot load."""
+        def __init__(self, text_delta: Optional[str] = None, audio_b64: Optional[str] = None):
+            self.text_delta = text_delta
+            self.audio_b64 = audio_b64
+
+    async def stream_chat(content_list, voice="Cherry", audio_format="wav"):
+        yield OmniStreamPiece(
+            text_delta=(
+                "Voice transcription is working, but local Omni is unavailable. "
+                f"Startup error: {_omni_import_error}"
+            )
+        )
 from asr_core import (
     ASRCallback,
     set_current_recognition,
@@ -861,7 +882,7 @@ async def ws_audio(ws: WebSocket):
                             result  = await loop.run_in_executor(
                                 None,
                                 lambda: _whisper_model.transcribe(
-                                    samples, language="en", fp16=False
+                                    samples, language=_whisper_config.language, fp16=False
                                 )
                             )
                             text = (result.get("text") or "").strip()
@@ -1335,8 +1356,18 @@ async def on_startup_init_audio():
 
 @app.on_event("startup")
 async def on_startup():
+    if os.getenv("AIGLASS_DISABLE_IMU_UDP", "0") == "1":
+        print("[UDP] IMU listener disabled by AIGLASS_DISABLE_IMU_UDP=1", flush=True)
+        return
+
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
+    try:
+        await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
+    except OSError as e:
+        print(
+            f"[UDP] IMU listener disabled: could not bind {UDP_IP}:{UDP_PORT}: {e}",
+            flush=True,
+        )
 
 @app.on_event("shutdown")
 async def on_shutdown():

@@ -10,6 +10,7 @@
 #   - device_map="mps" (NOT "auto") avoids meta-device disk offload on Apple Silicon
 #
 import os, base64, asyncio, io
+from pathlib import Path
 from typing import AsyncGenerator, Dict, Any, List, Optional
 
 # ===== [DASHSCOPE FALLBACK] Remote Qwen-Omni via OpenAI-compatible API =====
@@ -29,13 +30,44 @@ from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcess
 
 _MODEL_ID = os.getenv("QWEN_OMNI_MODEL", "Qwen/Qwen2.5-Omni-3B")
 
-print(f"[OMNI] Loading local model {_MODEL_ID!r} → MPS float16 …")
+
+def _resolve_model_path(model_id: str) -> str:
+    """Prefer an already-downloaded Hugging Face snapshot to avoid startup HEAD checks."""
+    if os.path.exists(model_id):
+        return model_id
+
+    repo_cache_name = f"models--{model_id.replace('/', '--')}"
+    candidates = []
+    for cache_root in (
+        os.getenv("HF_HOME"),
+        os.path.join(os.getenv("XDG_CACHE_HOME", ""), "huggingface"),
+        os.path.join(os.getcwd(), ".cache", "huggingface"),
+    ):
+        if cache_root:
+            candidates.append(Path(cache_root) / "hub" / repo_cache_name)
+
+    for model_cache in candidates:
+        ref_file = model_cache / "refs" / "main"
+        if not ref_file.exists():
+            continue
+        revision = ref_file.read_text(encoding="utf-8").strip()
+        snapshot = model_cache / "snapshots" / revision
+        if (snapshot / "config.json").exists():
+            return str(snapshot)
+
+    return model_id
+
+_MODEL_PATH = _resolve_model_path(_MODEL_ID)
+_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+_DTYPE = torch.float16 if _DEVICE == "mps" else torch.float32
+
+print(f"[OMNI] Loading local model {_MODEL_PATH!r} → {_DEVICE} {_DTYPE} …")
 _model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-    _MODEL_ID,
-    torch_dtype=torch.float16,
-    device_map="mps",      # force MPS — "auto" falls back to meta/CPU and offloads to disk
+    _MODEL_PATH,
+    torch_dtype=_DTYPE,
+    device_map=_DEVICE,
 )
-_processor = Qwen2_5OmniProcessor.from_pretrained(_MODEL_ID)
+_processor = Qwen2_5OmniProcessor.from_pretrained(_MODEL_PATH)
 print("[OMNI] Local model ready.")
 
 
@@ -140,7 +172,7 @@ async def stream_chat(
         images=pil_images if pil_images else None,
         padding=True,
         return_tensors="pt",
-    ).to("mps")
+    ).to(_DEVICE)
 
     prompt_len = proc_inputs.input_ids.shape[1]
     loop = asyncio.get_event_loop()
@@ -150,7 +182,7 @@ async def stream_chat(
             output_ids = _model.generate(
                 **proc_inputs,
                 thinker_max_new_tokens=256,
-                generation_mode="text",   # skips talker + token2wav entirely
+                return_audio=False,        # skips talker + token2wav entirely
             )
         new_ids = output_ids[0][prompt_len:]
         return _processor.decode(new_ids, skip_special_tokens=True).strip()

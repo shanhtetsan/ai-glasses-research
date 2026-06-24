@@ -75,18 +75,18 @@ source venv/bin/activate
 # 升级 pip
 echo ""
 echo "正在升级 pip..."
-pip install --upgrade pip -q
-echo -e "${GREEN}✓ pip 已升级${NC}"
+pip install --upgrade pip setuptools wheel -q
+echo -e "${GREEN}✓ pip/setuptools/wheel 已升级${NC}"
 
 # 安装 PyTorch
 echo ""
 echo "正在安装 PyTorch..."
 if [ "$HAS_GPU" = true ]; then
-    echo "安装 GPU 版本 PyTorch (CUDA 11.8)..."
-    pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --index-url https://download.pytorch.org/whl/cu118 -q
+    echo "安装 GPU 版本 PyTorch (CUDA 12.1)..."
+    pip install torch==2.3.1+cu121 torchvision==0.18.1+cu121 --index-url https://download.pytorch.org/whl/cu121 -q
 else
     echo "安装 CPU 版本 PyTorch..."
-    pip install torch torchvision -q
+    pip install torch==2.3.1 torchvision==0.18.1 -q
 fi
 echo -e "${GREEN}✓ PyTorch 已安装${NC}"
 
@@ -189,4 +189,3 @@ echo ""
 echo -e "${YELLOW}注意: 每次使用前请激活虚拟环境:${NC}"
 echo "  source venv/bin/activate"
 echo ""
-

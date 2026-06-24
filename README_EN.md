@@ -113,6 +113,7 @@ source venv/bin/activate
 
 Install Python packages:
 ```bash
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
@@ -142,7 +143,24 @@ python app_main.py
 
 The system starts at `http://0.0.0.0:8081`. Open your browser to see the live monitoring interface.
 
-### 6. Connect device (optional)
+### 6. Test voice input on your laptop
+
+In another terminal, activate the same virtual environment and send a sample WAV:
+
+```bash
+python dev_mic_client.py --wav test_7b.wav
+```
+
+To test with your laptop microphone:
+
+```bash
+python dev_mic_client.py --list-devices
+python dev_mic_client.py --seconds 5
+```
+
+The server log should print `[ASR/WHISPER] '<recognized text>'`, and the web UI should show the final transcript.
+
+### 7. Connect device (optional)
 
 If using ESP32-CAM:
 1. Flash `compile/compile.ino` to the ESP32
@@ -203,8 +221,8 @@ If using ESP32-CAM:
 ┌─────────▼─────────────────────────────────────────────────────┐
 │                     External Services Layer                    │
 │  ┌──────────────────────────────────────────────┐            │
-│  │  Alibaba Cloud DashScope API                  │            │
-│  │  - Paraformer ASR (real-time speech recognition)│          │
+│  │  Local Whisper + Alibaba Cloud DashScope API   │            │
+│  │  - Whisper ASR (buffered speech recognition)   │            │
 │  │  - Qwen-Omni-Turbo (multimodal dialogue)      │            │
 │  │  - Qwen-Turbo (tag extraction)                │            │
 │  └──────────────────────────────────────────────┘            │
@@ -220,7 +238,7 @@ If using ESP32-CAM:
 | Blind Path Nav | `workflow_blindpath.py` | Tactile paving detection, obstacle avoidance, turn guidance |
 | Cross Street Nav | `workflow_crossstreet.py` | Zebra crossing detection, traffic light recognition, alignment |
 | Item Search | `yolomedia.py` | Object detection, hand guidance, grasp confirmation |
-| Speech Recognition | `asr_core.py` | Real-time ASR, VAD, command parsing |
+| Speech Recognition | `app_main.py` / `asr_core.py` | Buffered Whisper ASR, hotword detection, command parsing |
 | Speech Synthesis | `omni_client.py` | Qwen-Omni streaming voice generation |
 | Audio Playback | `audio_player.py` | Multi-channel mixing, TTS playback, volume control |
 | Video Recording | `sync_recorder.py` | Synchronized A/V recording |
@@ -318,6 +336,8 @@ AIGLASS_MASK_MISS_TTL=6         # Mask loss tolerance frames
 AIGLASS_PANEL_SCALE=0.65        # Status panel scale
 
 # Audio
+WHISPER_MODEL=base                 # tiny/base/small/medium/large, or a local model path
+WHISPER_LANG=en                    # en, zh, etc.; use auto for language detection
 TTS_INTERVAL_SEC=1.0            # Voice broadcast interval
 ENABLE_TTS=true                 # Enable TTS
 ```
