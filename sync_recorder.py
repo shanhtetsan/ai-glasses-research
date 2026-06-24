@@ -57,7 +57,7 @@ class SyncRecorder:
         self.audio_bytes_written = 0
         self.last_log_time = time.time()
 
-        print(f"[RECORDER] Recorder initialized - FPS={fps}, output dir={output_dir}")
+        pass  # recorder initialized
 
     def start_recording(self):
         """Start a new recording session."""
@@ -90,9 +90,6 @@ class SyncRecorder:
             return False
 
         self.is_recording = True
-        print(f"[RECORDER] Recording started")
-        print(f"  Video: {self.video_path}")
-        print(f"  Audio: {self.audio_path}")
         return True
 
     def add_frame(self, jpeg_data: bytes):
@@ -130,7 +127,7 @@ class SyncRecorder:
                         self.is_recording = False
                         return
 
-                    print(f"[RECORDER] Video writer initialized: {width}x{height} @ {self.fps}fps")
+                    pass  # video writer ready
 
                 # Write frame
                 self.video_writer.write(frame)
@@ -144,17 +141,7 @@ class SyncRecorder:
                 # Audio sync: pad silence to match video duration
                 self._sync_audio_to_video(current_video_time)
 
-                # Performance log (every 10s)
-                now = time.time()
-                if now - self.last_log_time > 10.0:
-                    elapsed = now - self.start_time
-                    avg_fps = self.frames_written / elapsed if elapsed > 0 else 0
-                    audio_duration = self.audio_bytes_written / (self.sample_rate * self.sample_width)
-                    print(f"[RECORDER] Recording - frames={self.frames_written}, "
-                          f"actual FPS={avg_fps:.1f}, "
-                          f"video duration={current_video_time:.1f}s, "
-                          f"audio duration={audio_duration:.1f}s")
-                    self.last_log_time = now
+                self.last_log_time = time.time()  # suppress periodic status spam
 
         except Exception as e:
             print(f"[RECORDER] Failed to add frame: {e}")
@@ -184,8 +171,7 @@ class SyncRecorder:
                 self.last_audio_time = current_video_time + audio_duration
                 self.audio_bytes_written += len(pcm_data)
 
-                if text:
-                    print(f"[RECORDER] Recording audio: {text[:30]}... (time={current_video_time:.2f}s, duration={audio_duration:.2f}s)")
+                pass  # audio recorded
 
         except Exception as e:
             print(f"[RECORDER] Failed to add audio: {e}")

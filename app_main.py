@@ -35,6 +35,9 @@ try:
     import yolomedia
 except Exception:
     yolomedia = None
+DEBUG     = False  # set True to enable verbose navigation/recorder/YOLO logs
+DEBUG_VAD = False   # set False once VAD_SILENCE_RMS is tuned for your mic
+
 # ---- Windows event loop policy ----
 if sys.platform.startswith("win"):
     try:
@@ -65,9 +68,37 @@ except Exception:
 # ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
 SAMPLE_RATE = 16000
 import whisper as _whisper_lib
-print("[ASR] Loading Whisper 'base' model …")
+print("[...] Loading Whisper model...")
 _whisper_model = _whisper_lib.load_model("base")
-print("[ASR] Whisper model ready.")
+print("[OK] Whisper model ready")
+
+# ---- Server-side Voice Activity Detection (VAD) tuning ----
+# The ESP32 streams PCM16 continuously; these constants control when the
+# server decides the user has finished speaking and fires Whisper.
+#
+# VAD_SILENCE_RMS   — RMS amplitude (int16 scale, 0–32767) of a 20 ms chunk
+#                     that is treated as "silent".
+#                     Background/noise floor is typically 50–150.
+#                     Normal speech is 300–3 000+.
+#                     Raise if ambient noise falsely triggers speech detection;
+#                     lower if soft voices are missed.
+VAD_SILENCE_RMS    = 300
+
+# VAD_SILENCE_MS    — milliseconds of continuous silence (after speech has
+#                     been detected) that trigger auto-transcription.
+#                     700 ms = 35 chunks × 20 ms. Raise for slower speakers;
+#                     lower for snappier response.
+VAD_SILENCE_MS     = 700
+
+# VAD_MIN_SPEECH_MS — minimum speech duration (ms) before silence can fire
+#                     Whisper.  Prevents spurious triggers from a brief click
+#                     or microphone pop.  300 ms = 15 chunks × 20 ms.
+VAD_MIN_SPEECH_MS  = 300
+
+# Derived chunk counts (ESP32 sends exactly 20 ms chunks at 16 kHz / PCM16).
+_VAD_CHUNK_MS         = 20
+VAD_SILENCE_CHUNKS    = VAD_SILENCE_MS    // _VAD_CHUNK_MS   # 35
+VAD_MIN_SPEECH_CHUNKS = VAD_MIN_SPEECH_MS // _VAD_CHUNK_MS   # 15
 
 # ---- Import our modules ----
 from audio_stream import (
@@ -148,15 +179,15 @@ def load_navigation_models():
         #print(f"[NAVIGATION] Trying to load model: {seg_model_path}")
 
         if os.path.exists(seg_model_path):
-            print(f"[NAVIGATION] Model file found, starting load...")
+            if DEBUG: print(f"[NAVIGATION] Model file found, starting load...")
             yolo_seg_model = YOLO(seg_model_path)
 
             # Force the model onto GPU
             if torch.cuda.is_available():
                 yolo_seg_model.to("cuda")
-                print(f"[NAVIGATION] Blind-path segmentation model loaded and moved to GPU: {yolo_seg_model.device}")
+                if DEBUG: print(f"[NAVIGATION] Blind-path segmentation model loaded and moved to GPU: {yolo_seg_model.device}")
             else:
-                print("[NAVIGATION] CUDA not available, model remains on CPU")
+                if DEBUG: print("[NAVIGATION] CUDA not available, model remains on CPU")
 
             # Test whether the model runs correctly
             try:
@@ -166,72 +197,32 @@ def load_navigation_models():
                     device="cuda" if torch.cuda.is_available() else "cpu",
                     verbose=False
                 )
-                print(f"[NAVIGATION] Model test succeeded, supported class count: {len(yolo_seg_model.names) if hasattr(yolo_seg_model, 'names') else 'unknown'}")
-                if hasattr(yolo_seg_model, 'names'):
-                    print(f"[NAVIGATION] Model classes: {yolo_seg_model.names}")
+                if DEBUG: print(f"[NAVIGATION] Model test succeeded, supported class count: {len(yolo_seg_model.names) if hasattr(yolo_seg_model, 'names') else 'unknown'}")
             except Exception as e:
                 print(f"[NAVIGATION] Model test failed: {e}")
         else:
             print(f"[NAVIGATION] Error: model file not found: {seg_model_path}")
-            print(f"[NAVIGATION] Current working directory: {os.getcwd()}")
-            print(f"[NAVIGATION] Please verify that the file path is correct")
-            
+
         # Use ObstacleDetectorClient instead of YOLO directly
         obstacle_model_path = os.getenv("OBSTACLE_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
-        print(f"[NAVIGATION] Attempting to load obstacle detection model: {obstacle_model_path}")
+        if DEBUG: print(f"[NAVIGATION] Attempting to load obstacle detection model: {obstacle_model_path}")
 
         if os.path.exists(obstacle_model_path):
-            print(f"[NAVIGATION] Obstacle detection model file found, starting load...")
+            if DEBUG: print(f"[NAVIGATION] Obstacle detection model file found, starting load...")
             try:
                 # Use YOLO-E wrapped inside ObstacleDetectorClient
                 obstacle_detector = ObstacleDetectorClient(model_path=obstacle_model_path)
-                print(f"[NAVIGATION] ========== YOLO-E obstacle detector loaded successfully ==========")
-
-                # Check whether the model loaded successfully
-                if hasattr(obstacle_detector, 'model') and obstacle_detector.model is not None:
-                    print(f"[NAVIGATION] YOLO-E model initialized")
-                    print(f"[NAVIGATION] Model device: {next(obstacle_detector.model.parameters()).device}")
-                else:
-                    print(f"[NAVIGATION] Warning: YOLO-E model initialization failed")
-
-                # Check whether the whitelist loaded successfully
-                if hasattr(obstacle_detector, 'WHITELIST_CLASSES'):
-                    print(f"[NAVIGATION] Whitelist class count: {len(obstacle_detector.WHITELIST_CLASSES)}")
-                    print(f"[NAVIGATION] First 10 whitelist classes: {', '.join(obstacle_detector.WHITELIST_CLASSES[:10])}")
-                else:
-                    print(f"[NAVIGATION] Warning: whitelist classes not defined")
-
-                # Check whether text features were pre-computed successfully
-                if hasattr(obstacle_detector, 'whitelist_embeddings') and obstacle_detector.whitelist_embeddings is not None:
-                    print(f"[NAVIGATION] YOLO-E text features pre-computed")
-                    print(f"[NAVIGATION] Text feature tensor shape: {obstacle_detector.whitelist_embeddings.shape if hasattr(obstacle_detector.whitelist_embeddings, 'shape') else 'unknown'}")
-                else:
-                    print(f"[NAVIGATION] Warning: YOLO-E text features not pre-computed")
+                if DEBUG: print(f"[NAVIGATION] YOLO-E obstacle detector loaded successfully")
 
                 # Test the obstacle detection functionality
-                print(f"[NAVIGATION] Testing YOLO-E detection...")
-                try:
-                    test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                    # Draw a white rectangle in the test image to simulate an object
-                    cv2.rectangle(test_img, (200, 200), (400, 400), (255, 255, 255), -1)
-                    
-                    # Test detection (no path_mask provided)
-                    test_results = obstacle_detector.detect(test_img)
-                    print(f"[NAVIGATION] YOLO-E detection test succeeded!")
-                    print(f"[NAVIGATION] Test detection result count: {len(test_results)}")
-
-                    if len(test_results) > 0:
-                        print(f"[NAVIGATION] Objects detected in test:")
-                        for i, obj in enumerate(test_results):
-                            print(f"  - Object {i+1}: {obj.get('name', 'unknown')}, "
-                                  f"area ratio: {obj.get('area_ratio', 0):.3f}, "
-                                  f"position: ({obj.get('center_x', 0):.0f}, {obj.get('center_y', 0):.0f})")
-                except Exception as e:
-                    print(f"[NAVIGATION] YOLO-E detection test failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                print(f"[NAVIGATION] ========== YOLO-E obstacle detector load complete ==========")
+                if DEBUG:
+                    try:
+                        test_img = np.zeros((640, 640, 3), dtype=np.uint8)
+                        cv2.rectangle(test_img, (200, 200), (400, 400), (255, 255, 255), -1)
+                        test_results = obstacle_detector.detect(test_img)
+                        print(f"[NAVIGATION] YOLO-E detection test: {len(test_results)} objects")
+                    except Exception as e:
+                        print(f"[NAVIGATION] YOLO-E detection test failed: {e}")
 
             except Exception as e:
                 print(f"[NAVIGATION] Obstacle detector load failed: {e}")
@@ -239,7 +230,7 @@ def load_navigation_models():
                 traceback.print_exc()
                 obstacle_detector = None
         else:
-            print(f"[NAVIGATION] Warning: obstacle detection model file not found: {obstacle_model_path}")
+            if DEBUG: print(f"[NAVIGATION] Warning: obstacle detection model file not found: {obstacle_model_path}")
 
     except Exception as e:
         print(f"[NAVIGATION] Model load failed: {e}")
@@ -247,14 +238,12 @@ def load_navigation_models():
         traceback.print_exc()
 
 # Load models at program startup
-print("[NAVIGATION] Loading navigation models...")
+if DEBUG: print("[NAVIGATION] Loading navigation models...")
 load_navigation_models()
-print(f"[NAVIGATION] Model loading complete - yolo_seg_model: {yolo_seg_model is not None}")
+if DEBUG: print(f"[NAVIGATION] Model loading complete - yolo_seg_model: {yolo_seg_model is not None}")
 
 # Start synchronous recording
-print("[RECORDER] Starting synchronous recording system...")
 sync_recorder.start_recording()
-print("[RECORDER] Recording system started, will automatically save video and audio")
 
 # Register exit handler to ensure recordings are saved on Ctrl+C
 def cleanup_on_exit():
@@ -278,25 +267,24 @@ signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
 signal.signal(signal.SIGTERM, signal_handler)  # termination signal
 atexit.register(cleanup_on_exit)               # also called on normal exit
 
-print("[RECORDER] Exit handler registered - recording will be saved automatically on Ctrl+C")
+if DEBUG: print("[RECORDER] Exit handler registered")
 
 
 
 # Pre-load the traffic-light detection model (prevents stutter when entering WAIT_TRAFFIC_LIGHT state)
 try:
     import trafficlight_detection
-    print("[TRAFFIC_LIGHT] Pre-loading traffic-light detection model...")
+    if DEBUG: print("[TRAFFIC_LIGHT] Pre-loading traffic-light detection model...")
     if trafficlight_detection.init_model():
-        print("[TRAFFIC_LIGHT] Traffic-light detection model pre-loaded successfully")
-        # Run one test inference to fully warm up the model
+        if DEBUG: print("[TRAFFIC_LIGHT] Traffic-light detection model pre-loaded successfully")
         try:
             test_img = np.zeros((640, 640, 3), dtype=np.uint8)
             _ = trafficlight_detection.process_single_frame(test_img)
-            print("[TRAFFIC_LIGHT] Model warmup complete")
+            if DEBUG: print("[TRAFFIC_LIGHT] Model warmup complete")
         except Exception as e:
             print(f"[TRAFFIC_LIGHT] Model warmup failed: {e}")
     else:
-        print("[TRAFFIC_LIGHT] Traffic-light detection model pre-load failed")
+        if DEBUG: print("[TRAFFIC_LIGHT] Traffic-light detection model pre-load failed")
 except Exception as e:
     print(f"[TRAFFIC_LIGHT] Traffic-light model pre-load error: {e}")
 
@@ -375,7 +363,7 @@ async def full_system_reset(reason: str = ""):
     except Exception:
         pass
 
-    print("[SYSTEM] full reset done.", flush=True)
+    if DEBUG: print("[SYSTEM] full reset done.", flush=True)
 
 # ========= Start/Stop YOLO media processing =========
 def start_yolomedia_with_target(target_name: str):
@@ -388,8 +376,7 @@ def start_yolomedia_with_target(target_name: str):
     
     # Look up the corresponding YOLO class label
     yolo_class = ITEM_TO_CLASS_MAP.get(target_name, target_name)
-    print(f"[YOLOMEDIA] Starting with target: {target_name} -> YOLO class: {yolo_class}", flush=True)
-    print(f"[YOLOMEDIA] Available mappings: {ITEM_TO_CLASS_MAP}", flush=True)
+    if DEBUG: print(f"[YOLOMEDIA] Starting with target: {target_name} -> YOLO class: {yolo_class}", flush=True)
     
     yolomedia_stop_event.clear()
     yolomedia_running = True
@@ -408,26 +395,23 @@ def start_yolomedia_with_target(target_name: str):
     
     yolomedia_thread = threading.Thread(target=_run, daemon=True)
     yolomedia_thread.start()
-    print(f"[YOLOMEDIA] background worker started for: {yolo_class} (initializing, showing raw frame temporarily)", flush=True)
+    if DEBUG: print(f"[YOLOMEDIA] background worker started for: {yolo_class}", flush=True)
 
 def stop_yolomedia():
     """Stop the yolomedia worker thread."""
     global yolomedia_thread, yolomedia_stop_event, yolomedia_running, yolomedia_sending_frames
     
     if yolomedia_running:
-        print("[YOLOMEDIA] Stopping worker...", flush=True)
+        if DEBUG: print("[YOLOMEDIA] Stopping worker...", flush=True)
         yolomedia_stop_event.set()
-        
+
         # Wait for the thread to finish (up to 5 seconds)
         if yolomedia_thread and yolomedia_thread.is_alive():
             yolomedia_thread.join(timeout=5.0)
-        
+
         yolomedia_running = False
         yolomedia_sending_frames = False
-        
-        # If the orchestrator is in item-search mode, do not auto-restore on stop (controlled by command)
-        # Just clear the flags
-        print("[YOLOMEDIA] Worker stopped, waiting for state transition.", flush=True)
+        if DEBUG: print("[YOLOMEDIA] Worker stopped.", flush=True)
 
 # ========= Custom start_ai_with_text, with special command recognition =========
 async def start_ai_with_text_custom(user_text: str):
@@ -450,8 +434,9 @@ async def start_ai_with_text_custom(user_text: str):
             
             # If neither an allowed query nor a navigation control command, discard
             if not is_allowed_query and not is_nav_control:
-                mode_name = "Traffic light detection" if current_state == "TRAFFIC_LIGHT_DETECTION" else "Navigation"
-                print(f"[{mode_name} mode] Discarding non-dialogue audio: {user_text}")
+                if DEBUG:
+                    mode_name = "Traffic light detection" if current_state == "TRAFFIC_LIGHT_DETECTION" else "Navigation"
+                    print(f"[{mode_name} mode] Discarding non-dialogue audio: {user_text}")
                 return  # discard; do not enter omni
     
     # Check for street-crossing commands — use orchestrator to control
@@ -463,7 +448,7 @@ async def start_ai_with_text_custom(user_text: str):
 
         if orchestrator:
             orchestrator.start_crossing()
-            print(f"[CROSS_STREET] Street-crossing mode started, state: {orchestrator.get_state()}")
+            if DEBUG: print(f"[CROSS_STREET] Street-crossing mode started, state: {orchestrator.get_state()}")
             # Play launch voice prompt and broadcast to UI
             play_voice_text("Street crossing mode activated.")
             await ui_broadcast_final("[System] Street-crossing mode started")
@@ -476,7 +461,7 @@ async def start_ai_with_text_custom(user_text: str):
     if "过马路结束" in user_text or "结束过马路" in user_text:
         if orchestrator:
             orchestrator.stop_navigation()
-            print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
+            if DEBUG: print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
             # Play stop voice prompt and broadcast to UI
             play_voice_text("Navigation stopped.")
             await ui_broadcast_final("[System] Street-crossing mode stopped")
@@ -492,7 +477,7 @@ async def start_ai_with_text_custom(user_text: str):
             # Switch orchestrator to traffic-light detection mode (pause blind-path navigation)
             if orchestrator:
                 orchestrator.start_traffic_light_detection()
-                print(f"[TRAFFIC] Switched to traffic-light detection mode, state: {orchestrator.get_state()}")
+                if DEBUG: print(f"[TRAFFIC] Switched to traffic-light detection mode, state: {orchestrator.get_state()}")
             
             # Use main-thread processing instead of a separate thread to avoid dropped frames
             success = trafficlight_detection.init_model()  # initialise model only; do not start a thread
@@ -512,7 +497,7 @@ async def start_ai_with_text_custom(user_text: str):
             # Restore to dialogue (CHAT) mode
             if orchestrator:
                 orchestrator.stop_navigation()  # return to CHAT mode
-                print(f"[TRAFFIC] Traffic-light detection stopped, restored to {orchestrator.get_state()} mode")
+                if DEBUG: print(f"[TRAFFIC] Traffic-light detection stopped, restored to {orchestrator.get_state()} mode")
 
             await ui_broadcast_final("[System] Traffic-light detection stopped")
         except Exception as e:
@@ -529,7 +514,7 @@ async def start_ai_with_text_custom(user_text: str):
 
         if orchestrator:
             orchestrator.start_blind_path_navigation()
-            print(f"[NAVIGATION] Blind-path navigation started, state: {orchestrator.get_state()}")
+            if DEBUG: print(f"[NAVIGATION] Blind-path navigation started, state: {orchestrator.get_state()}")
             await ui_broadcast_final("[System] Blind-path navigation started")
         else:
             print("[NAVIGATION] Warning: navigation master not initialized!")
@@ -539,7 +524,7 @@ async def start_ai_with_text_custom(user_text: str):
     if "停止导航" in user_text or "结束导航" in user_text:
         if orchestrator:
             orchestrator.stop_navigation()
-            print(f"[NAVIGATION] Navigation stopped, state: {orchestrator.get_state()}")
+            if DEBUG: print(f"[NAVIGATION] Navigation stopped, state: {orchestrator.get_state()}")
             await ui_broadcast_final("[System] Blind-path navigation stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
@@ -565,12 +550,12 @@ async def start_ai_with_text_custom(user_text: str):
         if item_cn:
             # Use local mapping + Qwen to extract the English class label
             label_en, src = extract_english_label(item_cn)
-            print(f"[COMMAND] Finder request: '{item_cn}' -> '{label_en}' (src={src})", flush=True)
+            if DEBUG: print(f"[COMMAND] Finder request: '{item_cn}' -> '{label_en}' (src={src})", flush=True)
 
             # Switch to item-search mode (pause navigation)
             if orchestrator:
                 orchestrator.start_item_search()
-                print(f"[ITEM_SEARCH] Switched to item-search mode, state: {orchestrator.get_state()}")
+                if DEBUG: print(f"[ITEM_SEARCH] Switched to item-search mode, state: {orchestrator.get_state()}")
             
             # Pass the English class label to yolomedia (it will auto-switch to YOLOE when the class is not found)
             start_yolomedia_with_target(label_en)
@@ -585,15 +570,15 @@ async def start_ai_with_text_custom(user_text: str):
     
     # Check for "found it" (找到了) command
     if "找到了" in user_text or "拿到了" in user_text:
-        print("[COMMAND] Found command detected", flush=True)
+        if DEBUG: print("[COMMAND] Found command detected", flush=True)
         # Stop the yolomedia worker
         stop_yolomedia()
-        
+
         # Stop item-search mode and restore the previous navigation state
         if orchestrator:
             orchestrator.stop_item_search(restore_nav=True)
             current_state = orchestrator.get_state()
-            print(f"[ITEM_SEARCH] Item search ended, current state: {current_state}")
+            if DEBUG: print(f"[ITEM_SEARCH] Item search ended, current state: {current_state}")
             
             # Give feedback based on the restored state
             if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
@@ -616,15 +601,15 @@ async def start_ai_with_text_custom(user_text: str):
         if current_state not in ["CHAT", "IDLE"]:
             omni_previous_nav_state = current_state
             orchestrator.force_state("CHAT")
-            print(f"[OMNI] Dialogue started, switching from {current_state} to CHAT mode")
+            if DEBUG: print(f"[OMNI] Dialogue started, switching from {current_state} to CHAT mode")
         else:
             omni_previous_nav_state = None
-            print(f"[OMNI] Dialogue started (already in {current_state} mode)")
+            if DEBUG: print(f"[OMNI] Dialogue started (already in {current_state} mode)")
     
     # If not a special command, run the original AI dialogue logic
     # But if yolomedia is running, skip normal AI dialogue for now
     if yolomedia_running:
-        print("[AI] YOLO media is running, skipping normal AI response", flush=True)
+        if DEBUG: print("[AI] YOLO media is running, skipping normal AI response", flush=True)
         return
     
     # Original AI dialogue logic
@@ -719,6 +704,22 @@ async def start_ai_with_text(user_text: str):
                 try:
                     pcm8k = await _say_to_pcm8k(full_text)
                     if pcm8k:
+                        # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
+                        # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
+                        _ws = esp32_audio_ws
+                        if _ws and _ws.client_state == WebSocketState.CONNECTED:
+                            try:
+                                await _ws.send_text("TTS:START")
+                                _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
+                                for _i in range(0, len(pcm8k), _CHUNK):
+                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
+                                await _ws.send_text("TTS:END")
+                                print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
+                            except Exception as _ws_err:
+                                print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
+                        else:
+                            print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
+                        # Also broadcast via /stream.wav so browser clients can hear it
                         await broadcast_pcm16_realtime(pcm8k)
                 except Exception as tts_err:
                     print(f"[TTS] say failed: {tts_err}", flush=True)
@@ -739,10 +740,10 @@ async def start_ai_with_text(user_text: str):
             # Restore the previous navigation state
             if orchestrator and omni_previous_nav_state:
                 orchestrator.force_state(omni_previous_nav_state)
-                print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+                if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
                 omni_previous_nav_state = None
             else:
-                print(f"[OMNI] Dialogue ended (no navigation state to restore)")
+                if DEBUG: print(f"[OMNI] Dialogue ended (no navigation state to restore)")
             
             # On natural completion, send a "finish" signal to the current connection
             from audio_stream import stream_clients  # local import to avoid circular dependency
@@ -754,6 +755,7 @@ async def start_ai_with_text(user_text: str):
                     except Exception: pass
 
             final_text = ("".join(txt_buf)).strip() or "(empty response)"
+            print(f"[AI] {final_text}", flush=True)
             try:
                 await ui_broadcast_final("[AI] " + final_text)
             except Exception:
@@ -796,6 +798,40 @@ async def ws_ui(ws: WebSocket):
     finally:
         ui_clients.pop(id(ws), None)
 
+# ---------- Shared Whisper transcription + dispatch helper ----------
+async def _run_whisper_and_dispatch(buf: bytes) -> None:
+    """Convert a raw PCM16 buffer → Whisper → UI + AI dispatch.
+
+    Called by both the manual STOP handler and the VAD auto-trigger so the
+    logic lives in exactly one place.
+    """
+    if not buf:
+        return
+    try:
+        # PCM16 int16 → float32 normalised to [-1, 1] at 16 kHz
+        samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
+        loop    = asyncio.get_running_loop()
+        result  = await loop.run_in_executor(
+            None,
+            lambda: _whisper_model.transcribe(samples, language="en", fp16=False)
+        )
+        text = (result.get("text") or "").strip()
+        print(f"[WHISPER] {text}", flush=True)
+
+        if text:
+            await ui_broadcast_final(text)
+
+            if _has_hotword(text):
+                async with interrupt_lock:
+                    print(f"[HOTWORD] '{text}' → full reset", flush=True)
+                    await full_system_reset("Hotword interrupt")
+            elif not is_playing_now():
+                async with interrupt_lock:
+                    await start_ai_with_text_custom(text)
+    except Exception as e:
+        print(f"[WHISPER] transcribe error: {e}", flush=True)
+
+
 # ---------- WebSocket: ESP32 audio entry (ASR uplink) ----------
 #
 # Changes vs original:
@@ -817,10 +853,14 @@ async def ws_audio(ws: WebSocket):
     global esp32_audio_ws
     esp32_audio_ws = ws
     await ws.accept()
-    print("\n[AUDIO] client connected")
+    print("[CONNECTED] Mic (ESP32 audio)")
 
     streaming: bool = False
     pcm_buffer: Optional[bytearray] = None
+    # VAD state (reset on every START / STOP / auto-trigger)
+    vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
+    vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
+    vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
 
     try:
         while True:
@@ -840,45 +880,26 @@ async def ws_audio(ws: WebSocket):
                 cmd = raw.upper()
 
                 if cmd == "START":
-                    print("[AUDIO] START — buffering PCM16 from ESP32 …")
-                    streaming   = True
-                    pcm_buffer  = bytearray()
+                    print("[MIC] Listening — waiting for speech...")
+                    streaming            = True
+                    pcm_buffer           = bytearray()
+                    vad_silent_chunks    = 0
+                    vad_speech_chunks    = 0
+                    vad_speech_detected  = False
                     await ui_broadcast_partial("（Recording…）")
                     await ws.send_text("OK:STARTED")
 
                 elif cmd == "STOP":
-                    print("[AUDIO] STOP — transcribing with Whisper …")
-                    streaming  = False
-                    buf        = bytes(pcm_buffer) if pcm_buffer else b""
-                    pcm_buffer = None
+                    # Manual STOP from firmware (fallback; firmware currently never sends this)
+                    print("[MIC] Transcribing...")
+                    streaming            = False
+                    buf                  = bytes(pcm_buffer) if pcm_buffer else b""
+                    pcm_buffer           = None
+                    vad_silent_chunks    = 0
+                    vad_speech_chunks    = 0
+                    vad_speech_detected  = False
                     await ws.send_text("OK:STOPPED")
-
-                    if buf:
-                        try:
-                            # PCM16 (int16) → float32 normalised to [-1, 1] at 16 kHz
-                            samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
-                            loop    = asyncio.get_running_loop()
-                            result  = await loop.run_in_executor(
-                                None,
-                                lambda: _whisper_model.transcribe(
-                                    samples, language="en", fp16=False
-                                )
-                            )
-                            text = (result.get("text") or "").strip()
-                            print(f"[ASR/WHISPER] '{text}'", flush=True)
-
-                            if text:
-                                await ui_broadcast_final(text)
-
-                                if _has_hotword(text):
-                                    async with interrupt_lock:
-                                        print(f"[HOTWORD] '{text}' → full reset", flush=True)
-                                        await full_system_reset("Hotword interrupt")
-                                elif not is_playing_now():
-                                    async with interrupt_lock:
-                                        await start_ai_with_text_custom(text)
-                        except Exception as e:
-                            print(f"[ASR/WHISPER] transcribe error: {e}", flush=True)
+                    await _run_whisper_and_dispatch(buf)
 
                 elif raw.startswith("PROMPT:"):
                     # Device-initiated prompt (bypasses ASR entirely)
@@ -891,9 +912,56 @@ async def ws_audio(ws: WebSocket):
                         await ws.send_text("ERR:EMPTY_PROMPT")
 
             elif "bytes" in msg and msg["bytes"] is not None:
-                # Accumulate raw PCM16 frames into buffer
+                chunk = msg["bytes"]
                 if streaming and pcm_buffer is not None:
-                    pcm_buffer.extend(msg["bytes"])
+                    pcm_buffer.extend(chunk)
+
+                    # ---- VAD: classify this 20ms chunk ----
+                    n = len(chunk)
+                    if n >= 2:
+                        s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
+                        s -= s.mean()   # strip DC offset from PDM mic before measuring energy
+                        rms = float(np.sqrt(np.mean(s ** 2)))
+                    else:
+                        rms = 0.0
+
+                    # [VAD DEBUG] Log every chunk so we can read the real noise floor.
+                    # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
+                    if DEBUG_VAD:
+                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
+                        print(
+                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
+                            f"  → {label}"
+                            f"  speech_chunks={vad_speech_chunks}"
+                            f"  silent_chunks={vad_silent_chunks}"
+                            f"  detected={vad_speech_detected}",
+                            flush=True,
+                        )
+
+                    if rms >= VAD_SILENCE_RMS:
+                        # Voiced chunk
+                        vad_silent_chunks  = 0
+                        vad_speech_chunks += 1
+                        if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                            vad_speech_detected = True
+                            print("[MIC] Speech detected", flush=True)
+                    else:
+                        # Silent chunk — only counts after speech has begun
+                        if vad_speech_detected:
+                            vad_silent_chunks += 1
+                            if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
+                                print("[MIC] Transcribing...", flush=True)
+                                buf         = bytes(pcm_buffer)
+                                # Reset buffer + VAD state; keep streaming=True for next utterance
+                                pcm_buffer           = bytearray()
+                                vad_silent_chunks    = 0
+                                vad_speech_chunks    = 0
+                                vad_speech_detected  = False
+                                await ui_broadcast_partial("（Processing…）")
+                                await _run_whisper_and_dispatch(buf)
+                        else:
+                            # Pre-speech silence: don't let scattered noise accumulate
+                            vad_speech_chunks = 0
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
@@ -907,7 +975,7 @@ async def ws_audio(ws: WebSocket):
             pass
         if esp32_audio_ws is ws:
             esp32_audio_ws = None
-        print("[WS] connection closed")
+        print("[DISCONNECTED] Mic (ESP32 audio)")
 
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
@@ -918,18 +986,16 @@ async def ws_camera_esp(ws: WebSocket):
         return
     esp32_camera_ws = ws
     await ws.accept()
-    print("[CAMERA] ESP32 connected")
-    
+    print("[CONNECTED] Camera (ESP32)")
+
     # Initialize the blind-path navigator
     if blind_path_navigator is None and yolo_seg_model is not None:
         blind_path_navigator = BlindPathNavigator(yolo_seg_model, obstacle_detector)
-        print("[NAVIGATION] Blind-path navigator initialized")
+        if DEBUG: print("[NAVIGATION] Blind-path navigator initialized")
     else:
-        if blind_path_navigator is not None:
-            print("[NAVIGATION] Navigator already exists, no need to re-initialize")
-        elif yolo_seg_model is None:
+        if blind_path_navigator is None and yolo_seg_model is None:
             print("[NAVIGATION] Warning: YOLO model not loaded, cannot initialize navigator")
-    
+
     # Initialize the street-crossing navigator
     if cross_street_navigator is None:
         if yolo_seg_model:
@@ -938,18 +1004,13 @@ async def ws_camera_esp(ws: WebSocket):
                 coco_model=None,  # traffic-light detection disabled
                 obs_model=None    # obstacle detection also disabled for now (faster)
             )
-            print("[CROSS_STREET] Street-crossing navigator initialized (simplified - crosswalk detection only)")
+            if DEBUG: print("[CROSS_STREET] Street-crossing navigator initialized")
         else:
             print("[CROSS_STREET] Error: segmentation model missing, cannot initialize street-crossing navigator")
 
-            if not yolo_seg_model:
-                print("[CROSS_STREET] - Segmentation model missing (yolo_seg_model)")
-            if not obstacle_detector:
-                print("[CROSS_STREET] - Obstacle detector missing (obstacle_detector)")
-    
     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
-        print("[NAV MASTER] Master state machine initialized (managed mode)")
+        if DEBUG: print("[NAV MASTER] Master state machine initialized")
     frame_counter = 0
     
     try:
@@ -973,11 +1034,6 @@ async def ws_camera_esp(ws: WebSocket):
                 
                 # Push to bridge_io (for use by yolomedia)
                 bridge_io.push_raw_jpeg(data)
-                
-                # [Debug] Check navigation conditions
-                if frame_counter % 30 == 0:  # log every 30 frames
-                    state_dbg = orchestrator.get_state() if orchestrator else "N/A"
-                    print(f"[NAVIGATION DEBUG] Frame:{frame_counter}, state={state_dbg}, yolomedia_running={yolomedia_running}")
                 
                 # Unified decoding (with stricter exception handling)
                 try:
@@ -1093,8 +1149,8 @@ async def ws_camera_esp(ws: WebSocket):
         except Exception:
             pass
         esp32_camera_ws = None
-        print("[CAMERA] ESP32 disconnected")
-        
+        print("[DISCONNECTED] Camera (ESP32)")
+
         # Clean up navigation state
         if blind_path_navigator:
             blind_path_navigator.reset()
@@ -1102,7 +1158,7 @@ async def ws_camera_esp(ws: WebSocket):
             cross_street_navigator.reset()
         if orchestrator:
             orchestrator.reset()
-            print("[NAV MASTER] Master reset")
+            if DEBUG: print("[NAV MASTER] Master reset")
 
 # ---------- WebSocket: browser subscribes to camera frames ----------
 @app.websocket("/ws/viewer")
@@ -1159,6 +1215,9 @@ USE_PROJ    = True
 FREEZE_STILL= True
 G     = 9.807
 A_TOL = 0.08 * G
+# How many seconds of still IMU data to collect for startup gyro-bias calibration.
+# At ~50 Hz this is ~100 samples; if the device is moved the window resets.
+GYRO_CAL_SECONDS = 2.0
 gLP = {"x":0.0, "y":0.0, "z":0.0}
 gOff= {"x":0.0, "y":0.0, "z":0.0}
 BIAS_ALPHA = 0.002
@@ -1171,6 +1230,11 @@ last_ts_imu = 0.0
 last_wall = 0.0
 imu_store: List[Dict[str, Any]] = []
 
+# Startup gyro-bias calibration state
+_cal_done     = False  # True once the fast startup calibration has completed
+_cal_samples: List[Tuple[float, float, float]] = []  # (wx, wy, wz) still samples
+_cal_start_ms = 0.0   # t_ms when the current still window started
+
 def _wrap180(a: float) -> float:
     a = a % 360.0
     if a >= 180.0: a -= 360.0
@@ -1179,6 +1243,7 @@ def _wrap180(a: float) -> float:
 
 def process_imu_and_maybe_store(d: Dict[str, Any]):
     global gLP, gOff, yaw, Rf, Pf, Yf, ref, holdStart, isStill, last_ts_imu, last_wall
+    global _cal_done, _cal_samples, _cal_start_ms
 
     t_ms = float(d.get("ts", 0.0))
     now_wall = time.monotonic()
@@ -1218,6 +1283,34 @@ def process_imu_and_maybe_store(d: Dict[str, Any]):
         gOff["z"] = (1.0 - BIAS_ALPHA)*gOff["z"] + BIAS_ALPHA*wz
     else:
         holdStart = 0.0; isStill = False
+
+    # ---- Startup gyro-bias calibration ----
+    # Collect still samples until GYRO_CAL_SECONDS of continuous stillness has
+    # been observed, then replace gOff with the direct average.  This gives an
+    # immediate accurate baseline instead of waiting ~10 s for the slow EMA to
+    # converge from zero.  The existing EMA above continues running afterwards
+    # to track slow thermal drift.
+    if not _cal_done:
+        if stillCond:
+            if _cal_start_ms <= 0.0:
+                _cal_start_ms = t_ms
+            _cal_samples.append((wx, wy, wz))
+            if (t_ms - _cal_start_ms) >= GYRO_CAL_SECONDS * 1000.0 and len(_cal_samples) >= 10:
+                n = len(_cal_samples)
+                gOff["x"] = sum(s[0] for s in _cal_samples) / n
+                gOff["y"] = sum(s[1] for s in _cal_samples) / n
+                gOff["z"] = sum(s[2] for s in _cal_samples) / n
+                _cal_done = True
+                _cal_samples.clear()
+                print(
+                    f"[IMU] Gyro bias calibrated: gOff = "
+                    f"({gOff['x']:.4f}, {gOff['y']:.4f}, {gOff['z']:.4f})",
+                    flush=True,
+                )
+        else:
+            # Device moved — reset the collection window and start fresh
+            _cal_samples.clear()
+            _cal_start_ms = 0.0
 
     if USE_PROJ:
         yawdot = ((wx - gOff["x"])*gHat["x"] + (wy - gOff["y"])*gHat["y"] + (wz - gOff["z"])*gHat["z"])
@@ -1294,7 +1387,7 @@ async def on_startup_register_bridge_sender():
             global yolomedia_sending_frames
             if not yolomedia_sending_frames:
                 yolomedia_sending_frames = True
-                print("[YOLOMEDIA] Starting to send processed frames, switching to YOLO view", flush=True)
+                if DEBUG: print("[YOLOMEDIA] Starting to send processed frames", flush=True)
             
             async def _broadcast():
                 if not camera_viewers:
@@ -1337,6 +1430,7 @@ async def on_startup_init_audio():
 async def on_startup():
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
+    print("[OK] Server running on port 8081")
 
 @app.on_event("shutdown")
 async def on_shutdown():

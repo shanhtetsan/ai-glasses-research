@@ -18,7 +18,7 @@ using namespace websockets;
 // ===== WiFi / Server =====
 const char* WIFI_SSID   = "PromisingGuys";
 const char* WIFI_PASS   = "aloekanal2026";
-const char* SERVER_HOST = "192.168.12.157";
+const char* SERVER_HOST = "192.168.12.113";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -49,9 +49,9 @@ const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Speaker (I2S TX → MAX98357A) =====
-#define I2S_SPK_BCLK 7
-#define I2S_SPK_LRCK 8
-#define I2S_SPK_DIN  9
+#define I2S_SPK_BCLK D1
+#define I2S_SPK_LRCK D2
+#define I2S_SPK_DIN  D3
 const int TTS_RATE = 16000;
 
 // ===== IMU (MPU-6050 over I2C) / UDP =====
@@ -59,7 +59,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.12.157";
+const char* UDP_HOST  = "192.168.12.113";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -654,6 +654,8 @@ void taskHttpPlay(void*){
       if (filled & 1) filled -= 1;
       if (filled == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
 
+      if (tts_playing) continue;  // WebSocket TTS owns i2sOut right now; discard HTTP audio
+
       size_t samp = filled / 2;
       mono16_to_stereo32_msb((const int16_t*)inbuf, samp, outLR, 0.8f);
 
@@ -697,6 +699,7 @@ void taskTTSPlay(void*){
     if (!tts_playing){ vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     TTSChunk ch;
     if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS){
+      if (ch.n == 0) { tts_playing = false; continue; }  // TTS:END sentinel from server
       size_t inSamp  = ch.n / 2;
       int16_t* inPtr = (int16_t*)ch.data;
       size_t outPairs = 0;
@@ -979,7 +982,20 @@ void setup() {
       if (s == "RESTART"){
         run_audio_stream = false; xQueueReset(qAudio); delay(50);
         wsAud.send("START"); run_audio_stream = true;
+      } else if (s == "TTS:START") {
+        tts_reset_queue();
+        tts_playing = true;
+      } else if (s == "TTS:END") {
+        TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
+        xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(10));
       }
+    } else if (msg.isBinary()) {
+      if (!tts_playing) return;
+      TTSChunk ch = {};
+      size_t n = min((size_t)msg.length(), sizeof(ch.data));
+      ch.n = (uint16_t)n;
+      memcpy(ch.data, msg.rawData().c_str(), n);  // rawData() is std::string — safe for null bytes in PCM
+      xQueueSend(qTTS, &ch, 0);  // non-blocking; drop if queue full
     }
   });
 }
