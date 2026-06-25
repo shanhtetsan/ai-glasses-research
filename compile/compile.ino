@@ -53,10 +53,11 @@ const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Speaker (I2S TX → MAX98357A) =====
-#define I2S_SPK_BCLK 7
-#define I2S_SPK_LRCK 8
-#define I2S_SPK_DIN  9
+#define I2S_SPK_BCLK D1
+#define I2S_SPK_LRCK D2
+#define I2S_SPK_DIN  D3
 const int TTS_RATE = 16000;
+const bool SPEAKER_TEST_ON_BOOT = true;
 
 // ===== IMU (MPU-6050 over I2C) / UDP =====
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
@@ -458,6 +459,35 @@ void init_i2s_out(){
     while(1){ delay(1000); }
   }
   Serial.println("[I2S OUT] STD TX @16kHz 32bit STEREO ready");
+}
+
+void play_speaker_test_tone(uint16_t freq_hz = 880, uint16_t duration_ms = 900) {
+  Serial.printf("[I2S OUT] speaker test tone %u Hz for %u ms\n", freq_hz, duration_ms);
+  const uint32_t sample_rate = TTS_RATE;
+  const size_t chunk_samples = 256;
+  int32_t outLR[chunk_samples * 2];
+  uint32_t total_samples = (sample_rate * duration_ms) / 1000;
+  uint32_t phase = 0;
+  uint32_t phase_step = ((uint64_t)freq_hz << 32) / sample_rate;
+
+  while (total_samples > 0) {
+    size_t n = min((uint32_t)chunk_samples, total_samples);
+    for (size_t i = 0; i < n; i++) {
+      phase += phase_step;
+      int32_t s = (phase & 0x80000000UL) ? 9000 : -9000;
+      int32_t v32 = s << 16;
+      outLR[i * 2 + 0] = v32;
+      outLR[i * 2 + 1] = v32;
+    }
+    size_t bytes = n * 2 * sizeof(int32_t);
+    size_t off = 0;
+    while (off < bytes) {
+      size_t wrote = i2sOut.write((uint8_t*)outLR + off, bytes - off);
+      if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1));
+      else off += wrote;
+    }
+    total_samples -= n;
+  }
 }
 
 struct WavFmt {
@@ -1013,6 +1043,9 @@ void setup() {
 
   init_i2s_in();
   init_i2s_out();
+  if (SPEAKER_TEST_ON_BOOT) {
+    play_speaker_test_tone();
+  }
   print_memory_status("after-i2s");
 
   qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops

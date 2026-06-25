@@ -781,7 +781,7 @@ async def start_ai_with_text(user_text: str):
                 pass
 
     # Hard-reset before actually starting to guarantee absolutely no leftover audio
-    await hard_reset_audio("start_ai_with_text")
+    await hard_reset_audio("start_ai_with_text", reset_streams=False)
     loop = asyncio.get_running_loop()
     from audio_stream import current_ai_task as _task_holder  # read/write module-level global
     from audio_stream import __dict__ as _as_dict
@@ -798,6 +798,36 @@ def root():
 @app.get("/api/health", response_class=PlainTextResponse)
 def health():
     return "OK"
+
+@app.get("/api/dev/play-wav", response_class=PlainTextResponse)
+async def dev_play_wav(path: str = "test_ethan.wav"):
+    """Play a local WAV through the same ESP32 /stream.wav downlink used by TTS."""
+    root_dir = os.path.realpath(os.getcwd())
+    wav_path = os.path.realpath(os.path.join(root_dir, path))
+    if not wav_path.startswith(root_dir + os.sep) and wav_path != root_dir:
+        return PlainTextResponse("ERR:path outside project", status_code=400)
+    if not os.path.exists(wav_path):
+        return PlainTextResponse(f"ERR:not found: {path}", status_code=404)
+
+    try:
+        with wave.open(wav_path, "rb") as w:
+            channels = w.getnchannels()
+            sample_width = w.getsampwidth()
+            frame_rate = w.getframerate()
+            pcm = w.readframes(w.getnframes())
+
+        if sample_width != 2:
+            pcm = audioop.lin2lin(pcm, sample_width, 2)
+            sample_width = 2
+        if channels != 1:
+            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+        if frame_rate != 8000:
+            pcm, _ = audioop.ratecv(pcm, sample_width, 1, frame_rate, 8000, None)
+
+        await broadcast_pcm16_realtime(pcm)
+        return f"OK:played {path}"
+    except Exception as e:
+        return PlainTextResponse(f"ERR:{e}", status_code=500)
 
 # Register /stream.wav route
 register_stream_route(app)

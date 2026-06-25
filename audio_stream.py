@@ -56,18 +56,21 @@ def _wav_header_unknown_size(sr=16000, ch=1, sw=2) -> bytes:
         b"data", data_size
     )
 
-async def hard_reset_audio(reason: str = ""):
+async def hard_reset_audio(reason: str = "", reset_streams: bool = True):
     """
     Hard reset: abort all stream connections (set abort_event) and cancel the current AI task.
     Old audio has nowhere to go, and no task continues producing output.
     """
-    # 1) Disconnect all active HTTP streaming connections
-    for sc in list(stream_clients):
-        try:
-            sc.abort_event.set()
-        except Exception:
-            pass
-    stream_clients.clear()
+    # 1) Disconnect active HTTP streaming connections when the caller needs a
+    # full output reset. For normal AI-response startup, keep /stream.wav open
+    # so ESP32 speaker playback does not miss the first TTS chunks.
+    if reset_streams:
+        for sc in list(stream_clients):
+            try:
+                sc.abort_event.set()
+            except Exception:
+                pass
+        stream_clients.clear()
 
     # 2) Cancel the current AI task
     await cancel_current_ai()
@@ -85,6 +88,16 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
     except Exception:
         pass  # Silent failure — does not affect playback
     
+    if not stream_clients:
+        print("[AUDIO] TTS generated; waiting for /stream.wav client", flush=True)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 3.0
+        while not stream_clients and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        if not stream_clients:
+            print("[AUDIO] TTS dropped: no /stream.wav client connected", flush=True)
+            return
+
     loop = asyncio.get_event_loop()
     next_tick = loop.time()
     off = 0
