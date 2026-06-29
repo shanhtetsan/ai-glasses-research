@@ -149,16 +149,18 @@ elif _BACKEND == "gemini":
         loop = asyncio.get_event_loop()
 
         def _start_stream():
-            return _gemini_model.generate_content(parts, stream=True)
+            # generate_content(stream=True) returns a GenerateContentResponse that
+            # is iterable but not itself an iterator — wrap with iter() so next() works.
+            return iter(_gemini_model.generate_content(parts, stream=True))
 
-        stream = await loop.run_in_executor(None, _start_stream)
+        stream_iter = await loop.run_in_executor(None, _start_stream)
         print(f"[OMNI] Gemini stream started", flush=True)
 
         def _next_chunk(it):
             return next(it, None)
 
         while True:
-            chunk = await loop.run_in_executor(None, _next_chunk, stream)
+            chunk = await loop.run_in_executor(None, _next_chunk, stream_iter)
             if chunk is None:
                 break
             delta = getattr(chunk, "text", None)
