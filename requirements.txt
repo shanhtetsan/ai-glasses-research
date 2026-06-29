@@ -28,6 +28,9 @@ pygame==2.5.2
 dashscope==1.14.1
 openai==1.3.5  # For DashScope compatibility mode
 
+# Closed-source LLM clients
+google-generativeai>=0.8.0  # For dev_gemini_look.py laptop label-reading test
+
 # Environment & Configuration
 python-dotenv==1.0.0
 
