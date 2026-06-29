@@ -56,7 +56,7 @@ def capture_jpeg(source: Union[int, str], width: int, height: int, quality: int)
     return encoded.tobytes()
 
 
-def ask_gemini(jpeg_bytes: bytes, prompt: str, model_name: str) -> str:
+def stream_gemini(jpeg_bytes: bytes, prompt: str, model_name: str) -> str:
     import google.generativeai as genai
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -65,10 +65,21 @@ def ask_gemini(jpeg_bytes: bytes, prompt: str, model_name: str) -> str:
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        [prompt, {"mime_type": "image/jpeg", "data": jpeg_bytes}]
+    stream = model.generate_content(
+        [prompt, {"mime_type": "image/jpeg", "data": jpeg_bytes}],
+        stream=True,
     )
-    return (response.text or "").strip()
+
+    parts = []
+    for chunk in stream:
+        delta = getattr(chunk, "text", None)
+        if not delta:
+            continue
+        parts.append(delta)
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    return "".join(parts).strip()
 
 
 def main() -> None:
@@ -84,11 +95,12 @@ def main() -> None:
 
     jpeg = capture_jpeg(parse_source(args.source), args.width, args.height, args.quality)
     try:
-        response = ask_gemini(jpeg, args.prompt, args.model)
+        response = stream_gemini(jpeg, args.prompt, args.model)
     except Exception as e:
         sys.exit(f"Gemini API error: {e}")
 
-    print(response or "(empty response)")
+    if not response:
+        print("(empty response)")
 
 
 if __name__ == "__main__":
