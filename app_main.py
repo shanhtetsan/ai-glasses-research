@@ -52,6 +52,9 @@ try:
 except Exception:
     pass
 
+import os
+print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
+
 # ---- [DASHSCOPE FALLBACK] Remote ASR — commented out, kept for reference ----
 # from dashscope import audio as dash_audio
 # API_KEY     = os.getenv("DASHSCOPE_API_KEY", "YOUR_DASHSCOPE_API_KEY")
@@ -109,7 +112,7 @@ from audio_stream import (
     is_playing_now,
     current_ai_task,
 )
-from omni_client import stream_chat, OmniStreamPiece
+from gemini_client import stream_chat, OmniStreamPiece
 from asr_core import (
     ASRCallback,
     set_current_recognition,
