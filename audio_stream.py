@@ -7,10 +7,10 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 # ===== Downstream WAV stream basic parameters =====
-STREAM_SR = 8000  # 8 kHz — supported by ESP32
+STREAM_SR = 16000
 STREAM_CH = 1
 STREAM_SW = 2
-BYTES_PER_20MS_16K = STREAM_SR * STREAM_SW * 20 // 1000  # 320B (8kHz)
+BYTES_PER_20MS_16K = STREAM_SR * STREAM_SW * 20 // 1000  # 640B at 16 kHz
 
 # ===== AI playback task master switch =====
 current_ai_task: Optional[asyncio.Task] = None

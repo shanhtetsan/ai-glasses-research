@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PromisingGuys";
-const char* WIFI_PASS   = "aloekanal2026";
-const char* SERVER_HOST = "192.168.12.113";
+const char* WIFI_SSID   = "PRST";
+const char* WIFI_PASS   = "phone12345";
+const char* SERVER_HOST = "192.0.0.2";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -59,7 +59,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.12.113";
+const char* UDP_HOST  = "192.0.0.2";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -983,11 +983,14 @@ void setup() {
         run_audio_stream = false; xQueueReset(qAudio); delay(50);
         wsAud.send("START"); run_audio_stream = true;
       } else if (s == "TTS:START") {
+        run_audio_stream = false;
+        xQueueReset(qAudio);
         tts_reset_queue();
         tts_playing = true;
       } else if (s == "TTS:END") {
         TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
         xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(10));
+        run_audio_stream = true;
       }
     } else if (msg.isBinary()) {
       if (!tts_playing) return;

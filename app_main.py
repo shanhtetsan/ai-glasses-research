@@ -36,7 +36,7 @@ try:
 except Exception:
     yolomedia = None
 DEBUG     = False  # set True to enable verbose navigation/recorder/YOLO logs
-DEBUG_VAD = False   # set False once VAD_SILENCE_RMS is tuned for your mic
+DEBUG_VAD = os.getenv("AUDIO_DEBUG", "").lower() in ("1", "true", "yes")
 
 # ---- Windows event loop policy ----
 if sys.platform.startswith("win"):
@@ -82,7 +82,7 @@ print("[OK] Whisper model ready")
 #                     Normal speech is 300–3 000+.
 #                     Raise if ambient noise falsely triggers speech detection;
 #                     lower if soft voices are missed.
-VAD_SILENCE_RMS    = 300
+VAD_SILENCE_RMS    = int(os.getenv("VAD_SILENCE_RMS", "150"))
 
 # VAD_SILENCE_MS    — milliseconds of continuous silence (after speech has
 #                     been detected) that trigger auto-transcription.
@@ -93,7 +93,7 @@ VAD_SILENCE_MS     = 700
 # VAD_MIN_SPEECH_MS — minimum speech duration (ms) before silence can fire
 #                     Whisper.  Prevents spurious triggers from a brief click
 #                     or microphone pop.  300 ms = 15 chunks × 20 ms.
-VAD_MIN_SPEECH_MS  = 300
+VAD_MIN_SPEECH_MS  = int(os.getenv("VAD_MIN_SPEECH_MS", "160"))
 
 # Derived chunk counts (ESP32 sends exactly 20 ms chunks at 16 kHz / PCM16).
 _VAD_CHUNK_MS         = 20
@@ -615,16 +615,16 @@ async def start_ai_with_text_custom(user_text: str):
     # Original AI dialogue logic
     await start_ai_with_text(user_text)
 
-# ========= TTS: macOS 'say' → 8 kHz PCM16 =========
-async def _say_to_pcm8k(text: str) -> bytes:
+# ========= TTS: macOS 'say' -> 16 kHz PCM16 =========
+async def _say_to_pcm16k(text: str) -> bytes:
     """
-    Use macOS built-in TTS ('say') to produce 8 kHz PCM16 suitable for
-    broadcast_pcm16_realtime / the ESP32 8 kHz downlink.
+    Use macOS built-in TTS ('say') to produce 16 kHz PCM16 suitable for
+    broadcast_pcm16_realtime / the ESP32 speaker downlink.
 
     Steps:
       1. say   → AIFF  (native macOS TTS, any sample rate)
       2. afconvert → 16-bit PCM WAV  (keeps original sample rate)
-      3. audioop.ratecv → downsample to 8 kHz in Python
+      3. audioop.ratecv → resample to 16 kHz in Python
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         aiff_path = os.path.join(tmpdir, "out.aiff")
@@ -652,8 +652,8 @@ async def _say_to_pcm8k(text: str) -> bytes:
 
         if ch == 2:
             pcm = audioop.tomono(pcm, sw, 1, 0)
-        if fr != 8000:
-            pcm, _ = audioop.ratecv(pcm, sw, 1, fr, 8000, None)
+        if fr != SAMPLE_RATE:
+            pcm, _ = audioop.ratecv(pcm, sw, 1, fr, SAMPLE_RATE, None)
         return pcm
 
 
@@ -698,29 +698,30 @@ async def start_ai_with_text(user_text: str):
                 #     if pcm8k:
                 #         await broadcast_pcm16_realtime(pcm8k)
 
-            # TTS: feed the complete AI response through the 8 kHz downlink
+            # TTS: feed the complete AI response through the 16 kHz downlink
             full_text = "".join(txt_buf).strip()
             if full_text:
                 try:
-                    pcm8k = await _say_to_pcm8k(full_text)
-                    if pcm8k:
+                    pcm16k = await _say_to_pcm16k(full_text)
+                    if pcm16k:
                         # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
                         # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
                         _ws = esp32_audio_ws
                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
                             try:
                                 await _ws.send_text("TTS:START")
-                                _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
-                                for _i in range(0, len(pcm8k), _CHUNK):
-                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
+                                _CHUNK = BYTES_PER_20MS_16K
+                                for _i in range(0, len(pcm16k), _CHUNK):
+                                    await _ws.send_bytes(pcm16k[_i:_i + _CHUNK])
+                                    await asyncio.sleep(0.020)
                                 await _ws.send_text("TTS:END")
-                                print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
+                                print(f"[TTS-WS] sent {len(pcm16k)} bytes in {-(-len(pcm16k)//_CHUNK)} chunks", flush=True)
                             except Exception as _ws_err:
                                 print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
                         else:
                             print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
                         # Also broadcast via /stream.wav so browser clients can hear it
-                        await broadcast_pcm16_realtime(pcm8k)
+                        await broadcast_pcm16_realtime(pcm16k)
                 except Exception as tts_err:
                     print(f"[TTS] say failed: {tts_err}", flush=True)
 
@@ -861,6 +862,10 @@ async def ws_audio(ws: WebSocket):
     vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
     vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
     vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
+    debug_window_started = time.monotonic()
+    debug_chunks = 0
+    debug_bytes = 0
+    debug_rms_max = 0.0
 
     try:
         while True:
@@ -928,15 +933,23 @@ async def ws_audio(ws: WebSocket):
                     # [VAD DEBUG] Log every chunk so we can read the real noise floor.
                     # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
                     if DEBUG_VAD:
-                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
-                        print(
-                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
-                            f"  → {label}"
-                            f"  speech_chunks={vad_speech_chunks}"
-                            f"  silent_chunks={vad_silent_chunks}"
-                            f"  detected={vad_speech_detected}",
-                            flush=True,
-                        )
+                        debug_chunks += 1
+                        debug_bytes += len(chunk)
+                        debug_rms_max = max(debug_rms_max, rms)
+                        now = time.monotonic()
+                        if now - debug_window_started >= 1.0:
+                            print(
+                                f"[AUDIO DEBUG] chunks={debug_chunks}/s"
+                                f" bytes={debug_bytes}/s"
+                                f" max_rms={debug_rms_max:.0f}"
+                                f" thresh={VAD_SILENCE_RMS}"
+                                f" detected={vad_speech_detected}",
+                                flush=True,
+                            )
+                            debug_window_started = now
+                            debug_chunks = 0
+                            debug_bytes = 0
+                            debug_rms_max = 0.0
 
                     if rms >= VAD_SILENCE_RMS:
                         # Voiced chunk

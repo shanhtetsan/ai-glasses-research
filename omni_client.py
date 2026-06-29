@@ -3,9 +3,9 @@
 #
 # Changes vs original:
 #   - DashScope / OpenAI-compatible remote client commented out (kept as fallback)
-#   - stream_chat() now runs Qwen2.5-Omni-3B locally on MPS, TEXT ONLY
-#   - Audio output (return_audio) is disabled here; TTS handled via macOS 'say'
-#     in app_main.py._say_to_pcm8k → broadcast_pcm16_realtime
+#   - stream_chat() now runs Qwen2.5-Omni-3B locally on MPS for response text
+#   - Native Qwen talker audio is disabled here; the app still speaks the
+#     response via macOS 'say' in app_main.py._say_to_pcm16k
 #   - OmniStreamPiece interface unchanged so app_main.py needs no adjustments
 #   - device_map="mps" (NOT "auto") avoids meta-device disk offload on Apple Silicon
 #
@@ -28,6 +28,7 @@ from PIL import Image
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 _MODEL_ID = os.getenv("QWEN_OMNI_MODEL", "Qwen/Qwen2.5-Omni-3B")
+_MAX_NEW_TOKENS = int(os.getenv("QWEN_MAX_NEW_TOKENS", "96"))
 
 print(f"[OMNI] Loading local model {_MODEL_ID!r} → MPS float16 …")
 _model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -94,14 +95,14 @@ def _build_qwen_messages(
 
 async def stream_chat(
     content_list: List[Dict[str, Any]],
-    voice: str = "Cherry",       # retained for interface compat — unused here (TTS via 'say')
+    voice: str = "Cherry",       # retained for interface compat; TTS uses macOS 'say'
     audio_format: str = "wav",   # same
 ) -> AsyncGenerator[OmniStreamPiece, None]:
     """
-    Local Qwen2.5-Omni-3B text-only inference.
+    Local Qwen2.5-Omni-3B response generation.
 
-    generation_mode="text" → talker/token2wav are skipped entirely.
-    Audio is produced separately by _say_to_pcm8k in app_main.py.
+    This returns response text to the UI. Spoken audio is produced separately
+    by _say_to_pcm16k in app_main.py and sent to the ESP32/browser.
 
     Yields exactly one OmniStreamPiece(text_delta=<response>, audio_b64=None).
     The rest of the pipeline (ui_broadcast, broadcast_pcm16_realtime) is unchanged.
@@ -146,14 +147,21 @@ async def stream_chat(
     loop = asyncio.get_event_loop()
 
     def _generate() -> str:
+        print(f"[OMNI] generating text, max_new_tokens={_MAX_NEW_TOKENS}", flush=True)
         with torch.no_grad():
             output_ids = _model.generate(
                 **proc_inputs,
-                thinker_max_new_tokens=256,
-                generation_mode="text",   # skips talker + token2wav entirely
+                thinker_max_new_tokens=_MAX_NEW_TOKENS,
+                # Keep Qwen in thinker/text generation. The app still produces
+                # spoken audio from this text via macOS TTS.
+                return_audio=False,
             )
+        if isinstance(output_ids, tuple):
+            output_ids = output_ids[0]
         new_ids = output_ids[0][prompt_len:]
-        return _processor.decode(new_ids, skip_special_tokens=True).strip()
+        text = _processor.decode(new_ids, skip_special_tokens=True).strip()
+        print(f"[OMNI] generated {len(new_ids)} tokens, text_len={len(text)}", flush=True)
+        return text
 
     response_text = await loop.run_in_executor(None, _generate)
 
