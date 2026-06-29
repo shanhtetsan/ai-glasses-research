@@ -14,7 +14,8 @@ from workflow_blindpath import BlindPathNavigator
 from workflow_crossstreet import CrossStreetNavigator
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 import uvicorn
@@ -83,6 +84,7 @@ print("[OK] Whisper model ready")
 #                     Raise if ambient noise falsely triggers speech detection;
 #                     lower if soft voices are missed.
 VAD_SILENCE_RMS    = 300
+JPEG_QUALITY       = 80
 
 # VAD_SILENCE_MS    — milliseconds of continuous silence (after speech has
 #                     been detected) that trigger auto-transcription.
@@ -780,6 +782,70 @@ def root():
 def health():
     return "OK"
 
+class SettingsPayload(BaseModel):
+    jpeg_quality: Optional[int] = None
+    vad_silence_rms: Optional[int] = None
+    vad_silence_ms: Optional[int] = None
+    vad_min_speech_ms: Optional[int] = None
+
+@app.get("/api/settings")
+def get_settings():
+    return JSONResponse({
+        "jpeg_quality": JPEG_QUALITY,
+        "vad_silence_rms": VAD_SILENCE_RMS,
+        "vad_silence_ms": VAD_SILENCE_MS,
+        "vad_min_speech_ms": VAD_MIN_SPEECH_MS,
+    })
+
+@app.post("/api/settings")
+def update_settings(payload: SettingsPayload):
+    global JPEG_QUALITY, VAD_SILENCE_RMS, VAD_SILENCE_MS, VAD_MIN_SPEECH_MS
+    global VAD_SILENCE_CHUNKS, VAD_MIN_SPEECH_CHUNKS
+    if payload.jpeg_quality is not None:
+        JPEG_QUALITY = max(1, min(100, payload.jpeg_quality))
+    if payload.vad_silence_rms is not None:
+        VAD_SILENCE_RMS = max(50, min(5000, payload.vad_silence_rms))
+    if payload.vad_silence_ms is not None:
+        VAD_SILENCE_MS = max(200, min(3000, payload.vad_silence_ms))
+        VAD_SILENCE_CHUNKS = VAD_SILENCE_MS // _VAD_CHUNK_MS
+    if payload.vad_min_speech_ms is not None:
+        VAD_MIN_SPEECH_MS = max(100, min(2000, payload.vad_min_speech_ms))
+        VAD_MIN_SPEECH_CHUNKS = VAD_MIN_SPEECH_MS // _VAD_CHUNK_MS
+    return JSONResponse({
+        "jpeg_quality": JPEG_QUALITY,
+        "vad_silence_rms": VAD_SILENCE_RMS,
+        "vad_silence_ms": VAD_SILENCE_MS,
+        "vad_min_speech_ms": VAD_MIN_SPEECH_MS,
+    })
+
+class CameraCommand(BaseModel):
+    framesize: Optional[str] = None
+    quality: Optional[int] = None
+    fps: Optional[int] = None
+
+@app.post("/api/camera")
+async def camera_command(cmd: CameraCommand):
+    if esp32_camera_ws is None:
+        return JSONResponse({"error": "ESP32 camera not connected"}, status_code=503)
+    sent = []
+    try:
+        if cmd.framesize:
+            v = cmd.framesize.upper()
+            if v in ("VGA", "SVGA", "XGA"):
+                await esp32_camera_ws.send_text(f"SET:FRAMESIZE={v}")
+                sent.append(f"FRAMESIZE={v}")
+        if cmd.quality is not None:
+            q = max(5, min(40, cmd.quality))
+            await esp32_camera_ws.send_text(f"SET:QUALITY={q}")
+            sent.append(f"QUALITY={q}")
+        if cmd.fps is not None:
+            f = max(0, min(60, cmd.fps))
+            await esp32_camera_ws.send_text(f"SET:FPS={f}")
+            sent.append(f"FPS={f}")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"sent": sent})
+
 # Register /stream.wav route
 register_stream_route(app)
 
@@ -1012,14 +1078,14 @@ async def ws_camera_esp(ws: WebSocket):
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         if DEBUG: print("[NAV MASTER] Master state machine initialized")
     frame_counter = 0
-    
+
     try:
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 frame_counter += 1
-                
+
                 # Record the raw frame
                 try:
                     sync_recorder.record_frame(data)
@@ -1058,7 +1124,7 @@ async def ws_camera_esp(ws: WebSocket):
                     if current_state == "ITEM_SEARCH":
                         # In item-search mode, if yolomedia has not yet started sending frames, show the raw frame
                         if not yolomedia_sending_frames and camera_viewers:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                             if ok:
                                 jpeg_data = enc.tobytes()
                                 dead = []
@@ -1101,7 +1167,7 @@ async def ws_camera_esp(ws: WebSocket):
 
                     # Broadcast the image
                     if camera_viewers and out_img is not None:
-                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                         if ok:
                             jpeg_data = enc.tobytes()
                             dead = []
@@ -1122,7 +1188,7 @@ async def ws_camera_esp(ws: WebSocket):
                             arr = np.frombuffer(data, dtype=np.uint8)
                             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                         if bgr is not None:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                             if ok:
                                 jpeg_data = enc.tobytes()
                                 dead = []
@@ -1173,9 +1239,9 @@ async def ws_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[VIEWER] Browser disconnected", flush=True)
     finally:
-        try: 
+        try:
             camera_viewers.remove(ws)
-        except Exception: 
+        except Exception:
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
