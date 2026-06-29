@@ -155,6 +155,32 @@
   /* hidden but kept: calibration/sliders (used by main.js) */
   .hidden-controls{display:none}
 
+  /* settings panel */
+  .settings-toggle{background:transparent;border:1px solid #304057;color:#9fb0c3;font-size:18px;padding:4px 8px;border-radius:8px;cursor:pointer;line-height:1}
+  .settings-toggle:hover{background:#1a2332;border-color:#3d5a80}
+  .settings-panel{
+    display:none; padding:14px; border-top:1px solid var(--line); background:#0c121a;
+  }
+  .settings-panel.open{display:block}
+  .settings-panel h3{margin:0 0 12px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .setting-row{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06);
+  }
+  .setting-row:last-child{border-bottom:none}
+  .setting-label{font-size:12px;color:var(--muted);flex:1}
+  .setting-label small{display:block;color:#5a6f85;font-size:10px;margin-top:2px}
+  .setting-input{
+    width:80px; background:#0b0f14; border:1px solid #2d3b50; color:var(--text);
+    border-radius:6px; padding:5px 8px; font-size:13px; text-align:right;
+  }
+  .setting-input:focus{outline:none;border-color:#1f6feb}
+  .setting-range{flex:0 0 120px; accent-color:#1f6feb}
+  .setting-val{width:40px;text-align:right;font-size:12px;color:var(--text);font-variant-numeric:tabular-nums}
+  .settings-actions{display:flex;gap:8px;margin-top:12px;justify-content:flex-end}
+  .settings-actions button{font-size:12px;padding:5px 12px}
+  #settingsStatus{font-size:11px;color:var(--ok);margin-right:auto;align-self:center;opacity:0;transition:opacity .3s}
+
   @media (max-width:1100px){
     .app{grid-template-columns:1fr; height:auto}
     .chat{height:60vh}
@@ -196,6 +222,59 @@
       <div class="controls">
         <button class="ghost" id="btnClear">Clear Final</button>
         <button id="btnReconnect">Reconnect</button>
+        <button class="settings-toggle" id="btnSettings" title="Settings">&#9881;</button>
+      </div>
+    </div>
+    <div class="settings-panel" id="settingsPanel">
+      <h3>ESP32 Camera</h3>
+      <div class="setting-row">
+        <div class="setting-label">Resolution<small>ESP32 capture size</small></div>
+        <select class="setting-input" id="set_cam_framesize" style="width:100px">
+          <option value="VGA" selected>VGA (640x480)</option>
+          <option value="SVGA">SVGA (800x600)</option>
+          <option value="XGA">XGA (1024x768)</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">ESP32 JPEG Quality<small>Lower = better quality (5–40)</small></div>
+        <input type="range" class="setting-range" id="set_cam_quality" min="5" max="40" value="17">
+        <span class="setting-val" id="val_cam_quality">17</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Target FPS<small>Frame rate limit (0 = unlimited)</small></div>
+        <input type="range" class="setting-range" id="set_cam_fps" min="0" max="60" value="0">
+        <span class="setting-val" id="val_cam_fps">0</span>
+      </div>
+      <div class="settings-actions">
+        <span id="camSettingsStatus"></span>
+        <button id="btnApplyCamera">Apply</button>
+      </div>
+
+      <h3 style="margin-top:16px">Server</h3>
+      <div class="setting-row">
+        <div class="setting-label">Broadcast JPEG Quality<small>Server re-encoding (1–100)</small></div>
+        <input type="range" class="setting-range" id="set_jpeg_quality" min="1" max="100" value="80">
+        <span class="setting-val" id="val_jpeg_quality">80</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">VAD Silence RMS<small>Amplitude threshold for silence (50–5000)</small></div>
+        <input type="range" class="setting-range" id="set_vad_silence_rms" min="50" max="5000" step="10" value="300">
+        <span class="setting-val" id="val_vad_silence_rms">300</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">VAD Silence Duration<small>Silence before transcription (200–3000 ms)</small></div>
+        <input type="range" class="setting-range" id="set_vad_silence_ms" min="200" max="3000" step="50" value="700">
+        <span class="setting-val" id="val_vad_silence_ms">700</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">VAD Min Speech<small>Minimum speech length (100–2000 ms)</small></div>
+        <input type="range" class="setting-range" id="set_vad_min_speech_ms" min="100" max="2000" step="50" value="300">
+        <span class="setting-val" id="val_vad_min_speech_ms">300</span>
+      </div>
+      <div class="settings-actions">
+        <span id="settingsStatus"></span>
+        <button class="ghost" id="btnResetSettings">Reset</button>
+        <button id="btnApplySettings">Apply</button>
       </div>
     </div>
     <div class="chat-list">
@@ -240,5 +319,89 @@
 
 <!-- main script -->
 <script type="module" src="/static/main.js"></script>
+
+<!-- settings panel logic -->
+<script>
+(function(){
+  const btn = document.getElementById('btnSettings');
+  const panel = document.getElementById('settingsPanel');
+  const apply = document.getElementById('btnApplySettings');
+  const reset = document.getElementById('btnResetSettings');
+  const status = document.getElementById('settingsStatus');
+  const fields = ['jpeg_quality','vad_silence_rms','vad_silence_ms','vad_min_speech_ms'];
+
+  btn.addEventListener('click', ()=> panel.classList.toggle('open'));
+
+  // server setting sliders
+  fields.forEach(f=>{
+    const slider = document.getElementById('set_'+f);
+    const val = document.getElementById('val_'+f);
+    slider.addEventListener('input', ()=> val.textContent = slider.value);
+  });
+
+  // camera setting sliders
+  ['cam_quality','cam_fps'].forEach(f=>{
+    const slider = document.getElementById('set_'+f);
+    const val = document.getElementById('val_'+f);
+    slider.addEventListener('input', ()=> val.textContent = slider.value);
+  });
+
+  function loadSettings(){
+    fetch('/api/settings').then(r=>r.json()).then(data=>{
+      fields.forEach(f=>{
+        const slider = document.getElementById('set_'+f);
+        const val = document.getElementById('val_'+f);
+        if(data[f]!==undefined){ slider.value=data[f]; val.textContent=data[f]; }
+      });
+    }).catch(()=>{});
+  }
+
+  function flash(el, msg, ok){
+    el.textContent = msg;
+    el.style.color = ok ? 'var(--ok)' : 'var(--err)';
+    el.style.opacity = '1';
+    setTimeout(()=> el.style.opacity='0', 2000);
+  }
+
+  // apply server settings
+  apply.addEventListener('click', ()=>{
+    const body = {};
+    fields.forEach(f=> body[f] = parseInt(document.getElementById('set_'+f).value));
+    fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(r=>r.json()).then(data=>{
+        fields.forEach(f=>{
+          const slider = document.getElementById('set_'+f);
+          const val = document.getElementById('val_'+f);
+          if(data[f]!==undefined){ slider.value=data[f]; val.textContent=data[f]; }
+        });
+        flash(status,'Saved',true);
+      }).catch(()=> flash(status,'Error',false));
+  });
+
+  reset.addEventListener('click', ()=> loadSettings());
+
+  // apply camera settings
+  const camStatus = document.getElementById('camSettingsStatus');
+  document.getElementById('btnApplyCamera').addEventListener('click', ()=>{
+    const body = {
+      framesize: document.getElementById('set_cam_framesize').value,
+      quality: parseInt(document.getElementById('set_cam_quality').value),
+      fps: parseInt(document.getElementById('set_cam_fps').value)
+    };
+    fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(r=>{
+        if(!r.ok && r.status===503) throw new Error('ESP32 not connected');
+        return r.json();
+      })
+      .then(data=>{
+        if(data.error) flash(camStatus, data.error, false);
+        else flash(camStatus, 'Sent: '+data.sent.join(', '), true);
+      })
+      .catch(e=> flash(camStatus, e.message||'Error', false));
+  });
+
+  loadSettings();
+})();
+</script>
 </body>
 </html>
