@@ -12,6 +12,9 @@ recordings/
 model/*.pt
 model/*.task
 
+# Ultralytics asset cache (auto-downloaded on first YOLOE load, ~571 MiB)
+mobileclip_blt.ts
+
 # Local caches
 .cache/
 .config/

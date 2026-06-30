@@ -425,19 +425,36 @@ def stop_yolomedia():
 async def start_ai_with_text_custom(user_text: str):
     """Extended AI launch function with special command recognition."""
     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
-    
+
+    # Lower-case once so English phrase matching is case-insensitive. Lower-casing
+    # Chinese characters is a no-op so the existing Chinese checks still work.
+    user_text = user_text.lower()
+
     # In navigation or traffic-light detection mode, only specific words trigger omni dialogue
     if orchestrator:
         current_state = orchestrator.get_state()
         # If in navigation or traffic-light detection mode (not CHAT mode)
         if current_state not in ["CHAT", "IDLE"]:
             # Check whether the utterance is an allowed dialogue trigger keyword
-            allowed_keywords = ["帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下"]
+            allowed_keywords = [
+                # Chinese
+                "帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下",
+                # English
+                "what is this", "what is that", "what's this", "what's that",
+                "describe", "look at", "identify", "find",
+            ]
             is_allowed_query = any(keyword in user_text for keyword in allowed_keywords)
-            
+
             # Check whether the utterance is a navigation control command
-            nav_control_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", 
-                                   "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯"]
+            nav_control_keywords = [
+                # Chinese
+                "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
+                "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯",
+                # English
+                "start crossing", "stop crossing", "end crossing",
+                "start navigation", "stop navigation", "end navigation",
+                "detect traffic light", "check traffic light", "stop detection",
+            ]
             is_nav_control = any(keyword in user_text for keyword in nav_control_keywords)
             
             # If neither an allowed query nor a navigation control command, discard
@@ -448,7 +465,8 @@ async def start_ai_with_text_custom(user_text: str):
                 return  # discard; do not enter omni
     
     # Check for street-crossing commands — use orchestrator to control
-    if "开始过马路" in user_text or "帮我过马路" in user_text:
+    if any(k in user_text for k in ["开始过马路", "帮我过马路",
+                                     "start crossing", "help me cross", "cross the street"]):
         # If currently searching for an item, stop first
         if yolomedia_running:
             stop_yolomedia()
@@ -466,7 +484,8 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Navigation system not ready")
         return
     
-    if "过马路结束" in user_text or "结束过马路" in user_text:
+    if any(k in user_text for k in ["过马路结束", "结束过马路",
+                                     "stop crossing", "end crossing", "done crossing"]):
         if orchestrator:
             orchestrator.stop_navigation()
             if DEBUG: print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
@@ -478,7 +497,9 @@ async def start_ai_with_text_custom(user_text: str):
         return
     
     # Check for traffic-light detection command — mutually exclusive with blind-path navigation
-    if "检测红绿灯" in user_text or "看红绿灯" in user_text:
+    if any(k in user_text for k in ["检测红绿灯", "看红绿灯",
+                                     "detect traffic light", "check traffic light",
+                                     "what color is the light", "what light"]):
         try:
             import trafficlight_detection
             
@@ -500,7 +521,8 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final(f"[System] Start failed: {e}")
         return
     
-    if "停止检测" in user_text or "停止红绿灯" in user_text:
+    if any(k in user_text for k in ["停止检测", "停止红绿灯",
+                                     "stop detection", "stop traffic light"]):
         try:
             # Restore to dialogue (CHAT) mode
             if orchestrator:
@@ -514,7 +536,8 @@ async def start_ai_with_text_custom(user_text: str):
         return
     
     # Check for navigation commands — use orchestrator to control
-    if "开始导航" in user_text or "盲道导航" in user_text or "帮我导航" in user_text:
+    if any(k in user_text for k in ["开始导航", "盲道导航", "帮我导航",
+                                     "start navigation", "help me navigate", "navigate me", "blind path"]):
         # If currently searching for an item, stop first
         if yolomedia_running:
             stop_yolomedia()
@@ -529,7 +552,8 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Navigation system not ready")
         return
     
-    if "停止导航" in user_text or "结束导航" in user_text:
+    if any(k in user_text for k in ["停止导航", "结束导航",
+                                     "stop navigation", "end navigation"]):
         if orchestrator:
             orchestrator.stop_navigation()
             if DEBUG: print(f"[NAVIGATION] Navigation stopped, state: {orchestrator.get_state()}")
@@ -538,7 +562,15 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Navigation system not running")
         return
 
-    nav_cmd_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", "立即通过", "现在通过", "继续"]
+    nav_cmd_keywords = [
+        # Chinese
+        "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
+        "立即通过", "现在通过", "继续",
+        # English
+        "start crossing", "stop crossing", "end crossing",
+        "start navigation", "stop navigation", "end navigation",
+        "pass now", "go now", "continue",
+    ]
     if any(k in user_text for k in nav_cmd_keywords):
         if orchestrator:
             orchestrator.on_voice_command(user_text)
@@ -547,10 +579,11 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Navigation master not initialized")
         return    
 
-    # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command
-    # Extended regex to support more keywords
-    find_pattern = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
-    match = re.search(find_pattern, user_text)
+    # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command.
+    # Try Chinese pattern first, then English ("find <item>" / "look for <item>").
+    find_pattern_cn = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
+    find_pattern_en = r"\b(?:find|look\s+for)\s+(?:the\s+|a\s+|an\s+|my\s+)?(.+?)[\.\?\!]?\s*$"
+    match = re.search(find_pattern_cn, user_text) or re.search(find_pattern_en, user_text)
         
     if match:
         # Extract the Chinese item name
