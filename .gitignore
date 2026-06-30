@@ -7,3 +7,11 @@ recordings/
 *.avi
 .DS_Store
 .vscode/
+
+# Model files (download with scripts/download_models.sh)
+model/*.pt
+model/*.task
+
+# Local caches
+.cache/
+.config/

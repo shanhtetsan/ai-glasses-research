@@ -18,7 +18,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ========= Configuration parameters =========
-YOLO_MODEL_PATH = r"C:\Users\Administrator\Desktop\rebuild1002\model\trafficlight.pt"
+# Override with env var TRAFFIC_LIGHT_MODEL; default is ./model/ relative to this file.
+YOLO_MODEL_PATH = os.getenv(
+    "TRAFFIC_LIGHT_MODEL",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "trafficlight.pt"),
+)
 
 # ========= Display parameters =========
 CONF_THRESHOLD = 0.25  # Confidence threshold

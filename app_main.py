@@ -177,7 +177,10 @@ def load_navigation_models():
     global yolo_seg_model, obstacle_detector
 
     try:
-        seg_model_path = os.getenv("BLIND_PATH_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yolo-seg.pt")
+        seg_model_path = os.getenv(
+            "BLIND_PATH_MODEL",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yolo-seg.pt"),
+        )
         #print(f"[NAVIGATION] Trying to load model: {seg_model_path}")
 
         if os.path.exists(seg_model_path):
@@ -206,7 +209,10 @@ def load_navigation_models():
             print(f"[NAVIGATION] Error: model file not found: {seg_model_path}")
 
         # Use ObstacleDetectorClient instead of YOLO directly
-        obstacle_model_path = os.getenv("OBSTACLE_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
+        obstacle_model_path = os.getenv(
+            "OBSTACLE_MODEL",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yoloe-11l-seg.pt"),
+        )
         if DEBUG: print(f"[NAVIGATION] Attempting to load obstacle detection model: {obstacle_model_path}")
 
         if os.path.exists(obstacle_model_path):
@@ -1244,6 +1250,43 @@ async def ws_viewer(ws: WebSocket):
         except Exception:
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
+
+# ---------- WebSocket: ESP32 thermal entry (MLX90640, "THRM" binary) ----------
+@app.websocket("/ws/thermal")
+async def ws_thermal_esp(ws: WebSocket):
+    """Dedicated socket for MLX90640 thermal frames — kept separate from the
+    camera socket so the two streams never interfere. Forwards each frame
+    straight to the browser viewers."""
+    await ws.accept()
+    print("[CONNECTED] Thermal (ESP32)", flush=True)
+    thermal_frame_count = 0
+    try:
+        while True:
+            msg = await ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                data = msg["bytes"]
+                if len(data) >= 4 and data[:4] == b"THRM":
+                    thermal_frame_count += 1
+                    if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
+                        print(f"[THERMAL] received {thermal_frame_count} frames "
+                              f"({len(data)} bytes), forwarding to {len(camera_viewers)} viewer(s)",
+                              flush=True)
+                    dead = []
+                    for viewer_ws in list(camera_viewers):
+                        try:
+                            await viewer_ws.send_bytes(data)
+                        except Exception:
+                            dead.append(viewer_ws)
+                    for d in dead:
+                        camera_viewers.discard(d)
+            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[THERMAL ERROR] {e}", flush=True)
+    finally:
+        print("[DISCONNECTED] Thermal (ESP32)", flush=True)
 
 # ---------- WebSocket: browser subscribes to IMU data ----------
 @app.websocket("/ws")
