@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PRST";
-const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.168.2.3";
+const char* WIFI_SSID   = "ianleeiphone1";
+const char* WIFI_PASS   = "ianleeiphone1";
+const char* SERVER_HOST = "100.92.102.123";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -48,6 +48,10 @@ const int CHUNK_MS        = 20;
 const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
+// ===== Push-to-Talk Button =====
+#define PTT_BUTTON_PIN -1   // *** TODO: set GPIO later ***
+volatile bool ptt_active = false;
+
 // ===== Speaker (I2S TX → MAX98357A) =====
 #define I2S_SPK_BCLK D1
 #define I2S_SPK_LRCK D2
@@ -59,7 +63,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.2.3";
+const char* UDP_HOST  = "100.92.102.123";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -88,6 +92,8 @@ volatile bool tts_playing = false;
 I2SClass i2sIn;   // PDM RX (Mic)
 I2SClass i2sOut;  // STD TX (Speaker)
 volatile bool run_audio_stream = false;
+
+
 
 // ====================================================================
 // Camera
@@ -272,10 +278,35 @@ void init_i2s_in(){
   Serial.println("[I2S IN] PDM RX @16kHz 16bit MONO ready");
 }
 
+void taskButton(void*) {
+  bool last = false;
+  for (;;) {
+    if (PTT_BUTTON_PIN < 0) {
+      ptt_active = true;   // fallback mode: always on
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    bool pressed = (digitalRead(PTT_BUTTON_PIN) == LOW);
+    if (pressed != last) {
+      last = pressed;
+      ptt_active = pressed;
+      if (ptt_active) {
+        Serial.println("[PTT] START");
+        wsAud.send("START");
+      } else {
+        Serial.println("[PTT] STOP");
+        wsAud.send("END") // *** NOT SURE IF "END" IS RECOGNIZABLE --> TODO: get websocket to understand "END" text ***
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 void taskMicCapture(void*){
   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
   for(;;){
-    if (run_audio_stream && aud_ws_ready) {
+    // if (run_audio_stream && aud_ws_ready) {  *** button must be pressed to capture audio thru mic ***
+    if (ptt_active && aud_ws_ready) {
       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
       int16_t* out = reinterpret_cast<int16_t*>(ch.data);
       int i = 0;
@@ -297,7 +328,8 @@ void taskMicCapture(void*){
 
 void taskMicUpload(void*){
   for(;;){
-    if (run_audio_stream && aud_ws_ready){
+    // if (run_audio_stream && aud_ws_ready){  *** button must be pressed OR there must be unprocessed audio left in the queue for upload ***
+    if ((ptt_active || uxQueueMessagesWaiting(qAudio) > 0) && aud_ws_ready) {
       AudioChunk ch;
       if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
         wsAud.sendBinary((const char*)ch.data, ch.n);
@@ -890,6 +922,7 @@ void setup() {
   xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskButton,     "button",    2048, NULL, 1, NULL, 1); // *** added button task ***
 
   wsCam.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
