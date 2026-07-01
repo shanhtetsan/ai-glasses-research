@@ -69,8 +69,10 @@ except Exception:
 # ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
 SAMPLE_RATE = 16000
 import whisper as _whisper_lib
-print("[...] Loading Whisper model...")
-_whisper_model = _whisper_lib.load_model("base")
+from asr_config import load_whisper_config
+_WHISPER_CFG = load_whisper_config()
+print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
+_whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
 print("[OK] Whisper model ready")
 
 # ---- Server-side Voice Activity Detection (VAD) tuning ----
@@ -918,7 +920,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
         loop    = asyncio.get_running_loop()
         result  = await loop.run_in_executor(
             None,
-            lambda: _whisper_model.transcribe(samples, language="en", fp16=False)
+            lambda: _whisper_model.transcribe(samples, language=_WHISPER_CFG.language, fp16=False)
         )
         text = (result.get("text") or "").strip()
         print(f"[WHISPER] {text}", flush=True)
