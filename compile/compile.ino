@@ -51,6 +51,8 @@ const int AUDIO_QUEUE_DEPTH = 10;
 // ===== Push-to-Talk Button =====
 #define PTT_BUTTON_PIN -1   // *** TODO: set GPIO later ***
 volatile bool ptt_active = false;
+volatile bool stop_pending = false;  // *** whether audio processing is complete or not ***
+// *** stop_pending is true --> esp did not send "STOP" to server yet ***
 
 // ===== Speaker (I2S TX → MAX98357A) =====
 #define I2S_SPK_BCLK D1
@@ -295,7 +297,7 @@ void taskButton(void*) {
         wsAud.send("START");
       } else {
         Serial.println("[PTT] STOP");
-        wsAud.send("END") // *** NOT SURE IF "END" IS RECOGNIZABLE --> TODO: get websocket to understand "END" text ***
+        stop_pending = true; // *** BUTTON IS RELEASED, PROCESSING AUDIO IS NOT DONE YET ***
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -335,6 +337,13 @@ void taskMicUpload(void*){
         wsAud.sendBinary((const char*)ch.data, ch.n);
       }
     } else {
+      // *** If the button has already been released and the queue is now empty,
+      // notify the server with "STOP" that speech is complete. ***
+      if (stop_pending && aud_ws_ready) {
+        wsAud.send("STOP");
+        Serial.println("[PTT] STOP sent");
+        stop_pending = false;
+      }
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
