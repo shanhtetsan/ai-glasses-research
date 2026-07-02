@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PromisingGuys";
-const char* WIFI_PASS   = "aloekanal2026";
-const char* SERVER_HOST = "192.168.12.113";
+const char* WIFI_SSID   = "PRST";
+const char* WIFI_PASS   = "phone12345";
+const char* SERVER_HOST = "192.0.0.2";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -59,7 +59,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.12.113";
+const char* UDP_HOST  = "192.0.0.2";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -134,11 +134,13 @@ bool init_camera() {
     s->set_contrast(s, 1);
     s->set_saturation(s, 1);
     s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 0);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_32X);  // let AGC amplify dark scenes (default cap is 2X)
+    s->set_exposure_ctrl(s, 1);   // auto exposure ON by default (UI can toggle via SET:AE_AUTO)
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_aec2(s, 0);
-    s->set_aec_value(s, 40);
+    s->set_aec2(s, 1);            // extended AEC: allows longer integration in low light
+    s->set_ae_level(s, 2);        // bias AE brighter (-2..+2); counters bright-lamp-in-frame metering
+    // s->set_aec_value(s, 40);   // manual exposure only applies when AE is off (SET:AEC=<v> via UI)
   }
   return true;
 }
@@ -931,6 +933,34 @@ void setup() {
         int f = cmd.substring(strlen("SET:FPS=")).toInt();
         g_target_fps = (f <= 0 ? 0 : constrain(f, 5, 60));
         Serial.printf("[CAM] target_fps=%d\n", g_target_fps);
+      }
+      else if (cmd.startsWith("SET:AE_AUTO=")) {     // Auto-exposure on/off
+        int on = cmd.substring(strlen("SET:AE_AUTO=")).toInt();
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_exposure_ctrl(s, on ? 1 : 0); Serial.printf("[CAM] ae_auto=%d\n", on ? 1 : 0); }
+      }
+      else if (cmd.startsWith("SET:AEC=")) {         // Manual exposure value (0-1200)
+        int v = cmd.substring(strlen("SET:AEC=")).toInt();
+        v = constrain(v, 0, 1200);
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_aec_value(s, v); Serial.printf("[CAM] aec=%d\n", v); }
+      }
+      else if (cmd.startsWith("SET:GAINCEIL=")) {    // AGC ceiling: 0=2X .. 6=128X
+        int v = cmd.substring(strlen("SET:GAINCEIL=")).toInt();
+        v = constrain(v, 0, 6);
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_gainceiling(s, (gainceiling_t)v); Serial.printf("[CAM] gainceil=%d\n", v); }
+      }
+      else if (cmd.startsWith("SET:AEC2=")) {        // Extended AEC (night mode) on/off
+        int on = cmd.substring(strlen("SET:AEC2=")).toInt();
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_aec2(s, on ? 1 : 0); Serial.printf("[CAM] aec2=%d\n", on ? 1 : 0); }
+      }
+      else if (cmd.startsWith("SET:AE_LEVEL=")) {    // AE target bias (-2..+2)
+        int v = cmd.substring(strlen("SET:AE_LEVEL=")).toInt();
+        v = constrain(v, -2, 2);
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_ae_level(s, v); Serial.printf("[CAM] ae_level=%d\n", v); }
       }
 
       else if (cmd == "SNAP:HQ") {

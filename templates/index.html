@@ -245,6 +245,36 @@
         <input type="range" class="setting-range" id="set_cam_fps" min="0" max="60" value="0">
         <span class="setting-val" id="val_cam_fps">0</span>
       </div>
+      <div class="setting-row">
+        <div class="setting-label">Auto Exposure<small>Camera adapts to lighting</small></div>
+        <label style="cursor:pointer"><input type="checkbox" id="set_cam_ae_auto" checked> On</label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Manual Exposure<small>Ignored when Auto is on (0=dark, 1200=bright)</small></div>
+        <input type="range" class="setting-range" id="set_cam_aec" min="0" max="1200" step="10" value="40">
+        <span class="setting-val" id="val_cam_aec">40</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Gain Ceiling<small>Max auto-gain in dark scenes (higher = brighter + noisier)</small></div>
+        <select class="setting-input" id="set_cam_gainceil" style="width:100px">
+          <option value="0">2X</option>
+          <option value="1">4X</option>
+          <option value="2">8X</option>
+          <option value="3">16X</option>
+          <option value="4" selected>32X</option>
+          <option value="5">64X</option>
+          <option value="6">128X</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Night Mode (AEC2)<small>Longer exposure in low light (may blur motion)</small></div>
+        <label style="cursor:pointer"><input type="checkbox" id="set_cam_aec2" checked> On</label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">AE Brightness Bias<small>Auto-exposure target (-2 dark .. +2 bright)</small></div>
+        <input type="range" class="setting-range" id="set_cam_ae_level" min="-2" max="2" step="1" value="2">
+        <span class="setting-val" id="val_cam_ae_level">2</span>
+      </div>
       <div class="settings-actions">
         <span id="camSettingsStatus"></span>
         <button id="btnApplyCamera">Apply</button>
@@ -340,11 +370,18 @@
   });
 
   // camera setting sliders
-  ['cam_quality','cam_fps'].forEach(f=>{
+  ['cam_quality','cam_fps','cam_aec','cam_ae_level'].forEach(f=>{
     const slider = document.getElementById('set_'+f);
     const val = document.getElementById('val_'+f);
     slider.addEventListener('input', ()=> val.textContent = slider.value);
   });
+
+  // gray out manual exposure slider when auto is on
+  const aeAuto = document.getElementById('set_cam_ae_auto');
+  const aecSlider = document.getElementById('set_cam_aec');
+  function updateAeState(){ aecSlider.disabled = aeAuto.checked; aecSlider.style.opacity = aeAuto.checked ? 0.4 : 1; }
+  aeAuto.addEventListener('change', updateAeState);
+  updateAeState();
 
   function loadSettings(){
     fetch('/api/settings').then(r=>r.json()).then(data=>{
@@ -386,7 +423,12 @@
     const body = {
       framesize: document.getElementById('set_cam_framesize').value,
       quality: parseInt(document.getElementById('set_cam_quality').value),
-      fps: parseInt(document.getElementById('set_cam_fps').value)
+      fps: parseInt(document.getElementById('set_cam_fps').value),
+      exposure_auto: document.getElementById('set_cam_ae_auto').checked,
+      exposure_value: parseInt(document.getElementById('set_cam_aec').value),
+      gain_ceiling: parseInt(document.getElementById('set_cam_gainceil').value),
+      aec2: document.getElementById('set_cam_aec2').checked,
+      ae_level: parseInt(document.getElementById('set_cam_ae_level').value)
     };
     fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(r=>{

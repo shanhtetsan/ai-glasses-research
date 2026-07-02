@@ -863,6 +863,11 @@ class CameraCommand(BaseModel):
     framesize: Optional[str] = None
     quality: Optional[int] = None
     fps: Optional[int] = None
+    exposure_auto: Optional[bool] = None
+    exposure_value: Optional[int] = None
+    gain_ceiling: Optional[int] = None   # 0=2X .. 6=128X
+    aec2: Optional[bool] = None          # extended AEC (night mode)
+    ae_level: Optional[int] = None       # AE target bias, -2..+2
 
 @app.post("/api/camera")
 async def camera_command(cmd: CameraCommand):
@@ -883,6 +888,24 @@ async def camera_command(cmd: CameraCommand):
             f = max(0, min(60, cmd.fps))
             await esp32_camera_ws.send_text(f"SET:FPS={f}")
             sent.append(f"FPS={f}")
+        if cmd.exposure_auto is not None:
+            await esp32_camera_ws.send_text(f"SET:AE_AUTO={1 if cmd.exposure_auto else 0}")
+            sent.append(f"AE_AUTO={1 if cmd.exposure_auto else 0}")
+        if cmd.exposure_value is not None:
+            v = max(0, min(1200, cmd.exposure_value))
+            await esp32_camera_ws.send_text(f"SET:AEC={v}")
+            sent.append(f"AEC={v}")
+        if cmd.gain_ceiling is not None:
+            v = max(0, min(6, cmd.gain_ceiling))
+            await esp32_camera_ws.send_text(f"SET:GAINCEIL={v}")
+            sent.append(f"GAINCEIL={v}")
+        if cmd.aec2 is not None:
+            await esp32_camera_ws.send_text(f"SET:AEC2={1 if cmd.aec2 else 0}")
+            sent.append(f"AEC2={1 if cmd.aec2 else 0}")
+        if cmd.ae_level is not None:
+            v = max(-2, min(2, cmd.ae_level))
+            await esp32_camera_ws.send_text(f"SET:AE_LEVEL={v}")
+            sent.append(f"AE_LEVEL={v}")
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     return JSONResponse({"sent": sent})
@@ -1084,6 +1107,56 @@ async def ws_audio(ws: WebSocket):
             esp32_audio_ws = None
         print("[DISCONNECTED] Mic (ESP32 audio)")
 
+def _process_camera_frame_blocking(data: bytes):
+    """Decode one JPEG frame and run detection/navigation on it.
+
+    Pure synchronous CPU work — safe to run in a thread executor. Does NO
+    websocket or async I/O. Returns (out_jpeg_bytes | None, guidance_text | None);
+    the caller broadcasts the JPEG and speaks the guidance from the event loop.
+    """
+    try:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None or bgr.size == 0:
+            return (None, None)
+    except Exception:
+        return (None, None)
+
+    # Orchestrator active and item-search not occupying the frame
+    if orchestrator and not yolomedia_running:
+        current_state = orchestrator.get_state()
+
+        # Item-search: yolomedia owns the stream; show raw until it starts sending
+        if current_state == "ITEM_SEARCH":
+            if not yolomedia_sending_frames:
+                ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                return (enc.tobytes() if ok else None, None)
+            return (None, None)
+
+        out_img = bgr
+        guidance = None
+        try:
+            if current_state == "TRAFFIC_LIGHT_DETECTION":
+                import trafficlight_detection
+                result = trafficlight_detection.process_single_frame(bgr)
+                out_img = result['vis_image'] if result['vis_image'] is not None else bgr
+            else:
+                res = orchestrator.process_frame(bgr)
+                guidance = res.guidance_text
+                out_img = res.annotated_image if res.annotated_image is not None else bgr
+        except Exception:
+            pass
+        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        return (enc.tobytes() if ok else None, guidance)
+
+    # Fallback: no orchestrator, or yolomedia running. Passthrough raw unless
+    # yolomedia is already sending its own annotated frames.
+    if not yolomedia_sending_frames:
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        return (enc.tobytes() if ok else None, None)
+    return (None, None)
+
+
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
@@ -1118,7 +1191,55 @@ async def ws_camera_esp(ws: WebSocket):
     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         if DEBUG: print("[NAV MASTER] Master state machine initialized")
+    loop = asyncio.get_running_loop()
     frame_counter = 0
+
+    # ---- Drop-to-latest pipeline ----------------------------------------
+    # The receive loop below drains the socket and keeps only the NEWEST frame.
+    # A separate processor task runs YOLO/nav on that newest frame in a thread
+    # (so it never blocks the receive loop) and broadcasts the annotated result.
+    # Frames that arrive while the processor is busy are overwritten (dropped),
+    # so detection always runs on the freshest frame instead of a growing
+    # backlog — this is what kills the video/detection lag.
+    holder = {"data": None}
+    frame_event = asyncio.Event()
+
+    async def _processor():
+        while True:
+            await frame_event.wait()
+            frame_event.clear()
+            data = holder["data"]
+            if data is None:
+                continue
+            try:
+                out_jpeg, guidance = await loop.run_in_executor(
+                    None, _process_camera_frame_blocking, data
+                )
+            except Exception as e:
+                out_jpeg, guidance = None, None
+                if DEBUG:
+                    print(f"[NAV MASTER] processor error: {e}")
+
+            # Speak/broadcast navigation guidance from the event loop
+            if guidance:
+                try:
+                    play_voice_text(guidance)
+                    await ui_broadcast_final(f"[NAV] {guidance}")
+                except Exception:
+                    pass
+
+            # Broadcast the annotated frame to browser viewers
+            if out_jpeg and camera_viewers:
+                dead = []
+                for viewer_ws in list(camera_viewers):
+                    try:
+                        await viewer_ws.send_bytes(out_jpeg)
+                    except Exception:
+                        dead.append(viewer_ws)
+                for d in dead:
+                    camera_viewers.discard(d)
+
+    processor_task = asyncio.create_task(_processor())
 
     try:
         while True:
@@ -1127,121 +1248,23 @@ async def ws_camera_esp(ws: WebSocket):
                 data = msg["bytes"]
                 frame_counter += 1
 
-                # Record the raw frame
+                # Cheap per-frame bookkeeping stays in the receive loop so it
+                # sees every frame (recording, latest-frame cache, yolomedia feed).
                 try:
                     sync_recorder.record_frame(data)
                 except Exception as e:
                     if frame_counter % 100 == 0:  # avoid log spam
                         print(f"[RECORDER] Failed to record frame: {e}")
-                
                 try:
                     last_frames.append((time.time(), data))
                 except Exception:
                     pass
-                
-                # Push to bridge_io (for use by yolomedia)
                 bridge_io.push_raw_jpeg(data)
-                
-                # Unified decoding (with stricter exception handling)
-                try:
-                    arr = np.frombuffer(data, dtype=np.uint8)
-                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    # Validate the decode result
-                    if bgr is None or bgr.size == 0:
-                        if frame_counter % 30 == 0:
-                            print(f"[JPEG] Decode failed: data length={len(data)}")
-                        bgr = None
-                except Exception as e:
-                    if frame_counter % 30 == 0:
-                        print(f"[JPEG] Decode exception: {e}")
-                    bgr = None
 
-                # Hand off to the master state machine first (when item-search is not occupying the frame)
-                # In item-search mode, skip navigation processing and let yolomedia take over the frame
-                if orchestrator and not yolomedia_running and bgr is not None:
-                    current_state = orchestrator.get_state()
-                    
-                    # Item-search mode: skip frame processing and wait for yolomedia to send processed frames
-                    if current_state == "ITEM_SEARCH":
-                        # In item-search mode, if yolomedia has not yet started sending frames, show the raw frame
-                        if not yolomedia_sending_frames and camera_viewers:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                            if ok:
-                                jpeg_data = enc.tobytes()
-                                dead = []
-                                for viewer_ws in list(camera_viewers):
-                                    try:
-                                        await viewer_ws.send_bytes(jpeg_data)
-                                    except Exception:
-                                        dead.append(viewer_ws)
-                                for d in dead:
-                                    camera_viewers.discard(d)
-                        continue  # skip subsequent navigation processing
-                    
-                    out_img = bgr
-                    try:
-                        # Check whether we are in traffic-light detection mode
-                        if current_state == "TRAFFIC_LIGHT_DETECTION":
-                            # Traffic-light detection mode: process directly in the main thread to avoid dropped frames
-                            import trafficlight_detection
-                            result = trafficlight_detection.process_single_frame(bgr, ui_broadcast_callback=ui_broadcast_final)
-                            out_img = result['vis_image'] if result['vis_image'] is not None else bgr
-                        else:
-                            # Other modes: normal navigation processing
-                            res = orchestrator.process_frame(bgr)
-
-                            # Voice guidance (throttled internally)
-                            # Note: during omni dialogue the mode is CHAT, so no navigation voice is generated
-                            if res.guidance_text:
-                                try:
-                                    # Play voice first, then broadcast to UI
-                                    play_voice_text(res.guidance_text)
-                                    await ui_broadcast_final(f"[NAV] {res.guidance_text}")
-                                except Exception:
-                                    pass
-
-                            # Output image
-                            out_img = res.annotated_image if res.annotated_image is not None else bgr
-                    except Exception as e:
-                        if frame_counter % 100 == 0:
-                            print(f"[NAV MASTER] Error processing frame: {e}")
-
-                    # Broadcast the image
-                    if camera_viewers and out_img is not None:
-                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                        if ok:
-                            jpeg_data = enc.tobytes()
-                            dead = []
-                            for viewer_ws in list(camera_viewers):
-                                try:
-                                    await viewer_ws.send_bytes(jpeg_data)
-                                except Exception:
-                                    dead.append(viewer_ws)
-                            for d in dead:
-                                camera_viewers.discard(d)
-                    # Handed off to state machine; proceed to next frame
-                    continue
-
-                # [Fallback] Item-search is occupying the frame or decoding failed; fall back to the raw frame
-                if not yolomedia_sending_frames and camera_viewers:
-                    try:
-                        if bgr is None:
-                            arr = np.frombuffer(data, dtype=np.uint8)
-                            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if bgr is not None:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                            if ok:
-                                jpeg_data = enc.tobytes()
-                                dead = []
-                                for viewer_ws in list(camera_viewers):
-                                    try:
-                                        await viewer_ws.send_bytes(jpeg_data)
-                                    except Exception:
-                                        dead.append(viewer_ws)
-                                for ws in dead:
-                                    camera_viewers.discard(ws)
-                    except Exception as e:
-                        print(f"[CAMERA] Broadcast error: {e}")
+                # Hand the newest frame to the processor. If an older unprocessed
+                # frame is still sitting here, it's overwritten (dropped).
+                holder["data"] = data
+                frame_event.set()
 
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
@@ -1250,6 +1273,11 @@ async def ws_camera_esp(ws: WebSocket):
     except Exception as e:
         print(f"[CAMERA ERROR] {e}")
     finally:
+        processor_task.cancel()
+        try:
+            await processor_task
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)

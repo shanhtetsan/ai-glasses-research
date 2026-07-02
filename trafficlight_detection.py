@@ -523,6 +523,9 @@ def process_single_frame(image: np.ndarray, ui_broadcast_callback=None) -> dict:
     max_conf = 0.0
     class_names = _model.names if hasattr(_model, 'names') else {}
 
+    _n_boxes = len(results[0].boxes) if (results and results[0].boxes is not None) else 0
+    print(f"[TRAFFIC-DIAG] frame processed, raw boxes={_n_boxes}, thresh={CONF_THRESHOLD}", flush=True)
+
     if results and len(results) > 0:
         r = results[0]
         if r.boxes is not None and len(r.boxes) > 0:
