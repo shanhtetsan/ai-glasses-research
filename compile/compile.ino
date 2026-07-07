@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PRST";
+const char* WIFI_SSID   = "GTHE";
 const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.168.2.3";
+const char* SERVER_HOST = "192.0.0.2";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -59,7 +59,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.2.3";
+const char* UDP_HOST  = "192.0.0.2";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;

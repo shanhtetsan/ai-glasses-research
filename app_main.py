@@ -55,7 +55,7 @@ except Exception:
     pass
 
 import os
-print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
+print("Gemini Key present:", bool(os.getenv("GEMINI_API_KEY")))
 
 # ---- [DASHSCOPE FALLBACK] Remote ASR — commented out, kept for reference ----
 # from dashscope import audio as dash_audio
