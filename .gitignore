@@ -18,3 +18,6 @@ mobileclip_blt.ts
 # Local caches
 .cache/
 .config/
+
+# Local agent memory / scratch
+.agent/

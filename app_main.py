@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from obstacle_detector_client import ObstacleDetectorClient
+import general_detector  # prompt-free YOLOE general object detection (lazy-loaded)
 
 import torch
 
@@ -172,6 +173,10 @@ orchestrator = None
 # Omni conversation state flags
 omni_conversation_active = False  # marks whether an omni conversation is in progress
 omni_previous_nav_state = None  # saves the navigation state before omni was activated, for restoration
+
+# General object-detection (prompt-free YOLOE) state.
+# Boxes + labels are drawn on the video stream only — no audio, no text narration.
+general_detect_active = False       # True while "detect objects" mode is running
 
 # Model loading function
 def load_navigation_models():
@@ -431,6 +436,25 @@ async def start_ai_with_text_custom(user_text: str):
     # Lower-case once so English phrase matching is case-insensitive. Lower-casing
     # Chinese characters is a no-op so the existing Chinese checks still work.
     user_text = user_text.lower()
+
+    # ---- General object detection (prompt-free YOLOE, continuous stream) ----
+    # Draws boxes + labels on the video only — no spoken audio, no text narration.
+    # Checked before the orchestrator/navigation guards so it works in any mode.
+    global general_detect_active
+    if any(k in user_text for k in ["detect objects", "detect object",
+                                    "list objects", "what objects",
+                                    "检测物体", "识别物体"]):
+        if yolomedia_running:
+            stop_yolomedia()
+        general_detect_active = True
+        # Warm up the model in the background so the first frame isn't laggy.
+        threading.Thread(target=general_detector.load, daemon=True).start()
+        return
+    if any(k in user_text for k in ["stop detecting objects", "stop object detection",
+                                    "stop detecting", "stop objects",
+                                    "停止检测物体", "停止识别物体"]):
+        general_detect_active = False
+        return
 
     # In navigation or traffic-light detection mode, only specific words trigger omni dialogue
     if orchestrator:
@@ -823,6 +847,44 @@ def root():
 def health():
     return "OK"
 
+
+@app.post("/api/restart")
+async def restart_server():
+    """Restart the Python server by re-executing the process (reloads all models).
+
+    Responds first, then re-execs after a short delay so the HTTP reply flushes.
+    """
+    async def _do_restart():
+        await asyncio.sleep(0.5)
+        print("[SYSTEM] Restart requested via web UI — re-executing…", flush=True)
+        try:
+            cleanup_on_exit()  # save recordings; atexit won't fire across execv
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    asyncio.create_task(_do_restart())
+    return JSONResponse({"status": "restarting"})
+
+
+class CommandPayload(BaseModel):
+    text: str
+
+
+@app.post("/api/command")
+async def run_command(payload: CommandPayload):
+    """Inject a command exactly as if it had been spoken (dev buttons on the page).
+
+    Runs the same dispatcher as the voice/PROMPT path so every existing command
+    phrase (detect objects, start navigation, start crossing, …) works via HTTP.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        return JSONResponse({"error": "empty command"}, status_code=400)
+    async with interrupt_lock:
+        await start_ai_with_text_custom(text)
+    return JSONResponse({"ran": text})
+
 class SettingsPayload(BaseModel):
     jpeg_quality: Optional[int] = None
     vad_silence_rms: Optional[int] = None
@@ -1121,6 +1183,22 @@ def _process_camera_frame_blocking(data: bytes):
             return (None, None)
     except Exception:
         return (None, None)
+
+    # General object detection takes over the frame while active. Checked before
+    # the orchestrator so it works even when nav models aren't loaded (laptop).
+    if general_detect_active and not yolomedia_running:
+        try:
+            annotated, _counts = general_detector.detect(
+                bgr, conf=float(os.getenv("GENERAL_DET_CONF", "0.25"))
+            )
+            out_img = annotated if annotated is not None else bgr
+        except Exception as e:
+            if DEBUG:
+                print(f"[GENERAL_DET] error: {e}")
+            out_img = bgr
+        # No spoken/text guidance — boxes + labels are drawn on the frame itself.
+        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        return (enc.tobytes() if ok else None, None)
 
     # Orchestrator active and item-search not occupying the frame
     if orchestrator and not yolomedia_running:
