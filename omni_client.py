@@ -92,70 +92,99 @@ def _build_qwen_messages(
 # Main streaming interface (unchanged signature for app_main.py)
 # ---------------------------------------------------------------------------
 
+# async def stream_chat(
+#     content_list: List[Dict[str, Any]],
+#     voice: str = "Cherry",       # retained for interface compat — unused here (TTS via 'say')
+#     audio_format: str = "wav",   # same
+# ) -> AsyncGenerator[OmniStreamPiece, None]:
+#     """
+#     Local Qwen2.5-Omni-3B text-only inference.
+
+#     generation_mode="text" → talker/token2wav are skipped entirely.
+#     Audio is produced separately by _say_to_pcm8k in app_main.py.
+
+#     Yields exactly one OmniStreamPiece(text_delta=<response>, audio_b64=None).
+#     The rest of the pipeline (ui_broadcast, broadcast_pcm16_realtime) is unchanged.
+
+#     # ---- DASHSCOPE FALLBACK (stream from remote API) ----
+#     # completion = _oai_client.chat.completions.create(
+#     #     model=_QWEN_MODEL,
+#     #     messages=[{"role": "user", "content": content_list}],
+#     #     modalities=["text", "audio"],
+#     #     audio={"voice": voice, "format": audio_format},
+#     #     stream=True,
+#     #     stream_options={"include_usage": True},
+#     # )
+#     # for chunk in completion:
+#     #     text_delta = audio_b64 = None
+#     #     if getattr(chunk, "choices", None):
+#     #         c0 = chunk.choices[0]
+#     #         delta = getattr(c0, "delta", None)
+#     #         if delta and getattr(delta, "content", None):
+#     #             text_delta = delta.content
+#     #         if delta and getattr(delta, "audio", None):
+#     #             aud = delta.audio
+#     #             audio_b64 = aud.get("data") if isinstance(aud, dict) else getattr(aud, "data", None)
+#     #     if (text_delta is not None) or (audio_b64 is not None):
+#     #         yield OmniStreamPiece(text_delta=text_delta, audio_b64=audio_b64)
+#     # ---- END DASHSCOPE FALLBACK ----
+#     """
+#     messages, pil_images = _build_qwen_messages(content_list)
+
+#     text_prompt = _processor.apply_chat_template(
+#         messages, tokenize=False, add_generation_prompt=True
+#     )
+
+#     proc_inputs = _processor(
+#         text=text_prompt,
+#         images=pil_images if pil_images else None,
+#         padding=True,
+#         return_tensors="pt",
+#     ).to("mps")
+
+#     prompt_len = proc_inputs.input_ids.shape[1]
+#     loop = asyncio.get_event_loop()
+
+#     def _generate() -> str:
+#         with torch.no_grad():
+#             output_ids = _model.generate(
+#                 **proc_inputs,
+#                 thinker_max_new_tokens=256,
+#                 generation_mode="text",   # skips talker + token2wav entirely
+#             )
+#         new_ids = output_ids[0][prompt_len:]
+#         return _processor.decode(new_ids, skip_special_tokens=True).strip()
+
+#     response_text = await loop.run_in_executor(None, _generate)
+
+#     if response_text:
+#         yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
+
 async def stream_chat(
-    content_list: List[Dict[str, Any]],
-    voice: str = "Cherry",       # retained for interface compat — unused here (TTS via 'say')
-    audio_format: str = "wav",   # same
-) -> AsyncGenerator[OmniStreamPiece, None]:
-    """
-    Local Qwen2.5-Omni-3B text-only inference.
+    content_list,
+    voice="Aoede",
+    audio_format="wav",
+):
 
-    generation_mode="text" → talker/token2wav are skipped entirely.
-    Audio is produced separately by _say_to_pcm8k in app_main.py.
+    image = None
+    prompt = ""
 
-    Yields exactly one OmniStreamPiece(text_delta=<response>, audio_b64=None).
-    The rest of the pipeline (ui_broadcast, broadcast_pcm16_realtime) is unchanged.
+    for item in content_list:
 
-    # ---- DASHSCOPE FALLBACK (stream from remote API) ----
-    # completion = _oai_client.chat.completions.create(
-    #     model=_QWEN_MODEL,
-    #     messages=[{"role": "user", "content": content_list}],
-    #     modalities=["text", "audio"],
-    #     audio={"voice": voice, "format": audio_format},
-    #     stream=True,
-    #     stream_options={"include_usage": True},
-    # )
-    # for chunk in completion:
-    #     text_delta = audio_b64 = None
-    #     if getattr(chunk, "choices", None):
-    #         c0 = chunk.choices[0]
-    #         delta = getattr(c0, "delta", None)
-    #         if delta and getattr(delta, "content", None):
-    #             text_delta = delta.content
-    #         if delta and getattr(delta, "audio", None):
-    #             aud = delta.audio
-    #             audio_b64 = aud.get("data") if isinstance(aud, dict) else getattr(aud, "data", None)
-    #     if (text_delta is not None) or (audio_b64 is not None):
-    #         yield OmniStreamPiece(text_delta=text_delta, audio_b64=audio_b64)
-    # ---- END DASHSCOPE FALLBACK ----
-    """
-    messages, pil_images = _build_qwen_messages(content_list)
+        if item["type"] == "image_url":
 
-    text_prompt = _processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    proc_inputs = _processor(
-        text=text_prompt,
-        images=pil_images if pil_images else None,
-        padding=True,
-        return_tensors="pt",
-    ).to("mps")
-
-    prompt_len = proc_inputs.input_ids.shape[1]
-    loop = asyncio.get_event_loop()
-
-    def _generate() -> str:
-        with torch.no_grad():
-            output_ids = _model.generate(
-                **proc_inputs,
-                thinker_max_new_tokens=256,
-                generation_mode="text",   # skips talker + token2wav entirely
+            image = _decode_data_url(
+                item["image_url"]["url"]
             )
-        new_ids = output_ids[0][prompt_len:]
-        return _processor.decode(new_ids, skip_special_tokens=True).strip()
 
-    response_text = await loop.run_in_executor(None, _generate)
+        elif item["type"] == "text":
 
-    if response_text:
-        yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
+            prompt += item["text"]
+
+    parts = []
+
+    if image:
+
+        parts.append(image)
+
+    parts.append(prompt)
