@@ -5,11 +5,14 @@
   const $camStatus = document.getElementById('camStatus');
   const $asrStatus = document.getElementById('asrStatus');
   const $partial   = document.getElementById('partial');
+  const $partialTime = document.getElementById('partialTime');
   const $finalList = document.getElementById('finalList');
   const $btnClear  = document.getElementById('btnClear');
   const $btnRe     = document.getElementById('btnReconnect');
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
+  const thermalCanvas = document.getElementById("thermalCanvas");
+const thermalCtx = thermalCanvas.getContext("2d");
   const ctx        = canvas.getContext('2d');
 
   // === get/create chat container ===
@@ -107,8 +110,22 @@
       }
       .message.user .avatar{ display:none !important; }
 
+      .msg-content{
+        display:flex !important;
+        flex-direction:column !important;
+        max-width:72% !important;
+      }
+      .msg-time{
+        font-size:10px !important;
+        color:#5a6f85 !important;
+        margin:0 2px 2px !important;
+        user-select:none !important;
+        font-variant-numeric:tabular-nums !important;
+      }
+      .message.ai .msg-time{ align-self:flex-start !important; }
+      .message.user .msg-time{ align-self:flex-end !important; }
+
       .bubble{
-        max-width: 72% !important;
         padding:10px 12px !important;
         line-height:1.45 !important;
         border-radius:14px !important;
@@ -152,6 +169,15 @@
     const minutes = date.getMinutes().toString().padStart(2, '0');
     return `${hours}:${minutes}`;
   }
+
+  // HH:MM:SS, used for per-message latency-measurement timestamps
+  function formatClock(timestamp = Date.now()) {
+    const date = new Date(timestamp);
+    const hours = date.getHours().toString().padStart(2, '0');
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    const seconds = date.getSeconds().toString().padStart(2, '0');
+    return `${hours}:${minutes}:${seconds}`;
+  }
   
   function addTimestamp() {
     const container = ensureChatContainer();
@@ -160,6 +186,11 @@
     timestampDiv.textContent = formatTime();
     container.appendChild(timestampDiv);
   }
+
+
+ 
+
+
   
   function addMessage(text, isUser = false) {
     if (shouldShowTimestamp()) addTimestamp();
@@ -173,15 +204,25 @@
     avatar.className = 'avatar';
     avatar.textContent = isUser ? '' : 'AI';
 
+    const contentWrap = document.createElement('div');
+    contentWrap.className = 'msg-content';
+
+    const msgTime = document.createElement('div');
+    msgTime.className = 'msg-time';
+    msgTime.textContent = formatClock();
+
     const bubbleDiv = document.createElement('div');
     bubbleDiv.className = 'bubble';
     bubbleDiv.textContent = text;
 
+    contentWrap.appendChild(msgTime);
+    contentWrap.appendChild(bubbleDiv);
+
     if (isUser){
-      messageDiv.appendChild(bubbleDiv);
+      messageDiv.appendChild(contentWrap);
     }else{
       messageDiv.appendChild(avatar);
-      messageDiv.appendChild(bubbleDiv);
+      messageDiv.appendChild(contentWrap);
     }
 
     container.appendChild(messageDiv);
@@ -212,6 +253,7 @@
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0;
+  let wsThermal;
 
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
@@ -246,6 +288,72 @@
     wsCam.onmessage = (ev)=> drawBlob(ev.data);
   }
 
+  function drawThermal(frameArray){
+    if (!frameArray || frameArray.length !== 768) return;
+
+    const cols = 32, rows = 24;
+    if (thermalCanvas.width !== cols || thermalCanvas.height !== rows){
+      thermalCanvas.width = cols;
+      thermalCanvas.height = rows;
+    }
+
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < frameArray.length; i++){
+      const v = frameArray[i];
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    const range = (max - min) || 1;
+
+    const imgData = thermalCtx.createImageData(cols, rows);
+    for (let i = 0; i < frameArray.length; i++){
+      const t = (frameArray[i] - min) / range; // 0..1
+      const idx = i * 4;
+      imgData.data[idx]     = Math.round(255 * t);       // R: hot -> red
+      imgData.data[idx + 1] = 0;                          // G
+      imgData.data[idx + 2] = Math.round(255 * (1 - t));  // B: cold -> blue
+      imgData.data[idx + 3] = 255;                        // A
+    }
+    thermalCtx.putImageData(imgData, 0, 0);
+  }
+
+  function connectThermal(){
+
+    try{
+        if(wsThermal) wsThermal.close();
+    }catch(e){}
+
+    const proto = location.protocol==="https:"?"wss":"ws";
+
+    wsThermal = new WebSocket(`${proto}://${location.host}/ws_thermal`);
+
+    wsThermal.onopen=()=>{
+        console.log("Thermal Connected");
+    };
+
+    wsThermal.onclose=()=>{
+        console.log("Thermal Closed");
+    };
+
+    wsThermal.onerror=()=>{
+        console.log("Thermal Error");
+    };
+
+    wsThermal.onmessage=(event)=>{
+
+        const data=JSON.parse(event.data);
+
+        drawThermal(data.frame);
+
+        document.getElementById("thermalMax").textContent=
+            "Max: "+data.max.toFixed(1)+"°C";
+
+        document.getElementById("thermalMin").textContent=
+            "Min: "+data.min.toFixed(1)+"°C";
+    };
+
+}
+
   function connectASR(){
     try{ if (wsUI) wsUI.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -260,7 +368,8 @@
         try{
           const data = JSON.parse(s.slice(5));
           $partial.textContent = data.partial || '(waiting for audio…)';
-          
+          if (data.partial) $partialTime.textContent = formatClock();
+
           if (data.finals && data.finals.length > 0) {
             data.finals.forEach(text => {
               if (text.startsWith('[AI]')) {
@@ -276,9 +385,10 @@
         }catch(e){}
         return;
       }
-      if (s.startsWith('PARTIAL:')){ 
-        $partial.textContent = s.slice(8); 
-        return; 
+      if (s.startsWith('PARTIAL:')){
+        $partial.textContent = s.slice(8);
+        $partialTime.textContent = formatClock();
+        return;
       }
       if (s.startsWith('FINAL:')){
         const text = s.slice(6);
@@ -302,10 +412,11 @@
     messages.forEach(msg => msg.remove());
     lastTimestamp = 0;
   };
-  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); };
+  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); connectThermal(); };
 
   connectCamera();
-  connectASR();
+connectASR();
+connectThermal();
 })();
 
 

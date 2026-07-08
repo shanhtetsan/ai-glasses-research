@@ -131,6 +131,7 @@
   .live{padding:12px;border:1px dashed #2d3b50;border-radius:12px;background:#0c121a}
   .live h2{margin:0 0 8px 0;font-size:14px;color:var(--muted);font-weight:600}
   .partial{font-size:20px;min-height:2.2em;letter-spacing:.2px}
+  .partial-time{font-size:11px;color:var(--muted);margin-bottom:2px;font-variant-numeric:tabular-nums;min-height:1em}
 
   .finals {
     padding: 12px;
@@ -185,6 +186,43 @@
     .app{grid-template-columns:1fr; height:auto}
     .chat{height:60vh}
   }
+
+#thermalCanvas{
+    position:absolute;
+    right:20px;
+    bottom:20px;
+
+    width:260px;
+    height:195px;
+
+    border-radius:12px;
+    border:2px solid rgba(255,255,255,.25);
+
+    background:black;
+
+    z-index:40;
+
+    image-rendering:pixelated;
+}
+
+#thermalInfo{
+    position:absolute;
+    right:20px;
+    bottom:225px;
+
+    color:white;
+
+    background:rgba(0,0,0,.6);
+
+    padding:8px 12px;
+
+    border-radius:10px;
+
+    font-size:14px;
+
+    z-index:45;
+}
+
 </style>
 </head>
 <body>
@@ -192,7 +230,16 @@
 <div class="app">
   <!-- main stage (left) -->
   <section class="stage">
-    <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+<div class="canvas-wrap">
+    <canvas id="canvas"></canvas>
+
+    <canvas id="thermalCanvas"></canvas>
+
+    <div id="thermalInfo">
+        <div id="thermalMax">Max: --°C</div>
+        <div id="thermalMin">Min: --°C</div>
+    </div>
+</div>
 
     <!-- top-left: IMU float panel (horizontal) -->
     <div class="imu-float">
@@ -280,6 +327,7 @@
     <div class="chat-list">
       <div class="live">
         <h2>Live ASR (Partial)</h2>
+        <div class="partial-time" id="partialTime"></div>
         <div class="partial" id="partial">(waiting for audio…)</div>
       </div>
       <div class="finals">

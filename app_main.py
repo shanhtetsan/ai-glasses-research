@@ -154,7 +154,14 @@ recent_finals: List[str] = []
 RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
+# ====== Thermal (MLX90640) ======
+THERMAL_JPG_PATH = "latest_thermal.jpg"
+latest_thermal: Optional[np.ndarray] = None  # shape (24, 32) float32, sensor row-major layout
+latest_thermal_desc: str = ""  # e.g. "84°C at top-left"
+latest_thermal_lock = threading.Lock()
+
 camera_viewers: Set[WebSocket] = set()
+thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
@@ -671,6 +678,7 @@ async def start_ai_with_text(user_text: str):
 
         # Assemble (image + text) content
         content_list = []
+        have_rgb = False
         if last_frames:
             try:
                 _, jpeg_bytes = last_frames[-1]
@@ -679,9 +687,28 @@ async def start_ai_with_text(user_text: str):
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
                 })
+                have_rgb = True
             except Exception:
                 pass
-        content_list.append({"type": "text", "text": user_text})
+
+        # If a thermal frame has arrived, attach it as a second image with a
+        # system note; otherwise proceed with RGB only.
+        thermal_note = ""
+        if have_rgb and os.path.exists(THERMAL_JPG_PATH):
+            try:
+                with open(THERMAL_JPG_PATH, "rb") as f:
+                    thermal_b64 = base64.b64encode(f.read()).decode("ascii")
+                content_list.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{thermal_b64}"}
+                })
+                with latest_thermal_lock:
+                    desc = latest_thermal_desc
+                thermal_note = f"[Thermal] Max temp: {desc}. Second image is thermal (brighter = hotter). "
+            except Exception:
+                pass
+
+        content_list.append({"type": "text", "text": thermal_note + user_text})
 
         try:
             async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
@@ -848,6 +875,53 @@ async def camera_command(cmd: CameraCommand):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     return JSONResponse({"sent": sent})
+
+def _update_thermal_jpg(frame: np.ndarray) -> str:
+    """Render `frame` (24x32 float32 °C) to THERMAL_JPG_PATH and return a
+    human-readable hotspot description like '84°C at top-left'."""
+    lo, hi = np.percentile(frame, [5, 95])
+    if hi <= lo:
+        hi = lo + 1e-6
+    normed = np.clip((frame - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    colored = cv2.applyColorMap(normed, cv2.COLORMAP_INFERNO)
+    resized = cv2.resize(colored, (320, 240), interpolation=cv2.INTER_CUBIC)
+    cv2.imwrite(THERMAL_JPG_PATH, resized)
+
+    row, col = np.unravel_index(np.argmax(frame), frame.shape)
+    max_temp = float(frame[row, col])
+    vert = "top" if row < frame.shape[0] / 2 else "bottom"
+    horiz = "left" if col < frame.shape[1] / 2 else "right"
+    return f"{max_temp:.0f}°C at {vert}-{horiz}"
+
+@app.post("/thermal")
+async def receive_thermal(request: Request):
+    print("[THERMAL] POST received")
+    global latest_thermal, latest_thermal_desc
+    body = await request.body()
+    if len(body) != 3072:
+        return JSONResponse({"error": f"expected 3072 bytes, got {len(body)}"}, status_code=400)
+
+    frame = np.frombuffer(body, dtype="<f4").reshape(24, 32)
+    with latest_thermal_lock:
+        latest_thermal = frame.copy()
+        latest_thermal_desc = _update_thermal_jpg(frame)
+
+    if thermal_viewers:
+        payload = json.dumps({
+            "frame": frame.flatten().tolist(),
+            "max": float(frame.max()),
+            "min": float(frame.min()),
+        })
+        dead = []
+        for viewer_ws in list(thermal_viewers):
+            try:
+                await viewer_ws.send_text(payload)
+            except Exception:
+                dead.append(viewer_ws)
+        for viewer_ws in dead:
+            thermal_viewers.discard(viewer_ws)
+
+    return JSONResponse({"status": "ok", "desc": latest_thermal_desc})
 
 # Register /stream.wav route
 register_stream_route(app)
@@ -1247,6 +1321,25 @@ async def ws_viewer(ws: WebSocket):
         except Exception:
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
+
+# ---------- WebSocket: browser subscribes to thermal frames ----------
+@app.websocket("/ws_thermal")
+async def ws_thermal(ws: WebSocket):
+    await ws.accept()
+    thermal_viewers.add(ws)
+    print(f"[THERMAL] Browser connected. Total viewers: {len(thermal_viewers)}", flush=True)
+    try:
+        while True:
+            # Keep the connection alive
+            await asyncio.sleep(60)
+    except WebSocketDisconnect:
+        print("[THERMAL] Browser disconnected", flush=True)
+    finally:
+        try:
+            thermal_viewers.remove(ws)
+        except Exception:
+            pass
+        print(f"[THERMAL] Removed. Total viewers: {len(thermal_viewers)}", flush=True)
 
 # ---------- WebSocket: browser subscribes to IMU data ----------
 @app.websocket("/ws")

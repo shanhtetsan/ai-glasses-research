@@ -8,68 +8,182 @@
 #include "ESP_I2S.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+
+
+
 struct WavFmt;
-#include <cstring>      // memcmp
+#include <cstring>  // memcmp
 #include <WiFiUdp.h>
-#include <WiFiClient.h> 
+#include <WiFiClient.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PRST";
-const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.168.2.3";
+const char* WIFI_SSID = "IanLeeiPhone";
+const char* WIFI_PASS = "ianleeiphone1";
+const char* SERVER_HOST = "172.20.10.14";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
 static const char* AUD_WS_PATH = "/ws_audio";
+
 
 // ===== Camera config =====
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "camera_pins.h"
 
 framesize_t g_frame_size = FRAMESIZE_VGA;
-#define JPEG_QUALITY  17
-#define FB_COUNT      2
+#define JPEG_QUALITY 17
+#define FB_COUNT 2
 volatile int g_target_fps = 0;
 
 
-volatile unsigned long frame_captured_count = 0;  
-volatile unsigned long frame_sent_count = 0;      
-volatile unsigned long frame_dropped_count = 0;   
-volatile unsigned long last_stats_time = 0;       
-volatile unsigned long ws_send_fail_count = 0;  
+volatile unsigned long frame_captured_count = 0;
+volatile unsigned long frame_sent_count = 0;
+volatile unsigned long frame_dropped_count = 0;
+volatile unsigned long last_stats_time = 0;
+volatile unsigned long ws_send_fail_count = 0;
+
+// ===== Thermal ========
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
+SemaphoreHandle_t i2cMutex;
+
+#define THERMAL_ADDR 0x33
+#define THERMAL_EMISSIVITY 0.95
+#define THERMAL_TA_SHIFT 8
+#define THERMAL_POST_INTERVAL_MS 3000
+#define THERMAL_POST_TIMEOUT_MS 600
+
+paramsMLX90640 mlx90640;
+static float thermalPixels[32 * 24];
+bool thermalReady = false;
+
+bool initThermal() {
+  Serial.println("[THERMAL] Initializing...");
+
+  // DO NOT call Wire.begin()
+  // IMU already initialized the bus.
+
+  Wire.setClock(400000);
+
+  // Check device exists
+ if (xSemaphoreTake(i2cMutex, portMAX_DELAY))
+{
+    Wire.beginTransmission(THERMAL_ADDR);
+
+    if (Wire.endTransmission() != 0)
+    {
+        xSemaphoreGive(i2cMutex);
+        Serial.println("[THERMAL] MLX90640 not found");
+        return false;
+    }
+
+    uint16_t eeMLX90640[832];
+
+    if (MLX90640_DumpEE(THERMAL_ADDR, eeMLX90640) != 0)
+    {
+        xSemaphoreGive(i2cMutex);
+        return false;
+    }
+
+    if (MLX90640_ExtractParameters(eeMLX90640, &mlx90640) != 0)
+    {
+        xSemaphoreGive(i2cMutex);
+        return false;
+    }
+
+    MLX90640_SetRefreshRate(THERMAL_ADDR, 0x05);
+
+    xSemaphoreGive(i2cMutex);
+}
+
+  Wire.setClock(400000);
+
+  Serial.println("[THERMAL] Ready");
+
+  return true;
+}
+
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
-#define I2S_MIC_DATA_PIN  41
-const int SAMPLE_RATE     = 16000; 
-const int CHUNK_MS        = 20;
+#define I2S_MIC_DATA_PIN 41
+const int SAMPLE_RATE = 16000;
+const int CHUNK_MS = 20;
 const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Speaker (I2S TX → MAX98357A) =====
 #define I2S_SPK_BCLK D1
 #define I2S_SPK_LRCK D2
-#define I2S_SPK_DIN  D3
+#define I2S_SPK_DIN D3
 const int TTS_RATE = 16000;
 
 // ===== IMU (MPU-6050 over I2C) / UDP =====
-// Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
-// Change these if you wired the GY-521 to different pins.
-#define IMU_I2C_SDA   5   // D4
-#define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.2.3";
-const int   UDP_PORT  = 12345;
+// Some XIAO ESP32S3 builds use non-default I2C pins for the sensor board.
+// We probe several common pin pairs and use the one that actually responds.
+#define IMU_I2C_SDA_FALLBACK 5  // D4
+#define IMU_I2C_SCL_FALLBACK 6  // D5
+static uint8_t g_imu_i2c_sda = IMU_I2C_SDA_FALLBACK;
+static uint8_t g_imu_i2c_scl = IMU_I2C_SCL_FALLBACK;
+
+struct I2cPinPair {
+  uint8_t sda;
+  uint8_t scl;
+};
+
+static bool initI2cBus() {
+  static const I2cPinPair candidates[] = {
+    {5, 6},
+    {18, 17},
+    {8, 9},
+    {17, 18},
+    {21, 22},
+    {22, 21}
+  };
+
+  for (const auto& candidate : candidates) {
+    Wire.begin(candidate.sda, candidate.scl);
+    Wire.setClock(400000);
+    delay(50);
+
+    Wire.beginTransmission(MPU_ADDR);
+    uint8_t imuErr = Wire.endTransmission();
+
+    Wire.beginTransmission(THERMAL_ADDR);
+    uint8_t thermalErr = Wire.endTransmission();
+
+    Serial.printf("[I2C] probe SDA=%u SCL=%u -> imu=%u thermal=%u\n",
+                  candidate.sda, candidate.scl, imuErr, thermalErr);
+
+    if (imuErr == 0 || thermalErr == 0) {
+      g_imu_i2c_sda = candidate.sda;
+      g_imu_i2c_scl = candidate.scl;
+      Serial.printf("[I2C] using SDA=%u SCL=%u\n", g_imu_i2c_sda, g_imu_i2c_scl);
+      return true;
+    }
+  }
+
+  Wire.begin(IMU_I2C_SDA_FALLBACK, IMU_I2C_SCL_FALLBACK);
+  Wire.setClock(400000);
+  Serial.println("[I2C] no IMU/thermal device found on common I2C pins");
+  return false;
+}
+
+const char* UDP_HOST = "172.20.10.14";
+const int UDP_PORT = 12345;
 
 WiFiUDP udp;
 
 // ===== WS / Queues / I2S =====
 WebsocketsClient wsCam;
 WebsocketsClient wsAud;
+
 volatile bool cam_ws_ready = false;
 volatile bool aud_ws_ready = false;
-volatile bool snapshot_in_progress = false; // Pause live capture during a high-res snapshot
+volatile bool snapshot_in_progress = false;  // Pause live capture during a high-res snapshot
 
 typedef camera_fb_t* fb_ptr_t;
 QueueHandle_t qFrames;
@@ -81,7 +195,10 @@ typedef struct {
 QueueHandle_t qAudio;
 
 #define TTS_QUEUE_DEPTH 48
-typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
+typedef struct {
+  uint16_t n;
+  uint8_t data[2048];
+} TTSChunk;
 QueueHandle_t qTTS;
 volatile bool tts_playing = false;
 
@@ -96,35 +213,49 @@ bool apply_framesize(framesize_t fs) {
   sensor_t* s = esp_camera_sensor_get();
   if (!s) return false;
   int r = s->set_framesize(s, fs);
-  if (r == 0) { g_frame_size = fs; return true; }
+  if (r == 0) {
+    g_frame_size = fs;
+    return true;
+  }
   return false;
 }
 
 bool init_camera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn  = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = g_frame_size;
+  config.frame_size = g_frame_size;
   config.jpeg_quality = JPEG_QUALITY;
-  config.fb_count     = FB_COUNT;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_count = FB_COUNT;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) { Serial.printf("[CAM] init failed: 0x%x\n", err); return false; }
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] init failed: 0x%x\n", err);
+    return false;
+  }
 
-  sensor_t * s = esp_camera_sensor_get();
+  sensor_t* s = esp_camera_sensor_get();
   if (s) {
 
     s->set_hmirror(s, 1);  // ★ Horizontal mirror to match natural left/right (1=on, 0=off)
@@ -151,7 +282,7 @@ inline void enqueue_frame(camera_fb_t* fb) {
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
       if (drop) {
         esp_camera_fb_return(drop);
-        frame_dropped_count++;  
+        frame_dropped_count++;
       }
     }
     xQueueSend(qFrames, &fb, 0);
@@ -161,26 +292,28 @@ inline void enqueue_frame(camera_fb_t* fb) {
 void taskCamCapture(void*) {
   unsigned long last_log = 0;
   unsigned long capture_fail_count = 0;
-  
-  for(;;){
-    if (snapshot_in_progress) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-    
+
+  for (;;) {
+    if (snapshot_in_progress) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
     if (cam_ws_ready) {
       camera_fb_t* fb = esp_camera_fb_get();
       if (fb) {
         frame_captured_count++;
-        if (fb->format != PIXFORMAT_JPEG) { 
+        if (fb->format != PIXFORMAT_JPEG) {
           esp_camera_fb_return(fb);
           capture_fail_count++;
-        }
-        else { 
+        } else {
           enqueue_frame(fb);
         }
       } else {
         capture_fail_count++;
         vTaskDelay(pdMS_TO_TICKS(2));
       }
-      
+
       // Print capture stats every 5s
       unsigned long now = millis();
       if (now - last_log > 5000) {
@@ -201,8 +334,8 @@ void taskCamSend(void*) {
   unsigned long last_log = 0;
   unsigned long send_timeout_count = 0;
   unsigned long last_sent_time = 0;
-  
-  for(;;){
+
+  for (;;) {
     fb_ptr_t fb = nullptr;
     if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
       if (fb && cam_ws_ready) {
@@ -214,15 +347,15 @@ void taskCamSend(void*) {
           if (elapsed < period_ms) vTaskDelay(pdMS_TO_TICKS(period_ms - elapsed));
           lastTick = xTaskGetTickCount();
         }
-        
+
         unsigned long send_start = millis();
         bool ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
         unsigned long send_time = millis() - send_start;
-        
+
         if (ok) {
           frame_sent_count++;
           last_sent_time = millis();
-          
+
 
           if (send_time > 100) {
             Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
@@ -231,24 +364,24 @@ void taskCamSend(void*) {
           ws_send_fail_count++;
           Serial.println("[CAM-SEND] ERROR: WebSocket send failed, closing...");
           esp_camera_fb_return(fb);
-          wsCam.close(); 
+          wsCam.close();
           cam_ws_ready = false;
           continue;
         }
-        
+
         esp_camera_fb_return(fb);
-        
+
         // Print send stats every 5s
         unsigned long now = millis();
         if (now - last_log > 5000) {
           unsigned long gap = now - last_sent_time;
-          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
+          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n",
                         frame_sent_count, frame_dropped_count, ws_send_fail_count, gap);
           last_log = now;
         }
-        
-      } else if (fb) { 
-        esp_camera_fb_return(fb); 
+
+      } else if (fb) {
+        esp_camera_fb_return(fb);
       }
     } else {
 
@@ -263,28 +396,32 @@ void taskCamSend(void*) {
 // ====================================================================
 // Mic (PDM RX)
 // ====================================================================
-void init_i2s_in(){
+void init_i2s_in() {
   i2sIn.setPinsPdmRx(I2S_MIC_CLOCK_PIN, I2S_MIC_DATA_PIN);
   if (!i2sIn.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println("[I2S IN] init failed");
-    while(1) { delay(1000); }
+    while (1) { delay(1000); }
   }
   Serial.println("[I2S IN] PDM RX @16kHz 16bit MONO ready");
 }
 
-void taskMicCapture(void*){
-  const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
-  for(;;){
+void taskMicCapture(void*) {
+  const int samples_per_chunk = BYTES_PER_CHUNK / 2;  // int16
+  for (;;) {
     if (run_audio_stream && aud_ws_ready) {
-      AudioChunk ch; ch.n = BYTES_PER_CHUNK;
+      AudioChunk ch;
+      ch.n = BYTES_PER_CHUNK;
       int16_t* out = reinterpret_cast<int16_t*>(ch.data);
       int i = 0;
-      while (i < samples_per_chunk){
+      while (i < samples_per_chunk) {
         int v = i2sIn.read();
-        if (v == -1) { delay(1); continue; }
+        if (v == -1) {
+          delay(1);
+          continue;
+        }
         out[i++] = (int16_t)v;
       }
-      if (xQueueSend(qAudio, &ch, 0) != pdPASS){
+      if (xQueueSend(qAudio, &ch, 0) != pdPASS) {
         AudioChunk dump;
         xQueueReceive(qAudio, &dump, 0);
         xQueueSend(qAudio, &ch, 0);
@@ -295,11 +432,11 @@ void taskMicCapture(void*){
   }
 }
 
-void taskMicUpload(void*){
-  for(;;){
-    if (run_audio_stream && aud_ws_ready){
+void taskMicUpload(void*) {
+  for (;;) {
+    if (run_audio_stream && aud_ws_ready) {
       AudioChunk ch;
-      if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
+      if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS) {
         wsAud.sendBinary((const char*)ch.data, ch.n);
       }
     } else {
@@ -311,42 +448,42 @@ void taskMicUpload(void*){
 // ====================================================================
 // Speaker (I2S TX) + HTTP /stream.wav (chunked-safe)
 // ====================================================================
-void init_i2s_out(){
+void init_i2s_out() {
   i2sOut.setPins(I2S_SPK_BCLK, I2S_SPK_LRCK, I2S_SPK_DIN);
   if (!i2sOut.begin(I2S_MODE_STD, TTS_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
     Serial.println("[I2S OUT] init failed");
-    while(1){ delay(1000); }
+    while (1) { delay(1000); }
   }
   Serial.println("[I2S OUT] STD TX @16kHz 32bit STEREO ready");
 }
 
 struct WavFmt {
-  uint16_t audioFormat;   // 1=PCM
-  uint16_t numChannels;   // 1=mono
-  uint32_t sampleRate;    // 16000
+  uint16_t audioFormat;  // 1=PCM
+  uint16_t numChannels;  // 1=mono
+  uint32_t sampleRate;   // 16000
   uint32_t byteRate;
   uint16_t blockAlign;
-  uint16_t bitsPerSample; // 16
+  uint16_t bitsPerSample;  // 16
 };
 
 static inline void mono16_to_stereo32_msb(const int16_t* in, size_t nSamp, int32_t* outLR, float gain = 0.7f) {
   for (size_t i = 0; i < nSamp; ++i) {
     int32_t s = (int32_t)((float)in[i] * gain);
     int32_t v32 = s << 16;
-    outLR[i*2 + 0] = v32;
-    outLR[i*2 + 1] = v32;
+    outLR[i * 2 + 0] = v32;
+    outLR[i * 2 + 1] = v32;
   }
 }
 
 // === chunked ===
-static bool read_line(WiFiClient& cli, String& line, uint32_t timeout_ms=3000){
+static bool read_line(WiFiClient& cli, String& line, uint32_t timeout_ms = 3000) {
   line = "";
   uint32_t t0 = millis();
-  while (millis() - t0 < timeout_ms){
-    while (cli.available()){
+  while (millis() - t0 < timeout_ms) {
+    while (cli.available()) {
       char ch = (char)cli.read();
-      if (ch == '\n'){
-        if (line.endsWith("\r")) line.remove(line.length()-1);
+      if (ch == '\n') {
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
         return true;
       }
       line += ch;
@@ -356,15 +493,15 @@ static bool read_line(WiFiClient& cli, String& line, uint32_t timeout_ms=3000){
   return false;
 }
 
-static bool readN_http_body(WiFiClient& cli, uint8_t* buf, size_t n, bool chunked, size_t& chunk_left, uint32_t timeout_ms=3000){
+static bool readN_http_body(WiFiClient& cli, uint8_t* buf, size_t n, bool chunked, size_t& chunk_left, uint32_t timeout_ms = 3000) {
   size_t got = 0;
   uint32_t t0 = millis();
 
-  while (got < n){
+  while (got < n) {
     if (!cli.connected()) return false;
-    if (!chunked){
+    if (!chunked) {
       int avail = cli.available();
-      if (avail > 0){
+      if (avail > 0) {
         int toread = (int)min((size_t)avail, n - got);
         int r = cli.read(buf + got, toread);
         if (r > 0) got += r;
@@ -373,14 +510,14 @@ static bool readN_http_body(WiFiClient& cli, uint8_t* buf, size_t n, bool chunke
         delay(1);
       }
     } else {
-      if (chunk_left == 0){
+      if (chunk_left == 0) {
         String szline;
         if (!read_line(cli, szline, timeout_ms)) return false;
         int sc = szline.indexOf(';');
         if (sc >= 0) szline = szline.substring(0, sc);
         szline.trim();
         unsigned long sz = strtoul(szline.c_str(), nullptr, 16);
-        if (sz == 0){
+        if (sz == 0) {
           String dummy;
           read_line(cli, dummy, 500);
           return false;
@@ -388,16 +525,20 @@ static bool readN_http_body(WiFiClient& cli, uint8_t* buf, size_t n, bool chunke
         chunk_left = (size_t)sz;
       }
       int avail = cli.available();
-      if (avail > 0){
+      if (avail > 0) {
         size_t want = min(n - got, chunk_left);
         int toread = (int)min((size_t)avail, want);
         int r = cli.read(buf + got, toread);
-        if (r > 0){
+        if (r > 0) {
           got += r;
           chunk_left -= (size_t)r;
-          if (chunk_left == 0){
-            while (cli.available() < 2) { if (millis() - t0 > timeout_ms) return false; delay(1); }
-            cli.read(); cli.read();
+          if (chunk_left == 0) {
+            while (cli.available() < 2) {
+              if (millis() - t0 > timeout_ms) return false;
+              delay(1);
+            }
+            cli.read();
+            cli.read();
           }
         }
       } else {
@@ -409,7 +550,7 @@ static bool readN_http_body(WiFiClient& cli, uint8_t* buf, size_t n, bool chunke
   return true;
 }
 
-static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaining, bool chunked, size_t& chunk_left){
+static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaining, bool chunked, size_t& chunk_left) {
   uint8_t hdr12[12];
   if (!readN_http_body(cli, hdr12, 12, chunked, chunk_left)) return false;
   if (memcmp(hdr12, "RIFF", 4) != 0 || memcmp(hdr12 + 8, "WAVE", 4) != 0) return false;
@@ -428,28 +569,26 @@ static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaini
       size_t toread = min(sz, (uint32_t)sizeof(fmtbuf));
       if (!readN_http_body(cli, fmtbuf, toread, chunked, chunk_left)) return false;
       uint32_t left = sz - (uint32_t)toread;
-      while (left){
+      while (left) {
         uint8_t dump[64];
         size_t d = min((uint32_t)sizeof(dump), left);
         if (!readN_http_body(cli, dump, d, chunked, chunk_left)) return false;
         left -= d;
       }
-      fmt.audioFormat   = (uint16_t) (fmtbuf[0] | (fmtbuf[1] << 8));
-      fmt.numChannels   = (uint16_t) (fmtbuf[2] | (fmtbuf[3] << 8));
-      fmt.sampleRate    = (uint32_t) (fmtbuf[4] | (fmtbuf[5] << 8) | (fmtbuf[6] << 16) | (fmtbuf[7] << 24));
-      fmt.byteRate      = (uint32_t) (fmtbuf[8] | (fmtbuf[9] << 8) | (fmtbuf[10] << 16) | (fmtbuf[11] << 24));
-      fmt.blockAlign    = (uint16_t) (fmtbuf[12] | (fmtbuf[13] << 8));
-      fmt.bitsPerSample = (uint16_t) (fmtbuf[14] | (fmtbuf[15] << 8));
+      fmt.audioFormat = (uint16_t)(fmtbuf[0] | (fmtbuf[1] << 8));
+      fmt.numChannels = (uint16_t)(fmtbuf[2] | (fmtbuf[3] << 8));
+      fmt.sampleRate = (uint32_t)(fmtbuf[4] | (fmtbuf[5] << 8) | (fmtbuf[6] << 16) | (fmtbuf[7] << 24));
+      fmt.byteRate = (uint32_t)(fmtbuf[8] | (fmtbuf[9] << 8) | (fmtbuf[10] << 16) | (fmtbuf[11] << 24));
+      fmt.blockAlign = (uint16_t)(fmtbuf[12] | (fmtbuf[13] << 8));
+      fmt.bitsPerSample = (uint16_t)(fmtbuf[14] | (fmtbuf[15] << 8));
       gotFmt = true;
-    }
-    else if (memcmp(chdr, "data", 4) == 0) {
+    } else if (memcmp(chdr, "data", 4) == 0) {
       if (!gotFmt) return false;
       dataRemaining = sz;
       return true;
-    }
-    else {
+    } else {
       uint32_t left = sz;
-      while (left){
+      while (left) {
         uint8_t dump[128];
         size_t d = min((uint32_t)sizeof(dump), left);
         if (!readN_http_body(cli, dump, d, chunked, chunk_left)) return false;
@@ -463,11 +602,11 @@ static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaini
 static TaskHandle_t taskHttpPlayHandle = nullptr;
 static volatile bool http_play_running = false;
 
-void taskHttpPlay(void*){
+void taskHttpPlay(void*) {
   http_play_running = true;
   WiFiClient cli;
 
-  auto readLine = [&](String& out, uint32_t timeout_ms)->bool {
+  auto readLine = [&](String& out, uint32_t timeout_ms) -> bool {
     out = "";
     uint32_t t0 = millis();
     while (millis() - t0 < timeout_ms) {
@@ -483,7 +622,7 @@ void taskHttpPlay(void*){
     return false;
   };
 
-  auto readNRaw = [&](uint8_t* dst, size_t n, uint32_t timeout_ms)->bool {
+  auto readNRaw = [&](uint8_t* dst, size_t n, uint32_t timeout_ms) -> bool {
     size_t got = 0;
     uint32_t t0 = millis();
     while (got < n) {
@@ -492,7 +631,10 @@ void taskHttpPlay(void*){
       if (avail > 0) {
         int take = (int)min((size_t)avail, n - got);
         int r = cli.read(dst + got, take);
-        if (r > 0) { got += r; continue; }
+        if (r > 0) {
+          got += r;
+          continue;
+        }
       }
       if (millis() - t0 > timeout_ms) return false;
       delay(1);
@@ -500,8 +642,8 @@ void taskHttpPlay(void*){
     return true;
   };
 
-  auto makeBodyReader = [&](bool& is_chunked, uint32_t& chunk_left){
-    return [&](uint8_t* dst, size_t n, uint32_t timeout_ms)->bool {
+  auto makeBodyReader = [&](bool& is_chunked, uint32_t& chunk_left) {
+    return [&](uint8_t* dst, size_t n, uint32_t timeout_ms) -> bool {
       size_t filled = 0;
       uint32_t t0 = millis();
       while (filled < n) {
@@ -515,7 +657,11 @@ void taskHttpPlay(void*){
             szLine.trim();
             uint32_t sz = 0;
             if (sscanf(szLine.c_str(), "%x", &sz) != 1) return false;
-            if (sz == 0) { String dummy; readLine(dummy, 200); return false; }
+            if (sz == 0) {
+              String dummy;
+              readLine(dummy, 200);
+              return false;
+            }
             chunk_left = sz;
           }
           size_t need = (size_t)min<uint32_t>(chunk_left, (uint32_t)(n - filled));
@@ -527,9 +673,10 @@ void taskHttpPlay(void*){
           int r = cli.read(dst + filled, need);
           if (r <= 0) {
             if (millis() - t0 > timeout_ms) return false;
-            delay(1); continue;
+            delay(1);
+            continue;
           }
-          filled     += r;
+          filled += r;
           chunk_left -= r;
           if (chunk_left == 0) {
             char crlf[2];
@@ -550,80 +697,132 @@ void taskHttpPlay(void*){
   while (http_play_running) {
     if (!cli.connected()) {
       Serial.println("[AUDIO] HTTP connect...");
-      if (!cli.connect(SERVER_HOST, SERVER_PORT)) { delay(500); continue; }
+      if (!cli.connect(SERVER_HOST, SERVER_PORT)) {
+        delay(500);
+        continue;
+      }
       String req =
-        String("GET /stream.wav HTTP/1.1\r\n") +
-        "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
-        "Connection: keep-alive\r\n\r\n";
+        String("GET /stream.wav HTTP/1.1\r\n") + "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" + "Connection: keep-alive\r\n\r\n";
       cli.print(req);
     }
 
-    bool header_ok  = false;
+    bool header_ok = false;
     bool is_chunked = false;
     uint32_t content_len = 0;
     {
-      String line; uint32_t t0 = millis();
+      String line;
+      uint32_t t0 = millis();
       while (millis() - t0 < 3000) {
-        if (!readLine(line, 1000)) { if (!cli.connected()) break; continue; }
-        String u = line; u.toLowerCase();
-        if (u.startsWith("transfer-encoding:")) { if (u.indexOf("chunked") >= 0) is_chunked = true; }
-        else if (u.startsWith("content-length:")) { content_len = (uint32_t) strtoul(u.substring(strlen("content-length:")).c_str(), nullptr, 10); }
-        if (line.length() == 0) { header_ok = true; break; }
+        if (!readLine(line, 1000)) {
+          if (!cli.connected()) break;
+          continue;
+        }
+        String u = line;
+        u.toLowerCase();
+        if (u.startsWith("transfer-encoding:")) {
+          if (u.indexOf("chunked") >= 0) is_chunked = true;
+        } else if (u.startsWith("content-length:")) {
+          content_len = (uint32_t)strtoul(u.substring(strlen("content-length:")).c_str(), nullptr, 10);
+        }
+        if (line.length() == 0) {
+          header_ok = true;
+          break;
+        }
       }
     }
-    if (!header_ok) { cli.stop(); delay(300); continue; }
+    if (!header_ok) {
+      cli.stop();
+      delay(300);
+      continue;
+    }
 
     uint32_t chunk_left = 0;
     auto readBody = makeBodyReader(is_chunked, chunk_left);
 
     uint8_t hdr12[12];
-    if (!readBody(hdr12, 12, 1000)) { cli.stop(); delay(300); continue; }
-    if (memcmp(hdr12, "RIFF", 4) != 0 || memcmp(hdr12 + 8, "WAVE", 4) != 0) { cli.stop(); delay(300); continue; }
+    if (!readBody(hdr12, 12, 1000)) {
+      cli.stop();
+      delay(300);
+      continue;
+    }
+    if (memcmp(hdr12, "RIFF", 4) != 0 || memcmp(hdr12 + 8, "WAVE", 4) != 0) {
+      cli.stop();
+      delay(300);
+      continue;
+    }
 
-    bool  gotFmt = false, gotData = false;
+    bool gotFmt = false, gotData = false;
     uint8_t chdr[8];
-    uint16_t audioFormat=0, numChannels=0, bitsPerSample=0;
-    uint32_t sampleRate=0;
+    uint16_t audioFormat = 0, numChannels = 0, bitsPerSample = 0;
+    uint32_t sampleRate = 0;
 
     while (!gotData) {
-      if (!readBody(chdr, 8, 1000)) { cli.stop(); delay(300); goto reconnect; }
-      uint32_t sz = (uint32_t)chdr[4] | ((uint32_t)chdr[5]<<8) | ((uint32_t)chdr[6]<<16) | ((uint32_t)chdr[7]<<24);
+      if (!readBody(chdr, 8, 1000)) {
+        cli.stop();
+        delay(300);
+        goto reconnect;
+      }
+      uint32_t sz = (uint32_t)chdr[4] | ((uint32_t)chdr[5] << 8) | ((uint32_t)chdr[6] << 16) | ((uint32_t)chdr[7] << 24);
 
       if (memcmp(chdr, "fmt ", 4) == 0) {
-        if (sz < 16) { cli.stop(); delay(300); goto reconnect; }
+        if (sz < 16) {
+          cli.stop();
+          delay(300);
+          goto reconnect;
+        }
         uint8_t fmtbuf[32];
         size_t toread = min(sz, (uint32_t)sizeof(fmtbuf));
-        if (!readBody(fmtbuf, toread, 1000)) { cli.stop(); delay(300); goto reconnect; }
+        if (!readBody(fmtbuf, toread, 1000)) {
+          cli.stop();
+          delay(300);
+          goto reconnect;
+        }
         if (sz > toread) {
           size_t left = sz - toread;
-          while (left) { uint8_t dump[128]; size_t d = min(left, sizeof(dump));
-            if (!readBody(dump, d, 1000)) { cli.stop(); delay(300); goto reconnect; }
+          while (left) {
+            uint8_t dump[128];
+            size_t d = min(left, sizeof(dump));
+            if (!readBody(dump, d, 1000)) {
+              cli.stop();
+              delay(300);
+              goto reconnect;
+            }
             left -= d;
           }
         }
-        audioFormat   = (uint16_t)(fmtbuf[0] | (fmtbuf[1] << 8));
-        numChannels   = (uint16_t)(fmtbuf[2] | (fmtbuf[3] << 8));
-        sampleRate    = (uint32_t)(fmtbuf[4] | (fmtbuf[5] << 8) | (fmtbuf[6] << 16) | (fmtbuf[7] << 24));
+        audioFormat = (uint16_t)(fmtbuf[0] | (fmtbuf[1] << 8));
+        numChannels = (uint16_t)(fmtbuf[2] | (fmtbuf[3] << 8));
+        sampleRate = (uint32_t)(fmtbuf[4] | (fmtbuf[5] << 8) | (fmtbuf[6] << 16) | (fmtbuf[7] << 24));
         bitsPerSample = (uint16_t)(fmtbuf[14] | (fmtbuf[15] << 8));
         gotFmt = true;
-      }
-      else if (memcmp(chdr, "data", 4) == 0) {
-        if (!gotFmt) { cli.stop(); delay(300); goto reconnect; }
+      } else if (memcmp(chdr, "data", 4) == 0) {
+        if (!gotFmt) {
+          cli.stop();
+          delay(300);
+          goto reconnect;
+        }
         gotData = true;
-      }
-      else {
+      } else {
         size_t left = sz;
-        while (left) { uint8_t dump[128]; size_t d = min(left, sizeof(dump));
-          if (!readBody(dump, d, 1000)) { cli.stop(); delay(300); goto reconnect; }
+        while (left) {
+          uint8_t dump[128];
+          size_t d = min(left, sizeof(dump));
+          if (!readBody(dump, d, 1000)) {
+            cli.stop();
+            delay(300);
+            goto reconnect;
+          }
           left -= d;
         }
       }
     }
 
-    if (!(audioFormat==1 && numChannels==1 && bitsPerSample==16 && (sampleRate==8000 || sampleRate==12000 || sampleRate==16000))) {
+    if (!(audioFormat == 1 && numChannels == 1 && bitsPerSample == 16 && (sampleRate == 8000 || sampleRate == 12000 || sampleRate == 16000))) {
       Serial.printf("[AUDIO] unsupported fmt: ch=%u bits=%u sr=%u af=%u\n",
                     numChannels, bitsPerSample, sampleRate, audioFormat);
-      cli.stop(); delay(300); continue;
+      cli.stop();
+      delay(300);
+      continue;
     }
     Serial.printf("[AUDIO] WAV ok: %u/16bit/mono (chunked=%d)\n", sampleRate, is_chunked ? 1 : 0);
 
@@ -637,10 +836,10 @@ void taskHttpPlay(void*){
 
     while (http_play_running) {
       uint8_t inbuf[2048];
-      size_t  filled = 0;
+      size_t filled = 0;
 
       // Compute 20ms byte count based on sample rate (mono, 16-bit)
-      uint32_t bytes20 = (sampleRate * 2 * 20) / 1000; // 16k=640,12k=480,8k=320
+      uint32_t bytes20 = (sampleRate * 2 * 20) / 1000;  // 16k=640,12k=480,8k=320
       if (bytes20 < 2) bytes20 = 2;
 
       if (!readBody(inbuf, bytes20, BODY_TIMEOUT_MS)) { break; }
@@ -652,7 +851,10 @@ void taskHttpPlay(void*){
       }
 
       if (filled & 1) filled -= 1;
-      if (filled == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+      if (filled == 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
+      }
 
       if (tts_playing) continue;  // WebSocket TTS owns i2sOut right now; discard HTTP audio
 
@@ -668,7 +870,7 @@ void taskHttpPlay(void*){
       }
     }
 
-  reconnect:
+reconnect:
     cli.stop();
     delay(200);
   }
@@ -677,12 +879,12 @@ void taskHttpPlay(void*){
   vTaskDelete(nullptr);
 }
 
-void startStreamWav(){
+void startStreamWav() {
   if (taskHttpPlayHandle) return;
   xTaskCreatePinnedToCore(taskHttpPlay, "http_wav", 8192, nullptr, 2, &taskHttpPlayHandle, 0);
   Serial.println("[AUDIO] http_wav task started");
 }
-void stopStreamWav(){
+void stopStreamWav() {
   if (!taskHttpPlayHandle) return;
   http_play_running = false;
   vTaskDelay(pdMS_TO_TICKS(50));
@@ -693,46 +895,56 @@ void stopStreamWav(){
 // ====================================================================
 // TTS
 // ====================================================================
-void taskTTSPlay(void*){
-  static int32_t stereo32Buf[1024*2];
-  for(;;){
-    if (!tts_playing){ vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+void taskTTSPlay(void*) {
+  static int32_t stereo32Buf[1024 * 2];
+  for (;;) {
+    if (!tts_playing) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
     TTSChunk ch;
-    if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS){
-      if (ch.n == 0) { tts_playing = false; continue; }  // TTS:END sentinel from server
-      size_t inSamp  = ch.n / 2;
+    if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS) {
+      if (ch.n == 0) {
+        tts_playing = false;
+        continue;
+      }  // TTS:END sentinel from server
+      size_t inSamp = ch.n / 2;
       int16_t* inPtr = (int16_t*)ch.data;
       size_t outPairs = 0;
-      for (size_t i = 0; i < inSamp; ++i){
+      for (size_t i = 0; i < inSamp; ++i) {
         int32_t s = (int32_t)inPtr[i];
         s = (s * 19660) / 32768;
         int32_t v32 = s << 16;
-        stereo32Buf[outPairs*2 + 0] = v32;
-        stereo32Buf[outPairs*2 + 1] = v32;
+        stereo32Buf[outPairs * 2 + 0] = v32;
+        stereo32Buf[outPairs * 2 + 1] = v32;
         outPairs++;
-        if (outPairs >= 1024){
+        if (outPairs >= 1024) {
           size_t bytes = outPairs * 2 * sizeof(int32_t);
           size_t off = 0;
-          while (off < bytes){
+          while (off < bytes) {
             size_t wrote = i2sOut.write((uint8_t*)stereo32Buf + off, bytes - off);
-            if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1)); else off += wrote;
+            if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1));
+            else off += wrote;
           }
           outPairs = 0;
         }
       }
-      if (outPairs){
+      if (outPairs) {
         size_t bytes = outPairs * 2 * sizeof(int32_t);
         size_t off = 0;
-        while (off < bytes){
+        while (off < bytes) {
           size_t wrote = i2sOut.write((uint8_t*)stereo32Buf + off, bytes - off);
-          if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1)); else off += wrote;
+          if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1));
+          else off += wrote;
         }
       }
     }
   }
 }
 
-inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
+inline void tts_reset_queue() {
+  if (qTTS) xQueueReset(qTTS);
+}
 
 // ====================================================================
 // IMU (MPU-6050 over I2C, bare Wire) 50 Hz via UDP
@@ -740,17 +952,17 @@ inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
 // No third-party library — avoids the sensor_t typedef collision with
 // esp_camera.h that Adafruit_Sensor.h causes.
 
-#define MPU_ADDR          0x68  // I2C address when ADO=LOW (GY-521 default)
-#define MPU_REG_WHO_AM_I  0x75  // read-only ID register; MPU-6050 returns 0x68
+#define MPU_ADDR 0x68           // I2C address when ADO=LOW (GY-521 default)
+#define MPU_REG_WHO_AM_I 0x75   // read-only ID register; MPU-6050 returns 0x68
 #define MPU_REG_PWR_MGMT1 0x6B  // bit6=SLEEP; write 0x00 to wake the chip
-#define MPU_REG_GYRO_CFG  0x1B  // bits[4:3]=FS_SEL; 0x18 → ±2000 dps
+#define MPU_REG_GYRO_CFG 0x1B   // bits[4:3]=FS_SEL; 0x18 → ±2000 dps
 #define MPU_REG_ACCEL_CFG 0x1C  // bits[4:3]=AFS_SEL; 0x18 → ±16 g
 #define MPU_REG_ACCEL_OUT 0x3B  // first of 14 burst bytes: AX AY AZ TEMP GX GY GZ
 
 // At ±16 g: 2048 LSB per g.  Multiply by (9.80665 / 2048) to get m/s².
 // At ±2000 dps: 16.4 LSB per dps.  Divide by 16.4 to get deg/s.
 static const float MPU_ACCEL_SCALE = 9.80665f / 2048.0f;
-static const float MPU_GYRO_SCALE  = 1.0f / 16.4f;
+static const float MPU_GYRO_SCALE = 1.0f / 16.4f;
 
 static void mpu_write(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MPU_ADDR);
@@ -767,91 +979,190 @@ static uint8_t mpu_read1(uint8_t reg) {
   return Wire.available() ? Wire.read() : 0xFF;
 }
 
-static void mpu_read14(uint8_t* dst) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(MPU_REG_ACCEL_OUT);
-  Wire.endTransmission(false);  // repeated-START — do not release bus
-  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)14);
-  for (uint8_t i = 0; i < 14; i++)
-    dst[i] = Wire.available() ? Wire.read() : 0;
+static bool mpu_read14(uint8_t* dst)
+{
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(MPU_REG_ACCEL_OUT);
+
+    if (Wire.endTransmission(false) != 0)
+        return false;
+
+    if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)14) != 14)
+        return false;
+
+    for (uint8_t i = 0; i < 14; i++)
+        dst[i] = Wire.read();
+
+    return true;
 }
 
 bool imu_init_i2c() {
-  Wire.begin(IMU_I2C_SDA, IMU_I2C_SCL);
   delay(5);
+
+  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+    return false;
+  }
 
   uint8_t who = mpu_read1(MPU_REG_WHO_AM_I);
   Serial.printf("[IMU] WHO_AM_I=0x%02X (expect 0x68)\n", who);
-  if (who != 0x68) return false;
 
-  mpu_write(MPU_REG_PWR_MGMT1, 0x00);  // clear SLEEP bit — chip starts sampling
+  if (who != 0x68) {
+    xSemaphoreGive(i2cMutex);
+    return false;
+  }
+
+  mpu_write(MPU_REG_PWR_MGMT1, 0x00);  // Wake up MPU6050
   delay(10);
-  mpu_write(MPU_REG_GYRO_CFG,  0x18);  // FS_SEL=3  → ±2000 dps
-  mpu_write(MPU_REG_ACCEL_CFG, 0x18);  // AFS_SEL=3 → ±16 g
+  mpu_write(MPU_REG_GYRO_CFG, 0x18);   // ±2000 dps
+  mpu_write(MPU_REG_ACCEL_CFG, 0x18);  // ±16 g
+
+  xSemaphoreGive(i2cMutex);
+
   Serial.println("[IMU] MPU-6050 init OK (I2C)");
   return true;
 }
 
+
 bool imu_read_once(float& tempC, float& ax, float& ay, float& az,
-                   float& gx,   float& gy, float& gz) {
-  uint8_t raw[14];
-  mpu_read14(raw);
+                   float& gx, float& gy, float& gz)
+{
+    uint8_t raw[14];
 
-  // All values are 16-bit signed big-endian (high byte first).
-  auto s16 = [](uint8_t hi, uint8_t lo) -> int16_t {
-    return (int16_t)((uint16_t)hi << 8 | lo);
-  };
+    if (!xSemaphoreTake(i2cMutex, portMAX_DELAY))
+        return false;
 
-  ax = s16(raw[0],  raw[1])  * MPU_ACCEL_SCALE;  // m/s²
-  ay = s16(raw[2],  raw[3])  * MPU_ACCEL_SCALE;
-  az = s16(raw[4],  raw[5])  * MPU_ACCEL_SCALE;
-  // raw[6..7] = raw temperature — MPU-6050 datasheet formula:
-  tempC = s16(raw[6], raw[7]) / 340.0f + 36.53f;
-  gx = s16(raw[8],  raw[9])  * MPU_GYRO_SCALE;   // deg/s
-  gy = s16(raw[10], raw[11]) * MPU_GYRO_SCALE;
-  gz = s16(raw[12], raw[13]) * MPU_GYRO_SCALE;
-  return true;
+    bool ok = mpu_read14(raw);
+
+    xSemaphoreGive(i2cMutex);
+
+    if (!ok)
+        return false;
+
+    auto s16 = [](uint8_t hi, uint8_t lo) -> int16_t {
+        return (int16_t)(((uint16_t)hi << 8) | lo);
+    };
+
+    ax = s16(raw[0], raw[1]) * MPU_ACCEL_SCALE;
+    ay = s16(raw[2], raw[3]) * MPU_ACCEL_SCALE;
+    az = s16(raw[4], raw[5]) * MPU_ACCEL_SCALE;
+
+    tempC = s16(raw[6], raw[7]) / 340.0f + 36.53f;
+
+    gx = s16(raw[8], raw[9]) * MPU_GYRO_SCALE;
+    gy = s16(raw[10], raw[11]) * MPU_GYRO_SCALE;
+    gz = s16(raw[12], raw[13]) * MPU_GYRO_SCALE;
+
+    return true;
 }
 
 // EMA smoothing on accel only; does not change the UDP field names.
 static const float EMA_ALPHA = 0.20f;
-bool  ema_inited = false;
-float ax_f=0, ay_f=0, az_f=0;
+bool ema_inited = false;
+float ax_f = 0, ay_f = 0, az_f = 0;
 
-void taskImuLoop(void*){
-  for(;;){
+void taskImuLoop(void*) {
+  for (;;) {
     static bool inited = false;
-    if (!inited){
+    if (!inited) {
       inited = imu_init_i2c();
-      if (!inited){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+      if (!inited) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
     }
 
     float tempC, ax, ay, az, gx, gy, gz;
-    if (!imu_read_once(tempC, ax, ay, az, gx, gy, gz)){
-      inited = false; vTaskDelay(pdMS_TO_TICKS(50)); continue;
+    if (!imu_read_once(tempC, ax, ay, az, gx, gy, gz)) {
+      inited = false;
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
     }
 
-    if (!ema_inited){ ax_f=ax; ay_f=ay; az_f=az; ema_inited=true; }
-    else {
-      ax_f = EMA_ALPHA*ax + (1-EMA_ALPHA)*ax_f;
-      ay_f = EMA_ALPHA*ay + (1-EMA_ALPHA)*ay_f;
-      az_f = EMA_ALPHA*az + (1-EMA_ALPHA)*az_f;
+    if (!ema_inited) {
+      ax_f = ax;
+      ay_f = ay;
+      az_f = az;
+      ema_inited = true;
+    } else {
+      ax_f = EMA_ALPHA * ax + (1 - EMA_ALPHA) * ax_f;
+      ay_f = EMA_ALPHA * ay + (1 - EMA_ALPHA) * ay_f;
+      az_f = EMA_ALPHA * az + (1 - EMA_ALPHA) * az_f;
     }
 
     char buf[256];
     unsigned long ts = millis();
     int n = snprintf(buf, sizeof(buf),
-      "{\"ts\":%lu,\"temp_c\":%.2f,"
-      "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-      "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
-      ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
+                     "{\"ts\":%lu,\"temp_c\":%.2f,"
+                     "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
+                     "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
+                     ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
 
     if (n > 0) {
       udp.beginPacket(UDP_HOST, UDP_PORT);
       udp.write((const uint8_t*)buf, n);
       udp.endPacket();
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
+    vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz
+  }
+}
+
+void taskThermalLoop(void* pv) {
+
+  while (1) {
+    if (!thermalReady) {
+      thermalReady = initThermal();
+
+      if (!thermalReady) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
+      }
+    }
+
+    uint16_t frame[834];
+
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+      int status = MLX90640_GetFrameData(THERMAL_ADDR, frame);
+      xSemaphoreGive(i2cMutex);
+
+      if (status < 0) {
+        thermalReady = false;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+    } else {
+      Serial.println("[THERMAL] I2C busy, skipping frame");
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    float Ta = MLX90640_GetTa(frame, &mlx90640);
+    float tr = Ta - THERMAL_TA_SHIFT;
+
+    MLX90640_CalculateTo(
+      frame,
+      &mlx90640,
+      THERMAL_EMISSIVITY,
+      tr,
+      thermalPixels);
+
+    Serial.printf(
+      "[THERMAL] Center = %.2f C\n",
+      thermalPixels[12 * 32 + 16]);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = String("http://") + SERVER_HOST + ":" + String(SERVER_PORT) + "/thermal";
+      http.begin(url);
+      http.addHeader("Content-Type", "application/octet-stream");
+      http.setTimeout(THERMAL_POST_TIMEOUT_MS);
+      int code = http.POST((uint8_t*)thermalPixels, sizeof(thermalPixels));
+      if (code <= 0) {
+        Serial.printf("[THERMAL] POST failed: %s\n", http.errorToString(code).c_str());
+      }
+      http.end();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(THERMAL_POST_INTERVAL_MS));
   }
 }
 
@@ -870,10 +1181,17 @@ void setup() {
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] connecting");
-  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
   Serial.println(" OK " + WiFi.localIP().toString());
 
-  if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
+  if (!init_camera()) {
+    Serial.println("[CAM] init failed, reboot...");
+    delay(1500);
+    esp_restart();
+  }
 
   udp.begin(0);
 
@@ -881,19 +1199,32 @@ void setup() {
   init_i2s_out();
 
   qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
-  qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
-  qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
+  qAudio = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
+  qTTS = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
+  i2cMutex = xSemaphoreCreateMutex();
+
+  // Bring up the I2C bus once, before the IMU/thermal tasks start, so
+  // neither task races to call Wire.begin() first.
+  initI2cBus();
 
   xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
-  xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskCamSend, "cam_snd", 8192, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(taskMicCapture, "mic_cap", 4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskMicUpload, "mic_upl", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskImuLoop, "imu_loop", 4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(
+    taskThermalLoop,
+    "thermal",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0);
+  xTaskCreatePinnedToCore(taskTTSPlay, "tts_play", 4096, NULL, 2, NULL, 0);
 
-  wsCam.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened)  { 
-      cam_ws_ready = true;  
+  wsCam.onEvent([](WebsocketsEvent ev, String) {
+    if (ev == WebsocketsEvent::ConnectionOpened) {
+      cam_ws_ready = true;
       Serial.println("[WS-CAM] open");
       // Reset statistics
       frame_sent_count = 0;
@@ -901,16 +1232,17 @@ void setup() {
       ws_send_fail_count = 0;
       last_stats_time = millis();
     }
-    if (ev == WebsocketsEvent::ConnectionClosed)  { 
-      cam_ws_ready = false; 
-      Serial.printf("[WS-CAM] closed (sent=%lu, dropped=%lu, fail=%lu)\n", 
+    if (ev == WebsocketsEvent::ConnectionClosed) {
+      cam_ws_ready = false;
+      Serial.printf("[WS-CAM] closed (sent=%lu, dropped=%lu, fail=%lu)\n",
                     frame_sent_count, frame_dropped_count, ws_send_fail_count);
     }
   });
 
-  wsCam.onMessage([](WebsocketsMessage msg){
-    if (msg.isText()){
-      String cmd = msg.data(); cmd.trim();
+  wsCam.onMessage([](WebsocketsMessage msg) {
+    if (msg.isText()) {
+      String cmd = msg.data();
+      cmd.trim();
       if (cmd.startsWith("SET:FRAMESIZE=")) {
         String v = cmd.substring(strlen("SET:FRAMESIZE="));
         v.toUpperCase();
@@ -920,14 +1252,15 @@ void setup() {
         else if (v == "VGA") fs = FRAMESIZE_VGA;
         if (apply_framesize(fs)) Serial.printf("[CAM] framesize set to %s\n", v.c_str());
         else Serial.printf("[CAM] framesize set failed: %s\n", v.c_str());
-      }
-      else if (cmd.startsWith("SET:QUALITY=")) {     // Dynamic JPEG quality
+      } else if (cmd.startsWith("SET:QUALITY=")) {  // Dynamic JPEG quality
         int q = cmd.substring(strlen("SET:QUALITY=")).toInt();
         q = constrain(q, 5, 40);
         sensor_t* s = esp_camera_sensor_get();
-        if (s) { s->set_quality(s, q); Serial.printf("[CAM] quality=%d\n", q); }
-      }
-      else if (cmd.startsWith("SET:FPS=")) {         // Send throttle FPS
+        if (s) {
+          s->set_quality(s, q);
+          Serial.printf("[CAM] quality=%d\n", q);
+        }
+      } else if (cmd.startsWith("SET:FPS=")) {  // Send throttle FPS
         int f = cmd.substring(strlen("SET:FPS=")).toInt();
         g_target_fps = (f <= 0 ? 0 : constrain(f, 5, 60));
         Serial.printf("[CAM] target_fps=%d\n", g_target_fps);
@@ -944,7 +1277,7 @@ void setup() {
         framesize_t target_fs = FRAMESIZE_SXGA;
         if (s) {
           s->set_framesize(s, target_fs);
-          s->set_quality(s, 18); // Lower value = higher quality
+          s->set_quality(s, 18);  // Lower value = higher quality
         }
         vTaskDelay(pdMS_TO_TICKS(500));
         camera_fb_t* fb = esp_camera_fb_get();
@@ -967,21 +1300,28 @@ void setup() {
     }
   });
 
-  wsAud.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened)  { aud_ws_ready = true;  Serial.println("[WS-AUD] open"); }
-    if (ev == WebsocketsEvent::ConnectionClosed)  { 
-      aud_ws_ready = false; 
-      Serial.println("[WS-AUD] closed"); 
+  wsAud.onEvent([](WebsocketsEvent ev, String) {
+    if (ev == WebsocketsEvent::ConnectionOpened) {
+      aud_ws_ready = true;
+      Serial.println("[WS-AUD] open");
+    }
+    if (ev == WebsocketsEvent::ConnectionClosed) {
+      aud_ws_ready = false;
+      Serial.println("[WS-AUD] closed");
       stopStreamWav();
     }
   });
 
-  wsAud.onMessage([](WebsocketsMessage msg){
-    if (msg.isText()){
-      String s = msg.data(); s.trim();
-      if (s == "RESTART"){
-        run_audio_stream = false; xQueueReset(qAudio); delay(50);
-        wsAud.send("START"); run_audio_stream = true;
+  wsAud.onMessage([](WebsocketsMessage msg) {
+    if (msg.isText()) {
+      String s = msg.data();
+      s.trim();
+      if (s == "RESTART") {
+        run_audio_stream = false;
+        xQueueReset(qAudio);
+        delay(50);
+        wsAud.send("START");
+        run_audio_stream = true;
       } else if (s == "TTS:START") {
         tts_reset_queue();
         tts_playing = true;
@@ -995,7 +1335,7 @@ void setup() {
       size_t n = min((size_t)msg.length(), sizeof(ch.data));
       ch.n = (uint16_t)n;
       memcpy(ch.data, msg.rawData().c_str(), n);  // rawData() is std::string — safe for null bytes in PCM
-      xQueueSend(qTTS, &ch, 0);  // non-blocking; drop if queue full
+      xQueueSend(qTTS, &ch, 0);                   // non-blocking; drop if queue full
     }
   });
 }
@@ -1004,7 +1344,10 @@ void loop() {
   if (!wsCam.available()) {
     if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
       Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
+    } else {
+      Serial.println("[WS-CAM] retry in 1s...");
+      delay(1000);
+    }
   }
 
   if (!wsAud.available()) {
@@ -1013,8 +1356,11 @@ void loop() {
       delay(50);
       run_audio_stream = true;
       wsAud.send("START");
-      startStreamWav();   // /stream.wav (chunked)
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
+      startStreamWav();  // /stream.wav (chunked)
+    } else {
+      Serial.println("[WS-AUD] retry in 2s...");
+      delay(2000);
+    }
   }
 
   wsCam.poll();
