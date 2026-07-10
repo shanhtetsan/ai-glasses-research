@@ -117,7 +117,7 @@ from audio_stream import (
     is_playing_now,
     current_ai_task,
 )
-from gemini_client import stream_chat, OmniStreamPiece
+from vision_backend import stream_chat, OmniStreamPiece
 from asr_core import (
     ASRCallback,
     set_current_recognition,
@@ -840,6 +840,14 @@ async def start_ai_with_text(user_text: str):
     task = loop.create_task(_runner())
     _as_dict["current_ai_task"] = task
 
+    # Clear the handle when the turn ends so a finished task can never be
+    # mistaken for an in-progress one. Only clear if it is still *this* task,
+    # so a newer turn started in the meantime is left untouched.
+    def _clear_task(t: asyncio.Task) -> None:
+        if _as_dict.get("current_ai_task") is t:
+            _as_dict["current_ai_task"] = None
+    task.add_done_callback(_clear_task)
+
 # ---------- Page / Health ----------
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -1109,6 +1117,17 @@ async def ws_audio(ws: WebSocket):
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
                 if streaming and pcm_buffer is not None:
+                    # Mute the mic while the AI is speaking. Without this the
+                    # glasses' own TTS echoes back into the mic, gets VAD-segmented
+                    # and can launch a bogus turn — which then blocks the user's
+                    # next real question (the "ask twice" symptom). Drop the frame
+                    # and reset VAD so nothing accumulates during playback.
+                    if is_playing_now():
+                        pcm_buffer          = bytearray()
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
+                        continue
                     pcm_buffer.extend(chunk)
 
                     # ---- VAD: classify this 20ms chunk ----

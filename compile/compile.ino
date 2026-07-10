@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "GTHE";
-const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.0.0.2";
+const char* WIFI_SSID   = "YOUR_WIFI_SSID";       // set to your network before flashing
+const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
+const char* SERVER_HOST = "YOUR_SERVER_IP";       // the laptop running app_main.py, same LAN
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -55,11 +55,12 @@ const int AUDIO_QUEUE_DEPTH = 10;
 const int TTS_RATE = 16000;
 
 // ===== IMU (MPU-6050 over I2C) / UDP =====
+
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.0.0.2";
+const char* UDP_HOST  = "YOUR_SERVER_IP";  // same as SERVER_HOST
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -701,7 +702,11 @@ void taskTTSPlay(void*){
     if (!tts_playing){ vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     TTSChunk ch;
     if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS){
-      if (ch.n == 0) { tts_playing = false; continue; }  // TTS:END sentinel from server
+      if (ch.n == 0) {                     // TTS:END sentinel from server
+        tts_playing = false;
+        run_audio_stream = true;           // playback truly finished — un-mute the mic
+        continue;
+      }
       size_t inSamp  = ch.n / 2;
       int16_t* inPtr = (int16_t*)ch.data;
       size_t outPairs = 0;
@@ -1013,11 +1018,23 @@ void setup() {
         run_audio_stream = false; xQueueReset(qAudio); delay(50);
         wsAud.send("START"); run_audio_stream = true;
       } else if (s == "TTS:START") {
+        run_audio_stream = false;   // mute mic during playback: no echo, no wsAud contention
+        xQueueReset(qAudio);        // drop any mic frames already captured
         tts_reset_queue();
         tts_playing = true;
       } else if (s == "TTS:END") {
         TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
-        xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(10));
+        // Ensure the end-sentinel actually lands. If qTTS is briefly full the
+        // sentinel could be dropped, leaving tts_playing stuck true and the mic
+        // muted forever. Retry, then hard-recover if it still won't queue.
+        int tries = 0;
+        while (xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(20)) != pdPASS && tries < 10) {
+          tries++;
+        }
+        if (tries >= 10) {
+          tts_playing = false;      // fallback: force idle so the mic recovers
+          run_audio_stream = true;
+        }
       }
     } else if (msg.isBinary()) {
       if (!tts_playing) return;
