@@ -11,7 +11,10 @@ try:
 except Exception:
     from ultralytics import YOLO as _MODEL
 
-DEFAULT_MODEL_PATH = os.getenv("YOLOE_MODEL_PATH", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
+DEFAULT_MODEL_PATH = os.getenv(
+    "YOLOE_MODEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yoloe-11l-seg.pt"),
+)
 TRACKER_CFG        = os.getenv("YOLO_TRACKER_YAML", "bytetrack.yaml")
 
 class YoloEBackend:

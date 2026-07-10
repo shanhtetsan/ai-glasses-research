@@ -57,7 +57,7 @@ async def stream_chat(
                 parts.append(img)
 
     response = client.models.generate_content_stream(
-        model="gemini-2.5-flash",
+        model=os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash"),
         contents=parts,
     )
 

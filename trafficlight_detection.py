@@ -18,7 +18,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ========= Configuration parameters =========
-YOLO_MODEL_PATH = r"C:\Users\Administrator\Desktop\rebuild1002\model\trafficlight.pt"
+# Override with env var TRAFFIC_LIGHT_MODEL; default is ./model/ relative to this file.
+YOLO_MODEL_PATH = os.getenv(
+    "TRAFFIC_LIGHT_MODEL",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "trafficlight.pt"),
+)
 
 # ========= Display parameters =========
 CONF_THRESHOLD = 0.25  # Confidence threshold
@@ -518,6 +522,9 @@ def process_single_frame(image: np.ndarray, ui_broadcast_callback=None) -> dict:
     detected_light = None
     max_conf = 0.0
     class_names = _model.names if hasattr(_model, 'names') else {}
+
+    _n_boxes = len(results[0].boxes) if (results and results[0].boxes is not None) else 0
+    print(f"[TRAFFIC-DIAG] frame processed, raw boxes={_n_boxes}, thresh={CONF_THRESHOLD}", flush=True)
 
     if results and len(results) > 0:
         r = results[0]

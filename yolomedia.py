@@ -91,9 +91,10 @@ except Exception as e:
     _YOLOE_READY = False
     print(f"[DETECTOR] YOLOE backend not ready: {e}", flush=True)
 
-# ========= Path parameters (update as needed) =========
-YOLO_MODEL_PATH = r'C:\Users\Administrator\Desktop\rebuild1002\model\shoppingbest5.pt'
-HAND_TASK_PATH  = r"C:\Users\Administrator\Desktop\rebuild1002\model\hand_landmarker.task"
+# ========= Path parameters (env-overridable, default to ./model/) =========
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+YOLO_MODEL_PATH = os.getenv("SHOPPING_MODEL", os.path.join(_MODEL_DIR, "shoppingbest5.pt"))
+HAND_TASK_PATH  = os.getenv("HAND_LANDMARKER", os.path.join(_MODEL_DIR, "hand_landmarker.task"))
 
 # ========= Camera =========
 CAM_INDEX = 0

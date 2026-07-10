@@ -163,6 +163,16 @@
   }
   .settings-panel.open{display:block}
   .settings-panel h3{margin:0 0 12px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .dev-controls{padding:12px 14px;border-top:1px solid var(--line);background:#0c121a}
+  .dev-controls h3{margin:0 0 10px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .dev-controls h3 small{margin-left:8px;font-size:10px;color:#5b6b7a;text-transform:none;letter-spacing:0;font-weight:400}
+  .dev-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .dev-label{flex:1;font-size:12px;color:#c8d3de}
+  .dev-controls button{font-size:12px;padding:4px 12px;border-radius:6px;cursor:pointer;border:1px solid var(--line)}
+  .dev-start{background:#123a24;color:#7ee0a0}
+  .dev-stop{background:#3a1a1a;color:#e08a8a}
+  .dev-controls button:disabled{opacity:.5;cursor:default}
+  .dev-status{font-size:11px;color:#5b6b7a}
   .setting-row{
     display:flex; align-items:center; justify-content:space-between; gap:10px;
     padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06);
@@ -222,6 +232,7 @@
       <div class="controls">
         <button class="ghost" id="btnClear">Clear Final</button>
         <button id="btnReconnect">Reconnect</button>
+        <button id="btnRestart" title="Restart the Python server">Restart Server</button>
         <button class="settings-toggle" id="btnSettings" title="Settings">&#9881;</button>
       </div>
     </div>
@@ -244,6 +255,36 @@
         <div class="setting-label">Target FPS<small>Frame rate limit (0 = unlimited)</small></div>
         <input type="range" class="setting-range" id="set_cam_fps" min="0" max="60" value="0">
         <span class="setting-val" id="val_cam_fps">0</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Auto Exposure<small>Camera adapts to lighting</small></div>
+        <label style="cursor:pointer"><input type="checkbox" id="set_cam_ae_auto" checked> On</label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Manual Exposure<small>Ignored when Auto is on (0=dark, 1200=bright)</small></div>
+        <input type="range" class="setting-range" id="set_cam_aec" min="0" max="1200" step="10" value="40">
+        <span class="setting-val" id="val_cam_aec">40</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Gain Ceiling<small>Max auto-gain in dark scenes (higher = brighter + noisier)</small></div>
+        <select class="setting-input" id="set_cam_gainceil" style="width:100px">
+          <option value="0">2X</option>
+          <option value="1">4X</option>
+          <option value="2">8X</option>
+          <option value="3">16X</option>
+          <option value="4" selected>32X</option>
+          <option value="5">64X</option>
+          <option value="6">128X</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Night Mode (AEC2)<small>Longer exposure in low light (may blur motion)</small></div>
+        <label style="cursor:pointer"><input type="checkbox" id="set_cam_aec2" checked> On</label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">AE Brightness Bias<small>Auto-exposure target (-2 dark .. +2 bright)</small></div>
+        <input type="range" class="setting-range" id="set_cam_ae_level" min="-2" max="2" step="1" value="2">
+        <span class="setting-val" id="val_cam_ae_level">2</span>
       </div>
       <div class="settings-actions">
         <span id="camSettingsStatus"></span>
@@ -276,6 +317,26 @@
         <button class="ghost" id="btnResetSettings">Reset</button>
         <button id="btnApplySettings">Apply</button>
       </div>
+    </div>
+    <div class="dev-controls" id="devControls">
+      <h3>Dev Controls <small>click instead of speaking</small></h3>
+      <div class="dev-row"><span class="dev-label">Object Detection</span>
+        <button class="dev-start" onclick="sendCmd('detect objects', this)">Start</button>
+        <button class="dev-stop"  onclick="sendCmd('stop detecting objects', this)">Stop</button>
+      </div>
+      <div class="dev-row"><span class="dev-label">Blind-Path Nav</span>
+        <button class="dev-start" onclick="sendCmd('start navigation', this)">Start</button>
+        <button class="dev-stop"  onclick="sendCmd('stop navigation', this)">Stop</button>
+      </div>
+      <div class="dev-row"><span class="dev-label">Cross Street</span>
+        <button class="dev-start" onclick="sendCmd('start crossing', this)">Start</button>
+        <button class="dev-stop"  onclick="sendCmd('stop crossing', this)">Stop</button>
+      </div>
+      <div class="dev-row"><span class="dev-label">Traffic Light</span>
+        <button class="dev-start" onclick="sendCmd('detect traffic light', this)">Start</button>
+        <button class="dev-stop"  onclick="sendCmd('stop traffic light', this)">Stop</button>
+      </div>
+      <span id="devStatus" class="dev-status"></span>
     </div>
     <div class="chat-list">
       <div class="live">
@@ -320,6 +381,26 @@
 <!-- main script -->
 <script type="module" src="/static/main.js"></script>
 
+<!-- dev command buttons: POST a phrase to /api/command (same path as voice) -->
+<script>
+window.sendCmd = async function(text, btn){
+  const status = document.getElementById('devStatus');
+  if (btn) btn.disabled = true;
+  if (status) status.textContent = '→ ' + text;
+  try {
+    const r = await fetch('/api/command', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    if (status) status.textContent = r.ok ? ('✓ ' + text) : ('✗ ' + text);
+  } catch(e) {
+    if (status) status.textContent = '✗ ' + text + ' (' + e + ')';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+};
+</script>
+
 <!-- settings panel logic -->
 <script>
 (function(){
@@ -332,6 +413,24 @@
 
   btn.addEventListener('click', ()=> panel.classList.toggle('open'));
 
+  // Restart the Python server, then poll /api/health until it's back and reload.
+  const btnRestart = document.getElementById('btnRestart');
+  if (btnRestart) btnRestart.addEventListener('click', async ()=>{
+    if (!confirm('Restart the server? Models will reload — this takes ~10-30s.')) return;
+    btnRestart.disabled = true;
+    const original = btnRestart.textContent;
+    btnRestart.textContent = 'Restarting…';
+    try { await fetch('/api/restart', {method:'POST'}); } catch(e) {}
+    const t0 = Date.now();
+    const poll = setInterval(async ()=>{
+      try {
+        const r = await fetch('/api/health', {cache:'no-store'});
+        if (r.ok) { clearInterval(poll); location.reload(); return; }
+      } catch(e) {}
+      if (Date.now() - t0 > 90000) { clearInterval(poll); btnRestart.disabled = false; btnRestart.textContent = original; alert('Server did not come back within 90s.'); }
+    }, 1500);
+  });
+
   // server setting sliders
   fields.forEach(f=>{
     const slider = document.getElementById('set_'+f);
@@ -340,11 +439,18 @@
   });
 
   // camera setting sliders
-  ['cam_quality','cam_fps'].forEach(f=>{
+  ['cam_quality','cam_fps','cam_aec','cam_ae_level'].forEach(f=>{
     const slider = document.getElementById('set_'+f);
     const val = document.getElementById('val_'+f);
     slider.addEventListener('input', ()=> val.textContent = slider.value);
   });
+
+  // gray out manual exposure slider when auto is on
+  const aeAuto = document.getElementById('set_cam_ae_auto');
+  const aecSlider = document.getElementById('set_cam_aec');
+  function updateAeState(){ aecSlider.disabled = aeAuto.checked; aecSlider.style.opacity = aeAuto.checked ? 0.4 : 1; }
+  aeAuto.addEventListener('change', updateAeState);
+  updateAeState();
 
   function loadSettings(){
     fetch('/api/settings').then(r=>r.json()).then(data=>{
@@ -386,7 +492,12 @@
     const body = {
       framesize: document.getElementById('set_cam_framesize').value,
       quality: parseInt(document.getElementById('set_cam_quality').value),
-      fps: parseInt(document.getElementById('set_cam_fps').value)
+      fps: parseInt(document.getElementById('set_cam_fps').value),
+      exposure_auto: document.getElementById('set_cam_ae_auto').checked,
+      exposure_value: parseInt(document.getElementById('set_cam_aec').value),
+      gain_ceiling: parseInt(document.getElementById('set_cam_gainceil').value),
+      aec2: document.getElementById('set_cam_aec2').checked,
+      ae_level: parseInt(document.getElementById('set_cam_ae_level').value)
     };
     fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(r=>{

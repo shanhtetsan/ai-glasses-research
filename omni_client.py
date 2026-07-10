@@ -161,30 +161,46 @@ def _build_qwen_messages(
 #         yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
 
 async def stream_chat(
-    content_list,
-    voice="Aoede",
-    audio_format="wav",
-):
+    content_list: List[Dict[str, Any]],
+    voice: str = "Aoede",       # retained for interface compat — unused (TTS via 'say')
+    audio_format: str = "wav",  # same
+) -> AsyncGenerator[OmniStreamPiece, None]:
+    """
+    Local Qwen2.5-Omni-3B text-only inference.
 
-    image = None
-    prompt = ""
+    generation_mode="text" skips the talker/token2wav path entirely, so only text
+    is produced (audio is handled separately by _say_to_pcm8k in app_main.py).
+    Yields exactly one OmniStreamPiece(text_delta=<response>, audio_b64=None),
+    matching the interface the rest of the pipeline expects.
+    """
+    messages, pil_images = _build_qwen_messages(content_list)
 
-    for item in content_list:
+    text_prompt = _processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    proc_inputs = _processor(
+        text=text_prompt,
+        images=pil_images if pil_images else None,
+        padding=True,
+        return_tensors="pt",
+    ).to("mps")
 
-        if item["type"] == "image_url":
+    prompt_len = proc_inputs.input_ids.shape[1]
+    max_new = int(os.getenv("QWEN_MAX_NEW_TOKENS", "128"))
+    loop = asyncio.get_event_loop()
 
-            image = _decode_data_url(
-                item["image_url"]["url"]
+    def _generate() -> str:
+        with torch.no_grad():
+            output_ids = _model.generate(
+                **proc_inputs,
+                thinker_max_new_tokens=max_new,
+                return_audio=False,   # text only — skips talker + token2wav entirely
             )
+        new_ids = output_ids[0][prompt_len:]
+        return _processor.decode(new_ids, skip_special_tokens=True).strip()
 
-        elif item["type"] == "text":
+    # Run the blocking generate() off the event loop so we don't stall asyncio.
+    response_text = await loop.run_in_executor(None, _generate)
 
-            prompt += item["text"]
-
-    parts = []
-
-    if image:
-
-        parts.append(image)
-
-    parts.append(prompt)
+    if response_text:
+        yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
