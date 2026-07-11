@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "ianleeiphone1";
+const char* WIFI_SSID   = "IanLeeiPhone";
 const char* WIFI_PASS   = "ianleeiphone1";
-const char* SERVER_HOST = "100.92.102.123";
+const char* SERVER_HOST = "172.20.10.9";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -49,7 +49,7 @@ const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Push-to-Talk Button =====
-#define PTT_BUTTON_PIN -1   // *** TODO: set GPIO later ***
+#define PTT_BUTTON_PIN D6   // *** TODO: set GPIO later ***
 volatile bool ptt_active = false;
 volatile bool stop_pending = false;  // *** whether audio processing is complete or not ***
 // *** stop_pending is true --> esp did not send "STOP" to server yet ***
@@ -65,7 +65,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "100.92.102.123";
+const char* UDP_HOST  = "172.20.10.9";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -280,7 +280,13 @@ void init_i2s_in(){
   Serial.println("[I2S IN] PDM RX @16kHz 16bit MONO ready");
 }
 
+void init_button() {
+    pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
+    Serial.println("[BUTTON] ready");
+}
+
 void taskButton(void*) {
+  Serial.println("Button task started");
   bool last = false;
   for (;;) {
     if (PTT_BUTTON_PIN < 0) {
@@ -293,10 +299,12 @@ void taskButton(void*) {
       last = pressed;
       ptt_active = pressed;
       if (ptt_active) {
-        Serial.println("[PTT] START");
+        Serial.print("[PTT] START");
+        Serial.println(ptt_active);
         wsAud.send("START");
       } else {
-        Serial.println("[PTT] STOP");
+        Serial.print("[PTT] STOP");
+        Serial.println(ptt_active);
         stop_pending = true; // *** BUTTON IS RELEASED, PROCESSING AUDIO IS NOT DONE YET ***
       }
     }
@@ -305,10 +313,12 @@ void taskButton(void*) {
 }
 
 void taskMicCapture(void*){
+  Serial.println("Mic Capture Task Started");
   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
   for(;;){
     // if (run_audio_stream && aud_ws_ready) {  *** button must be pressed to capture audio thru mic ***
     if (ptt_active && aud_ws_ready) {
+      Serial.println("MIC CAPTURING...");
       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
       int16_t* out = reinterpret_cast<int16_t*>(ch.data);
       int i = 0;
@@ -323,6 +333,7 @@ void taskMicCapture(void*){
         xQueueSend(qAudio, &ch, 0);
       }
     } else {
+      Serial.println("MIC NOT CAPTURING...");
       vTaskDelay(pdMS_TO_TICKS(5));
     }
   }
@@ -919,6 +930,7 @@ void setup() {
   udp.begin(0);
 
   init_i2s_in();
+  init_button();
   init_i2s_out();
 
   qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
@@ -931,7 +943,7 @@ void setup() {
   xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskButton,     "button",    2048, NULL, 1, NULL, 1); // *** added button task ***
+  xTaskCreatePinnedToCore(taskButton,     "button",    4096, NULL, 1, NULL, 1); // *** added button task ***
 
   wsCam.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
