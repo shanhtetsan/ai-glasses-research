@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PRST";
-const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.168.2.3";
+const char* WIFI_SSID   = "Verizon_3FVRM7";
+const char* WIFI_PASS   = "excess6-fed-map";
+const char* SERVER_HOST = "192.168.1.38";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -58,8 +58,8 @@ const int TTS_RATE = 16000;
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
-#define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.2.3";
+#define IMU_I2C_SCL   6   // D5=
+const char* UDP_HOST  = "192.168.1.38";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -274,6 +274,8 @@ void init_i2s_in(){
 
 void taskMicCapture(void*){
   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
+  unsigned long last_log = 0;
+  unsigned long chunks_captured = 0;
   for(;;){
     if (run_audio_stream && aud_ws_ready) {
       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
@@ -284,6 +286,7 @@ void taskMicCapture(void*){
         if (v == -1) { delay(1); continue; }
         out[i++] = (int16_t)v;
       }
+      chunks_captured++;
       if (xQueueSend(qAudio, &ch, 0) != pdPASS){
         AudioChunk dump;
         xQueueReceive(qAudio, &dump, 0);
@@ -291,6 +294,19 @@ void taskMicCapture(void*){
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // Was: Serial.println("MIC CAPTURING"/"MIC NOT CAPTURING") on every
+    // iteration — up to 200x/sec while idle, 50x/sec while streaming.
+    // Serial.print holds a mutex shared across cores/tasks on ESP32-Arduino,
+    // so that much traffic can starve other tasks (including loop(), which
+    // handles wsAud reconnects) — log a summary every 5s instead.
+    unsigned long now = millis();
+    if (now - last_log > 5000) {
+      Serial.printf("[MIC-CAP] streaming=%d, chunks_captured=%lu\n",
+                    (run_audio_stream && aud_ws_ready) ? 1 : 0, chunks_captured);
+      last_log = now;
+      chunks_captured = 0;
     }
   }
 }
@@ -300,7 +316,19 @@ void taskMicUpload(void*){
     if (run_audio_stream && aud_ws_ready){
       AudioChunk ch;
       if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
-        wsAud.sendBinary((const char*)ch.data, ch.n);
+        bool ok = wsAud.sendBinary((const char*)ch.data, ch.n);
+        if (!ok) {
+          // Was previously unchecked — a failed send here just silently
+          // dropped audio with no signal to reconnect, unlike taskCamSend.
+          // Close explicitly so loop() sees !wsAud.available() and
+          // reconnects deliberately instead of the stale-socket flapping
+          // (a new connection opening before the old one's close is
+          // noticed server-side, seen as back-to-back CONNECTED logs with
+          // no DISCONNECTED in between on the server).
+          Serial.println("[MIC-UPL] ERROR: WebSocket send failed, closing...");
+          wsAud.close();
+          aud_ws_ready = false;
+        }
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
