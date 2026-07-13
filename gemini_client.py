@@ -56,18 +56,36 @@ async def stream_chat(
             if img is not None:
                 parts.append(img)
 
-    response = client.models.generate_content_stream(
-        model="gemini-2.5-flash",
-        contents=parts,
-    )
+    # client.models.generate_content_stream(...) and iterating its response
+    # are both blocking/synchronous under the hood — running them directly
+    # inside this async function would stall the whole event loop (other
+    # websockets, camera frames, etc.) for the duration of generation. Run
+    # it in a worker thread instead and relay chunks back through a queue,
+    # so this stays non-blocking and still streams incrementally.
+    loop = asyncio.get_running_loop()
+    queue: "asyncio.Queue" = asyncio.Queue()
+    _DONE = object()
 
-    for chunk in response:
-
-        if chunk.text:
-
-            yield OmniStreamPiece(
-                text_delta=chunk.text,
-                audio_b64=None,
+    def _run_stream():
+        try:
+            response = client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=parts,
             )
+            for chunk in response:
+                if chunk.text:
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, e)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _DONE)
 
-        await asyncio.sleep(0)
+    loop.run_in_executor(None, _run_stream)
+
+    while True:
+        item = await queue.get()
+        if item is _DONE:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield OmniStreamPiece(text_delta=item, audio_b64=None)
