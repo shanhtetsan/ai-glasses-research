@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, tempfile, wave
+import os, sys, time, json, asyncio, base64, audioop
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -37,7 +37,7 @@ try:
 except Exception:
     yolomedia = None
 DEBUG     = False  # set True to enable verbose navigation/recorder/YOLO logs
-DEBUG_VAD = False   # set False once VAD_SILENCE_RMS is tuned for your mic
+DEBUG_VAD = False   # set True temporarily if you need to see per-chunk RMS values again
 
 # ---- Windows event loop policy ----
 if sys.platform.startswith("win"):
@@ -54,7 +54,29 @@ except Exception:
     pass
 
 import os
-print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
+_gk = os.getenv("GEMINI_API_KEY") or ""
+print("Gemini Key =", (_gk[:6] + "..." + _gk[-4:]) if len(_gk) > 12 else "(not set)")
+
+# ---- Active AI backend selection (for comparing regular Gemini / Gemini Live / Qwen) ----
+# Set via env var, e.g.:  AI_BACKEND=gemini_regular python app_main.py
+# "gemini_live"    — Gemini Live handles ASR + conversation + spoken reply end-to-end.
+# "gemini_regular" — Gemini Live is used only for real-time ASR (TEXT response
+#                     mode, no spoken reply from it); the transcribed text is
+#                     sent to gemini_client.stream_chat (gemini-2.5-flash) and
+#                     the reply is spoken via local TTS.
+# "qwen"           — same as gemini_regular, but the transcribed text goes to
+#                     omni_client.stream_chat (local Qwen2.5-Omni-3B) instead.
+_VALID_BACKENDS = ("gemini_live", "gemini_regular", "qwen")
+AI_BACKEND = os.getenv("AI_BACKEND", "gemini_live").strip().lower()
+if AI_BACKEND not in _VALID_BACKENDS:
+    print(f"[BACKEND] WARNING: unknown AI_BACKEND={AI_BACKEND!r}, falling back to 'gemini_live'")
+    AI_BACKEND = "gemini_live"
+
+print("=" * 60)
+print(f"  ACTIVE AI BACKEND: {AI_BACKEND}")
+print("=" * 60)
+
+
 
 # ---- [DASHSCOPE FALLBACK] Remote ASR — commented out, kept for reference ----
 # from dashscope import audio as dash_audio
@@ -68,17 +90,29 @@ print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
 # SILENCE_20MS = bytes(BYTES_CHUNK)
 # ---------------------------------------------------------------------------
 
-# ---- Local Whisper ASR (replaces DashScope) ----
-# ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
+# ---- ASR ----
+# AI_BACKEND == "gemini_live": ASR is handled server-side by Gemini Live
+# (input_audio_transcription) — raw mic PCM16 is forwarded straight to
+# GeminiLiveClient.send_audio(), no local model needed.
+# AI_BACKEND == "gemini_regular" / "qwen": these are text-only backends with
+# no ASR of their own (gemini-3.1-flash-live-preview only supports AUDIO
+# response modality, so it can't be reused as a TEXT-only ASR engine either —
+# confirmed by testing, not just docs). So for these two, local Whisper is
+# back exactly as it worked before the Live migration: buffer PCM16 with a
+# simple RMS VAD, transcribe on silence, dispatch the text.
 SAMPLE_RATE = 16000
-import whisper as _whisper_lib
-print("[...] Loading Whisper model...")
-_whisper_model = _whisper_lib.load_model("base")
-print("[OK] Whisper model ready")
+_whisper_model = None
+if AI_BACKEND != "gemini_live":
+    import whisper as _whisper_lib
+    print("[...] Loading Whisper model...")
+    _whisper_model = _whisper_lib.load_model("base")
+    print("[OK] Whisper model ready")
 
-# ---- Server-side Voice Activity Detection (VAD) tuning ----
-# The ESP32 streams PCM16 continuously; these constants control when the
-# server decides the user has finished speaking and fires Whisper.
+# ---- Voice Activity Detection (VAD) tuning ----
+# Used by ws_audio's RMS-based VAD loop for the gemini_regular/qwen backends
+# (see above). Has no effect on AI_BACKEND == "gemini_live", which streams
+# raw audio continuously and lets Gemini Live's own server-side VAD decide
+# turn boundaries.
 #
 # VAD_SILENCE_RMS   — RMS amplitude (int16 scale, 0–32767) of a 20 ms chunk
 #                     that is treated as "silent".
@@ -112,9 +146,19 @@ from audio_stream import (
     hard_reset_audio,              # master switch for audio + AI playback
     BYTES_PER_20MS_16K,
     is_playing_now,
-    current_ai_task,
 )
-from gemini_client import stream_chat, OmniStreamPiece
+from gemini_live_client import GeminiLiveClient
+gemini_live = GeminiLiveClient()
+
+# Only import whichever text-generation backend was actually selected —
+# importing omni_client.py loads the full Qwen2.5-Omni-3B model into memory,
+# so we don't want that happening unless AI_BACKEND=qwen was explicitly asked for.
+_backend_stream_chat = None
+if AI_BACKEND == "gemini_regular":
+    from gemini_client import stream_chat as _backend_stream_chat
+elif AI_BACKEND == "qwen":
+    from omni_client import stream_chat as _backend_stream_chat
+
 from asr_core import (
     ASRCallback,
     set_current_recognition,
@@ -133,6 +177,238 @@ def _has_hotword(text: str) -> bool:
         if w and _normalize_cn(w) in t:
             return True
     return False
+
+# ---- Gemini Live callback wiring ----
+# Rolling per-turn buffers for the transcripts Gemini streams back to us.
+_input_text_buf: List[str] = []   # what the user said this turn (from input_audio_transcription)
+_output_text_buf: List[str] = []  # what Gemini said this turn (from output_audio_transcription)
+_esp32_tts_started: bool = False  # whether we've sent TTS:START to the ESP32 for the current turn
+_TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware side
+
+# Persistent audioop.ratecv state, kept across _on_audio calls within a turn
+# so consecutive chunks resample smoothly instead of clicking at boundaries.
+# Reset whenever a new response turn starts (on turn_complete/interrupted).
+_ratecv_state_8k = None
+_ratecv_state_16k = None
+
+async def _on_audio(pcm24k: bytes):
+    """Gemini Live streams 24kHz PCM16 audio deltas.
+
+    Two different downstream consumers need two different sample rates:
+      - the ESP32 TTS websocket expects 8kHz (matches its i2s DAC / the old
+        macOS-TTS output rate)
+      - broadcast_pcm16_realtime / the browser's /stream.wav expects 16kHz
+        (see its import comment and BYTES_PER_20MS_16K)
+    Resampling once to 8kHz and reusing that buffer for both was the bug
+    that made browser audio inaudible/garbled — each consumer now gets its
+    own correctly-rated stream.
+    """
+    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+
+    try:
+        pcm8k, _ratecv_state_8k = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, _ratecv_state_8k)
+        pcm16k, _ratecv_state_16k = audioop.ratecv(pcm24k, 2, 1, 24000, 16000, _ratecv_state_16k)
+    except Exception as e:
+        print(f"[Gemini Live] audio resample failed: {e}", flush=True)
+        return
+
+    if pcm8k:
+        _ws = esp32_audio_ws
+        if _ws and _ws.client_state == WebSocketState.CONNECTED:
+            try:
+                if not _esp32_tts_started:
+                    await _ws.send_text("TTS:START")
+                    _esp32_tts_started = True
+                for i in range(0, len(pcm8k), _TTS_CHUNK):
+                    await _ws.send_bytes(pcm8k[i:i + _TTS_CHUNK])
+            except Exception as e:
+                print(f"[TTS-WS] send failed: {e}", flush=True)
+
+    if pcm16k:
+        # Browser /stream.wav — this is the one that was getting the wrong
+        # sample rate before.
+        await broadcast_pcm16_realtime(pcm16k)
+
+async def _on_input_transcription(text: str):
+    """User speech transcript, streamed incrementally by Gemini Live."""
+    if not text:
+        return
+    _input_text_buf.append(text)
+    try:
+        # Tagged so the UI can tell this apart from the AI's partial text —
+        # see the note in _on_turn_complete about why this also needs a
+        # ui_broadcast_final once the turn ends.
+        await ui_broadcast_partial("(user) " + "".join(_input_text_buf))
+    except Exception:
+        pass
+    combined = "".join(_input_text_buf)
+    if _has_hotword(combined):
+        async with interrupt_lock:
+            print(f"[HOTWORD] '{combined}' -> full reset", flush=True)
+            await full_system_reset("Hotword interrupt")
+
+async def _on_output_transcription(text: str):
+    """Gemini's spoken-response transcript, streamed incrementally."""
+    if not text:
+        return
+    _output_text_buf.append(text)
+    try:
+        await ui_broadcast_partial("[AI] " + "".join(_output_text_buf))
+    except Exception:
+        pass
+
+async def _on_turn_complete():
+    """Fires once Gemini has finished a full spoken response.
+
+    Only relevant for AI_BACKEND == "gemini_live" — gemini_regular/qwen
+    don't connect to Gemini Live at all (they use local Whisper ASR instead,
+    see ws_audio / _run_whisper_and_dispatch), so this callback never fires
+    for those backends.
+
+    NOTE: there's no pre-Gemini gate on the live audio stream — Gemini hears
+    and may respond to everything the user says, including navigation/command
+    phrases like "开始导航". This handler still runs the command dispatcher
+    afterwards so the app's own state (navigation mode, item search, etc.)
+    stays correct, but the user will already have heard Gemini's spoken
+    reply to that utterance by the time it fires. If that's not acceptable,
+    consider gating `streaming` in ws_audio so mic audio isn't forwarded to
+    Gemini at all while in a restrictive navigation state.
+    """
+    global _esp32_tts_started, omni_conversation_active, omni_previous_nav_state
+    global _ratecv_state_8k, _ratecv_state_16k
+
+    _ws = esp32_audio_ws
+    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
+        try:
+            await _ws.send_text("TTS:END")
+        except Exception:
+            pass
+    _esp32_tts_started = False
+    # New turn next time — don't carry resample state across turn boundaries
+    _ratecv_state_8k = None
+    _ratecv_state_16k = None
+
+    # Broadcast the user's transcript as a FINAL message first, so it's
+    # actually visible/persisted in the UI (previously it only ever went out
+    # as a partial, which the AI's own partial immediately overwrote — it
+    # never showed up because it was never sent as a final).
+    user_text = "".join(_input_text_buf).strip()
+    _input_text_buf.clear()
+    if user_text:
+        try:
+            await ui_broadcast_final("(user) " + user_text)
+        except Exception:
+            pass
+
+    # Signal "finished" to any /stream.wav listeners
+    await _signal_stream_finished()
+
+    final_ai_text = "".join(_output_text_buf).strip() or "(empty response)"
+    print(f"[AI] {final_ai_text}", flush=True)
+    try:
+        await ui_broadcast_final("[AI] " + final_ai_text)
+    except Exception:
+        pass
+    _output_text_buf.clear()
+
+    if user_text:
+        async with interrupt_lock:
+            await try_dispatch_command(user_text)
+
+    omni_conversation_active = False
+    if orchestrator and omni_previous_nav_state:
+        orchestrator.force_state(omni_previous_nav_state)
+        if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+        omni_previous_nav_state = None
+
+async def _on_interrupted():
+    """User barged in and cut off Gemini's current response."""
+    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+    print("[Gemini Live] Response interrupted by user", flush=True)
+    _esp32_tts_started = False
+    _ratecv_state_8k = None
+    _ratecv_state_16k = None
+    await hard_reset_audio("gemini_interrupted")
+
+gemini_live.on_audio = _on_audio
+gemini_live.on_input_transcription = _on_input_transcription
+gemini_live.on_output_transcription = _on_output_transcription
+gemini_live.on_turn_complete = _on_turn_complete
+gemini_live.on_interrupted = _on_interrupted
+
+# ---- Helper for the non-live backends (gemini_regular / qwen) ----
+# These backends are text-only for this comparison — no TTS, no audio out.
+# Only AI_BACKEND == "gemini_live" touches audio at all; ASR for the other
+# two still runs through Gemini Live (in TEXT response mode, see
+# startup_gemini) purely so transcription stays consistent across all three
+# tests, but their replies are text-in/text-out to the UI only.
+
+async def _signal_stream_finished():
+    """Tell any /stream.wav listeners the current (gemini_live) audio
+    response is over. Only used by the gemini_live path — the text-only
+    backends never open an audio stream in the first place."""
+    from audio_stream import stream_clients  # local import to avoid circular dependency
+    for sc in list(stream_clients):
+        if not sc.abort_event.is_set():
+            try: sc.q.put_nowait(b"\x00" * BYTES_PER_20MS_16K)  # one frame of silence
+            except Exception: pass
+            try: sc.q.put_nowait(None)
+            except Exception: pass
+
+async def run_backend_turn(user_text: str):
+    """Generate a text reply using the selected non-live backend and
+    broadcast it to the UI. No audio synthesis — gemini_regular/qwen are
+    being compared as text backends here, with Gemini Live handling the
+    full audio pipeline separately when AI_BACKEND == "gemini_live"."""
+    global omni_conversation_active, omni_previous_nav_state
+
+    if _backend_stream_chat is None:
+        print(f"[BACKEND] No stream_chat available for AI_BACKEND={AI_BACKEND!r}", flush=True)
+        return
+
+    content_list = []
+    if last_frames:
+        try:
+            _, jpeg_bytes = last_frames[-1]
+            img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+            })
+        except Exception:
+            pass
+    content_list.append({"type": "text", "text": user_text})
+
+    txt_buf: List[str] = []
+    try:
+        async for piece in _backend_stream_chat(content_list, voice="Cherry", audio_format="wav"):
+            if piece.text_delta:
+                txt_buf.append(piece.text_delta)
+                try:
+                    await ui_broadcast_partial("[AI] " + "".join(txt_buf))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[BACKEND:{AI_BACKEND}] generation failed: {e}", flush=True)
+        try:
+            await ui_broadcast_final(f"[AI] Error occurred: {e}")
+        except Exception:
+            pass
+        txt_buf = []
+
+    final_text = "".join(txt_buf).strip()
+    if final_text:
+        print(f"[AI] {final_text}", flush=True)
+        try:
+            await ui_broadcast_final("[AI] " + final_text)
+        except Exception:
+            pass
+
+    omni_conversation_active = False
+    if orchestrator and omni_previous_nav_state:
+        orchestrator.force_state(omni_previous_nav_state)
+        if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+        omni_previous_nav_state = None
 
 # ---- Synchronous recorder ----
 import sync_recorder
@@ -173,6 +449,14 @@ orchestrator = None
 # Omni conversation state flags
 omni_conversation_active = False  # marks whether an omni conversation is in progress
 omni_previous_nav_state = None  # saves the navigation state before omni was activated, for restoration
+
+# True exactly while the ESP32 mic is streaming audio to Gemini Live (set in
+# ws_audio on START/STOP). Camera frames are only forwarded to Gemini while
+# this is True — mirrors Google's own guidance to send video only during
+# audio activity. Deliberately NOT gated on omni_conversation_active, since
+# that flag is only updated post-hoc (after Gemini has already responded)
+# and would always be stale by the time a frame needs to go out.
+mic_streaming = False
 
 # Model loading function
 def load_navigation_models():
@@ -419,8 +703,18 @@ def stop_yolomedia():
         if DEBUG: print("[YOLOMEDIA] Worker stopped.", flush=True)
 
 # ========= Custom start_ai_with_text, with special command recognition =========
-async def start_ai_with_text_custom(user_text: str):
-    """Extended AI launch function with special command recognition."""
+async def try_dispatch_command(user_text: str) -> bool:
+    """Check user_text for special nav/system commands and run their side effects.
+
+    Returns True if the text was handled as a command (or explicitly
+    discarded) and should NOT also be treated as ordinary conversation;
+    False if it's plain conversational text with no special meaning.
+
+    (Renamed from start_ai_with_text_custom — it no longer decides whether
+    to call the AI itself, since Gemini Live already streams a response to
+    everything heard on the mic. Callers use the return value to decide
+    whether to additionally forward text to Gemini, e.g. for typed prompts.)
+    """
     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
     
     # In navigation or traffic-light detection mode, only specific words trigger omni dialogue
@@ -442,7 +736,7 @@ async def start_ai_with_text_custom(user_text: str):
                 if DEBUG:
                     mode_name = "Traffic light detection" if current_state == "TRAFFIC_LIGHT_DETECTION" else "Navigation"
                     print(f"[{mode_name} mode] Discarding non-dialogue audio: {user_text}")
-                return  # discard; do not enter omni
+                return True  # discard; do not enter omni
     
     # Check for street-crossing commands — use orchestrator to control
     if "开始过马路" in user_text or "帮我过马路" in user_text:
@@ -461,7 +755,7 @@ async def start_ai_with_text_custom(user_text: str):
             print("[CROSS_STREET] Warning: navigation master not initialized!")
             play_voice_text("Failed to start crossing mode, please try again later.")
             await ui_broadcast_final("[System] Navigation system not ready")
-        return
+        return True
     
     if "过马路结束" in user_text or "结束过马路" in user_text:
         if orchestrator:
@@ -472,7 +766,7 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Street-crossing mode stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
-        return
+        return True
     
     # Check for traffic-light detection command — mutually exclusive with blind-path navigation
     if "检测红绿灯" in user_text or "看红绿灯" in user_text:
@@ -495,7 +789,7 @@ async def start_ai_with_text_custom(user_text: str):
         except Exception as e:
             print(f"[TRAFFIC] Failed to start traffic-light detection: {e}")
             await ui_broadcast_final(f"[System] Start failed: {e}")
-        return
+        return True
     
     if "停止检测" in user_text or "停止红绿灯" in user_text:
         try:
@@ -508,7 +802,7 @@ async def start_ai_with_text_custom(user_text: str):
         except Exception as e:
             print(f"[TRAFFIC] Failed to stop traffic-light detection: {e}")
             await ui_broadcast_final(f"[System] Stop failed: {e}")
-        return
+        return True
     
     # Check for navigation commands — use orchestrator to control
     if "开始导航" in user_text or "盲道导航" in user_text or "帮我导航" in user_text:
@@ -524,7 +818,7 @@ async def start_ai_with_text_custom(user_text: str):
         else:
             print("[NAVIGATION] Warning: navigation master not initialized!")
             await ui_broadcast_final("[System] Navigation system not ready")
-        return
+        return True
     
     if "停止导航" in user_text or "结束导航" in user_text:
         if orchestrator:
@@ -533,7 +827,7 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Blind-path navigation stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
-        return
+        return True
 
     nav_cmd_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", "立即通过", "现在通过", "继续"]
     if any(k in user_text for k in nav_cmd_keywords):
@@ -542,7 +836,7 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Navigation mode updated")
         else:
             await ui_broadcast_final("[System] Navigation master not initialized")
-        return    
+        return True
 
     # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command
     # Extended regex to support more keywords
@@ -571,7 +865,7 @@ async def start_ai_with_text_custom(user_text: str):
             except Exception:
                 pass
 
-            return
+            return True
     
     # Check for "found it" (找到了) command
     if "找到了" in user_text or "拿到了" in user_text:
@@ -593,7 +887,7 @@ async def start_ai_with_text_custom(user_text: str):
         else:
             await ui_broadcast_final("[Item Search] Item found.")
         
-        return
+        return True
     
     # When omni dialogue starts, switch to CHAT mode
     global omni_conversation_active, omni_previous_nav_state
@@ -611,169 +905,45 @@ async def start_ai_with_text_custom(user_text: str):
             omni_previous_nav_state = None
             if DEBUG: print(f"[OMNI] Dialogue started (already in {current_state} mode)")
     
-    # If not a special command, run the original AI dialogue logic
-    # But if yolomedia is running, skip normal AI dialogue for now
+    # Not a special command. If yolomedia is running, skip normal AI dialogue for now.
     if yolomedia_running:
         if DEBUG: print("[AI] YOLO media is running, skipping normal AI response", flush=True)
-        return
-    
-    # Original AI dialogue logic
-    await start_ai_with_text(user_text)
+        return True
 
-# ========= TTS: macOS 'say' → 8 kHz PCM16 =========
-async def _say_to_pcm8k(text: str) -> bytes:
-    """
-    Use macOS built-in TTS ('say') to produce 8 kHz PCM16 suitable for
-    broadcast_pcm16_realtime / the ESP32 8 kHz downlink.
+    # Plain conversation — not handled here; caller decides what to do with it
+    # (the live mic-audio path just uses this for its side effects since
+    # Gemini already replied; the typed-PROMPT path forwards it to Gemini).
+    return False
 
-    Steps:
-      1. say   → AIFF  (native macOS TTS, any sample rate)
-      2. afconvert → 16-bit PCM WAV  (keeps original sample rate)
-      3. audioop.ratecv → downsample to 8 kHz in Python
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        aiff_path = os.path.join(tmpdir, "out.aiff")
-        wav_path  = os.path.join(tmpdir, "out.wav")
-
-        p1 = await asyncio.create_subprocess_exec(
-            "say", "-o", aiff_path, "--", text,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await p1.wait()
-
-        p2 = await asyncio.create_subprocess_exec(
-            "afconvert", aiff_path, wav_path, "-f", "WAVE", "-d", "LEI16",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await p2.wait()
-
-        with wave.open(wav_path, "rb") as w:
-            ch  = w.getnchannels()
-            sw  = w.getsampwidth()
-            fr  = w.getframerate()
-            pcm = w.readframes(w.getnframes())
-
-        if ch == 2:
-            pcm = audioop.tomono(pcm, sw, 1, 0)
-        if fr != 8000:
-            pcm, _ = audioop.ratecv(pcm, sw, 1, fr, 8000, None)
-        return pcm
-
-
-# ========= Omni playback launch =========
+# ========= Typed-prompt entry point =========
+# gemini_live is the only backend that touches audio at all — it produces
+# its own spoken reply via _on_audio. gemini_regular/qwen are text-only for
+# this comparison (see run_backend_turn above): no TTS, reply goes to the UI only.
 async def start_ai_with_text(user_text: str):
-    """Start new AI voice output after a hard reset."""
-    async def _runner():
-        txt_buf: List[str] = []
-        rate_state = None
+    """Route typed text to whichever backend is currently selected.
 
-        # Assemble (image + text) content
-        content_list = []
-        if last_frames:
-            try:
-                _, jpeg_bytes = last_frames[-1]
-                img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-                content_list.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                })
-            except Exception:
-                pass
-        content_list.append({"type": "text", "text": user_text})
-
+    Used for the /ws_audio 'PROMPT:' text path (device-initiated prompts
+    that bypass audio ASR entirely). Ordinary mic audio doesn't go through
+    this function — for AI_BACKEND=="gemini_live" it's streamed straight to
+    gemini_live.send_audio() from ws_audio and the reply arrives via the
+    Live callbacks; for the other backends, ws_audio streams mic audio into
+    a TEXT-mode Live session used purely for ASR, and _on_turn_complete
+    hands the transcribed text to run_backend_turn() the same way this
+    function does for typed prompts.
+    """
+    await hard_reset_audio("start_ai_with_text")
+    if AI_BACKEND == "gemini_live":
+        _output_text_buf.clear()
         try:
-            async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
-                # Text delta — update UI as text arrives
-                if piece.text_delta:
-                    txt_buf.append(piece.text_delta)
-                    try:
-                        await ui_broadcast_partial("[AI] " + "".join(txt_buf))
-                    except Exception:
-                        pass
-                # piece.audio_b64 is always None from the local model;
-                # audio is produced below via macOS 'say' after the full text is ready.
-                #
-                # [DASHSCOPE FALLBACK] streaming audio path:
-                # if piece.audio_b64:
-                #     pcm24 = base64.b64decode(piece.audio_b64)
-                #     pcm8k, rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, rate_state)
-                #     pcm8k = audioop.mul(pcm8k, 2, 0.60)
-                #     if pcm8k:
-                #         await broadcast_pcm16_realtime(pcm8k)
-
-            # TTS: feed the complete AI response through the 8 kHz downlink
-            full_text = "".join(txt_buf).strip()
-            if full_text:
-                try:
-                    pcm8k = await _say_to_pcm8k(full_text)
-                    if pcm8k:
-                        # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
-                        # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
-                        _ws = esp32_audio_ws
-                        if _ws and _ws.client_state == WebSocketState.CONNECTED:
-                            try:
-                                await _ws.send_text("TTS:START")
-                                _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
-                                for _i in range(0, len(pcm8k), _CHUNK):
-                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
-                                await _ws.send_text("TTS:END")
-                                print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
-                            except Exception as _ws_err:
-                                print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
-                        else:
-                            print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
-                        # Also broadcast via /stream.wav so browser clients can hear it
-                        await broadcast_pcm16_realtime(pcm8k)
-                except Exception as tts_err:
-                    print(f"[TTS] say failed: {tts_err}", flush=True)
-
-        except asyncio.CancelledError:
-            # Interrupted by a new round
-            raise
+            await gemini_live.send_text(user_text)
         except Exception as e:
+            print(f"[Gemini Live] send_text failed: {e}", flush=True)
             try:
                 await ui_broadcast_final(f"[AI] Error occurred: {e}")
             except Exception:
                 pass
-        finally:
-            # Mark omni dialogue as ended and restore the previous navigation mode
-            global omni_conversation_active, omni_previous_nav_state
-            omni_conversation_active = False
-            
-            # Restore the previous navigation state
-            if orchestrator and omni_previous_nav_state:
-                orchestrator.force_state(omni_previous_nav_state)
-                if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
-                omni_previous_nav_state = None
-            else:
-                if DEBUG: print(f"[OMNI] Dialogue ended (no navigation state to restore)")
-            
-            # On natural completion, send a "finish" signal to the current connection
-            from audio_stream import stream_clients  # local import to avoid circular dependency
-            for sc in list(stream_clients):
-                if not sc.abort_event.is_set():
-                    try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # one frame of silence
-                    except Exception: pass
-                    try: sc.q.put_nowait(None)
-                    except Exception: pass
-
-            final_text = ("".join(txt_buf)).strip() or "(empty response)"
-            print(f"[AI] {final_text}", flush=True)
-            try:
-                await ui_broadcast_final("[AI] " + final_text)
-            except Exception:
-                pass
-
-    # Hard-reset before actually starting to guarantee absolutely no leftover audio
-    await hard_reset_audio("start_ai_with_text")
-    loop = asyncio.get_running_loop()
-    from audio_stream import current_ai_task as _task_holder  # read/write module-level global
-    from audio_stream import __dict__ as _as_dict
-    # Set the module-level current_ai_task
-    task = loop.create_task(_runner())
-    _as_dict["current_ai_task"] = task
+    else:
+        await run_backend_turn(user_text)
 
 # ---------- Page / Health ----------
 @app.get("/", response_class=HTMLResponse)
@@ -784,6 +954,10 @@ def root():
 @app.get("/api/health", response_class=PlainTextResponse)
 def health():
     return "OK"
+
+@app.get("/api/backend")
+def get_backend():
+    return JSONResponse({"backend": AI_BACKEND})
 
 class SettingsPayload(BaseModel):
     jpeg_quality: Optional[int] = None
@@ -858,7 +1032,7 @@ async def ws_ui(ws: WebSocket):
     await ws.accept()
     ui_clients[id(ws)] = ws
     try:
-        init = {"partial": current_partial, "finals": recent_finals[-10:]}
+        init = {"partial": current_partial, "finals": recent_finals[-10:], "backend": AI_BACKEND}
         await ws.send_text("INIT:" + json.dumps(init, ensure_ascii=False))
         while True:
             await asyncio.sleep(60)
@@ -867,17 +1041,16 @@ async def ws_ui(ws: WebSocket):
     finally:
         ui_clients.pop(id(ws), None)
 
-# ---------- Shared Whisper transcription + dispatch helper ----------
+# ---------- Whisper + RMS-VAD dispatch (gemini_regular / qwen only) ----------
+# This is the same local-ASR flow the app used before the Live migration —
+# buffer PCM16, transcribe on detected silence, dispatch the text. Only used
+# when AI_BACKEND != "gemini_live" (see the ASR section near the top of this
+# file for why: gemini-3.1-flash-live-preview can't be reused as a TEXT-only
+# ASR engine, so these two backends need their own ASR again).
 async def _run_whisper_and_dispatch(buf: bytes) -> None:
-    """Convert a raw PCM16 buffer → Whisper → UI + AI dispatch.
-
-    Called by both the manual STOP handler and the VAD auto-trigger so the
-    logic lives in exactly one place.
-    """
-    if not buf:
+    if not buf or _whisper_model is None:
         return
     try:
-        # PCM16 int16 → float32 normalised to [-1, 1] at 16 kHz
         samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
         loop    = asyncio.get_running_loop()
         result  = await loop.run_in_executor(
@@ -888,48 +1061,44 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
         print(f"[WHISPER] {text}", flush=True)
 
         if text:
-            await ui_broadcast_final(text)
+            await ui_broadcast_final("(user) " + text)
 
             if _has_hotword(text):
                 async with interrupt_lock:
-                    print(f"[HOTWORD] '{text}' → full reset", flush=True)
+                    print(f"[HOTWORD] '{text}' -> full reset", flush=True)
                     await full_system_reset("Hotword interrupt")
             elif not is_playing_now():
                 async with interrupt_lock:
-                    await start_ai_with_text_custom(text)
+                    handled = await try_dispatch_command(text)
+                    if not handled:
+                        await run_backend_turn(text)
     except Exception as e:
         print(f"[WHISPER] transcribe error: {e}", flush=True)
 
-
 # ---------- WebSocket: ESP32 audio entry (ASR uplink) ----------
 #
-# Changes vs original:
-#   - DashScope dash_audio.asr.Recognition, keepalive_loop, ASRCallback all removed.
-#   - New flow: START → buffer PCM16, audio frames → extend buffer,
-#     STOP → transcribe with Whisper, hotword check, then call start_ai_with_text_custom.
-#
-# [DASHSCOPE FALLBACK] The original recognition-based flow was:
-#   cb = ASRCallback(on_sdk_error=…, post=…, ui_broadcast_partial=…, …)
-#   recognition = dash_audio.asr.Recognition(api_key=API_KEY, model=MODEL,
-#       format=AUDIO_FMT, sample_rate=SAMPLE_RATE, callback=cb)
-#   recognition.start(); await set_current_recognition(recognition)
-#   # On each audio frame: recognition.send_audio_frame(msg["bytes"])
-#   # keepalive_loop fed silence when idle > 350 ms
-#   # On STOP: recognition.send_audio_frame(SILENCE_20MS) x15, then recognition.stop()
+# Branches by AI_BACKEND:
+#   gemini_live               -> audio frames forwarded straight to
+#                                 gemini_live.send_audio() in real time;
+#                                 Gemini's own server-side VAD/turn-detection
+#                                 and the _on_input_transcription / _on_audio /
+#                                 _on_turn_complete callbacks handle the rest.
+#   gemini_regular / qwen     -> local Whisper + RMS VAD (same as pre-Live),
+#                                 buffering PCM16 and transcribing on silence.
 #
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
+    global esp32_audio_ws, mic_streaming
     esp32_audio_ws = ws
     await ws.accept()
     print("[CONNECTED] Mic (ESP32 audio)")
 
     streaming: bool = False
+    # VAD state — only used when AI_BACKEND != "gemini_live"
     pcm_buffer: Optional[bytearray] = None
-    # VAD state (reset on every START / STOP / auto-trigger)
-    vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
-    vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
-    vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
+    vad_silent_chunks: int = 0
+    vad_speech_chunks: int = 0
+    vad_speech_detected: bool = False
 
     try:
         while True:
@@ -949,94 +1118,110 @@ async def ws_audio(ws: WebSocket):
                 cmd = raw.upper()
 
                 if cmd == "START":
-                    print("[MIC] Listening — waiting for speech...")
-                    streaming            = True
-                    pcm_buffer           = bytearray()
-                    vad_silent_chunks    = 0
-                    vad_speech_chunks    = 0
-                    vad_speech_detected  = False
+                    streaming = True
+                    if AI_BACKEND == "gemini_live":
+                        print("[MIC] Streaming to Gemini Live...")
+                        mic_streaming = True
+                    else:
+                        print("[MIC] Listening — waiting for speech...")
+                        pcm_buffer          = bytearray()
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
                     await ui_broadcast_partial("（Recording…）")
                     await ws.send_text("OK:STARTED")
 
                 elif cmd == "STOP":
-                    # Manual STOP from firmware (fallback; firmware currently never sends this)
-                    print("[MIC] Transcribing...")
-                    streaming            = False
-                    buf                  = bytes(pcm_buffer) if pcm_buffer else b""
-                    pcm_buffer           = None
-                    vad_silent_chunks    = 0
-                    vad_speech_chunks    = 0
-                    vad_speech_detected  = False
-                    await ws.send_text("OK:STOPPED")
-                    await _run_whisper_and_dispatch(buf)
+                    streaming = False
+                    if AI_BACKEND == "gemini_live":
+                        print("[MIC] Stopped streaming")
+                        mic_streaming = False
+                        await ws.send_text("OK:STOPPED")
+                    else:
+                        print("[MIC] Transcribing...")
+                        buf = bytes(pcm_buffer) if pcm_buffer else b""
+                        pcm_buffer          = None
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
+                        await ws.send_text("OK:STOPPED")
+                        await _run_whisper_and_dispatch(buf)
 
                 elif raw.startswith("PROMPT:"):
                     # Device-initiated prompt (bypasses ASR entirely)
                     text = raw[len("PROMPT:"):].strip()
                     if text:
                         async with interrupt_lock:
-                            await start_ai_with_text_custom(text)
+                            handled = await try_dispatch_command(text)
+                            if not handled:
+                                await start_ai_with_text(text)
                         await ws.send_text("OK:PROMPT_ACCEPTED")
                     else:
                         await ws.send_text("ERR:EMPTY_PROMPT")
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
-                if streaming and pcm_buffer is not None:
-                    pcm_buffer.extend(chunk)
+                if not streaming:
+                    continue
 
-                    # ---- VAD: classify this 20ms chunk ----
-                    n = len(chunk)
-                    if n >= 2:
-                        s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
-                        s -= s.mean()   # strip DC offset from PDM mic before measuring energy
-                        rms = float(np.sqrt(np.mean(s ** 2)))
+                if AI_BACKEND == "gemini_live":
+                    try:
+                        await gemini_live.send_audio(chunk)
+                    except Exception as e:
+                        print(f"[Gemini Live] send_audio failed: {e}", flush=True)
+                    continue
+
+                # ---- gemini_regular / qwen: RMS VAD over the PCM buffer ----
+                if pcm_buffer is None:
+                    continue
+                pcm_buffer.extend(chunk)
+
+                n = len(chunk)
+                if n >= 2:
+                    s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
+                    s -= s.mean()  # strip DC offset from PDM mic before measuring energy
+                    rms = float(np.sqrt(np.mean(s ** 2)))
+                else:
+                    rms = 0.0
+
+                if DEBUG_VAD:
+                    label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
+                    print(
+                        f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
+                        f"  -> {label}"
+                        f"  speech_chunks={vad_speech_chunks}"
+                        f"  silent_chunks={vad_silent_chunks}"
+                        f"  detected={vad_speech_detected}",
+                        flush=True,
+                    )
+
+                if rms >= VAD_SILENCE_RMS:
+                    vad_silent_chunks  = 0
+                    vad_speech_chunks += 1
+                    if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                        vad_speech_detected = True
+                        print("[MIC] Speech detected", flush=True)
+                else:
+                    if vad_speech_detected:
+                        vad_silent_chunks += 1
+                        if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
+                            print("[MIC] Transcribing...", flush=True)
+                            buf = bytes(pcm_buffer)
+                            pcm_buffer          = bytearray()
+                            vad_silent_chunks   = 0
+                            vad_speech_chunks   = 0
+                            vad_speech_detected = False
+                            await ui_broadcast_partial("（Processing…）")
+                            await _run_whisper_and_dispatch(buf)
                     else:
-                        rms = 0.0
-
-                    # [VAD DEBUG] Log every chunk so we can read the real noise floor.
-                    # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
-                    if DEBUG_VAD:
-                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
-                        print(
-                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
-                            f"  → {label}"
-                            f"  speech_chunks={vad_speech_chunks}"
-                            f"  silent_chunks={vad_silent_chunks}"
-                            f"  detected={vad_speech_detected}",
-                            flush=True,
-                        )
-
-                    if rms >= VAD_SILENCE_RMS:
-                        # Voiced chunk
-                        vad_silent_chunks  = 0
-                        vad_speech_chunks += 1
-                        if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
-                            vad_speech_detected = True
-                            print("[MIC] Speech detected", flush=True)
-                    else:
-                        # Silent chunk — only counts after speech has begun
-                        if vad_speech_detected:
-                            vad_silent_chunks += 1
-                            if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
-                                print("[MIC] Transcribing...", flush=True)
-                                buf         = bytes(pcm_buffer)
-                                # Reset buffer + VAD state; keep streaming=True for next utterance
-                                pcm_buffer           = bytearray()
-                                vad_silent_chunks    = 0
-                                vad_speech_chunks    = 0
-                                vad_speech_detected  = False
-                                await ui_broadcast_partial("（Processing…）")
-                                await _run_whisper_and_dispatch(buf)
-                        else:
-                            # Pre-speech silence: don't let scattered noise accumulate
-                            vad_speech_chunks = 0
+                        vad_speech_chunks = 0
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
     finally:
-        streaming  = False
+        streaming = False
         pcm_buffer = None
+        mic_streaming = False
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
@@ -1045,6 +1230,37 @@ async def ws_audio(ws: WebSocket):
         if esp32_audio_ws is ws:
             esp32_audio_ws = None
         print("[DISCONNECTED] Mic (ESP32 audio)")
+
+# ---------- Non-blocking cv2 helpers ----------
+# cv2.imdecode/imencode are synchronous, CPU-bound calls. Running them
+# directly inside an async def (as the camera handler did before) blocks
+# the whole event loop for their duration — including the coroutines that
+# keep the Gemini Live websocket's keepalive pings answered and audio
+# chunks flowing. Route them through a thread pool instead so a slow frame
+# doesn't stall unrelated async work.
+async def _cv2_imdecode_async(data: bytes) -> Optional["np.ndarray"]:
+    loop = asyncio.get_running_loop()
+    def _decode():
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None or bgr.size == 0:
+                return None
+            return bgr
+        except Exception:
+            return None
+    return await loop.run_in_executor(None, _decode)
+
+async def _cv2_imencode_async(img, quality: int):
+    """Returns (ok, jpeg_bytes_or_None)."""
+    loop = asyncio.get_running_loop()
+    def _encode():
+        try:
+            ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            return (ok, enc.tobytes() if ok else None)
+        except Exception:
+            return (False, None)
+    return await loop.run_in_executor(None, _encode)
 
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
@@ -1100,23 +1316,30 @@ async def ws_camera_esp(ws: WebSocket):
                     last_frames.append((time.time(), data))
                 except Exception:
                     pass
-                
+
+                # Give Gemini Live visual context while the mic is actively
+                # streaming (Google's own guidance: send video frames during
+                # audio activity). NOTE: this used to gate on
+                # omni_conversation_active, but that flag is only ever set
+                # True post-hoc inside _on_turn_complete/try_dispatch_command
+                # — by the time it flips True, the turn it was meant for is
+                # already over, so no frame ever actually went out. Gating on
+                # mic_streaming (set live in ws_audio on START/STOP) fixes that.
+                # Throttled to ~2 fps since Live API input doesn't need full
+                # camera framerate and this avoids saturating the session.
+                if mic_streaming and frame_counter % 15 == 0:
+                    try:
+                        await gemini_live.send_image(data)
+                    except Exception as e:
+                        print(f"[Gemini Live] send_image failed: {e}", flush=True)
+
                 # Push to bridge_io (for use by yolomedia)
                 bridge_io.push_raw_jpeg(data)
                 
-                # Unified decoding (with stricter exception handling)
-                try:
-                    arr = np.frombuffer(data, dtype=np.uint8)
-                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    # Validate the decode result
-                    if bgr is None or bgr.size == 0:
-                        if frame_counter % 30 == 0:
-                            print(f"[JPEG] Decode failed: data length={len(data)}")
-                        bgr = None
-                except Exception as e:
-                    if frame_counter % 30 == 0:
-                        print(f"[JPEG] Decode exception: {e}")
-                    bgr = None
+                # Unified decoding (off the event loop — see _cv2_imdecode_async)
+                bgr = await _cv2_imdecode_async(data)
+                if bgr is None and frame_counter % 30 == 0:
+                    print(f"[JPEG] Decode failed: data length={len(data)}")
 
                 # Hand off to the master state machine first (when item-search is not occupying the frame)
                 # In item-search mode, skip navigation processing and let yolomedia take over the frame
@@ -1127,9 +1350,8 @@ async def ws_camera_esp(ws: WebSocket):
                     if current_state == "ITEM_SEARCH":
                         # In item-search mode, if yolomedia has not yet started sending frames, show the raw frame
                         if not yolomedia_sending_frames and camera_viewers:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
                             if ok:
-                                jpeg_data = enc.tobytes()
                                 dead = []
                                 for viewer_ws in list(camera_viewers):
                                     try:
@@ -1170,9 +1392,8 @@ async def ws_camera_esp(ws: WebSocket):
 
                     # Broadcast the image
                     if camera_viewers and out_img is not None:
-                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                        ok, jpeg_data = await _cv2_imencode_async(out_img, JPEG_QUALITY)
                         if ok:
-                            jpeg_data = enc.tobytes()
                             dead = []
                             for viewer_ws in list(camera_viewers):
                                 try:
@@ -1188,12 +1409,10 @@ async def ws_camera_esp(ws: WebSocket):
                 if not yolomedia_sending_frames and camera_viewers:
                     try:
                         if bgr is None:
-                            arr = np.frombuffer(data, dtype=np.uint8)
-                            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            bgr = await _cv2_imdecode_async(data)
                         if bgr is not None:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
                             if ok:
-                                jpeg_data = enc.tobytes()
                                 dead = []
                                 for viewer_ws in list(camera_viewers):
                                     try:
@@ -1437,7 +1656,12 @@ class UDPProto(asyncio.DatagramProtocol):
         except Exception:
             pass
 
-
+@app.on_event("startup")
+async def startup_gemini():
+    if AI_BACKEND == "gemini_live":
+        await gemini_live.connect(response_modality="AUDIO")
+    # gemini_regular/qwen don't touch Gemini Live at all — they use local
+    # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
 
 # === New: register a send callback for bridge_io (broadcast JPEG to /ws/viewer) ===
 @app.on_event("startup")
@@ -1511,6 +1735,7 @@ async def on_shutdown():
 
     # Stop audio and AI tasks
     await hard_reset_audio("shutdown")
+    await gemini_live.disconnect()
     
     print("[SHUTDOWN] Resource cleanup complete")
 
