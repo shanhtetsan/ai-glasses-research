@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, tempfile, wave
+import os, sys, time, json, asyncio, base64, audioop, tempfile, wave, functools
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -31,6 +31,7 @@ import torch
 import mediapipe as mp
 import bridge_io
 import threading
+import faulthandler
 # import yolomedia  # must be in the same directory as app_main.py, filename is yolomedia.py
 
 try:
@@ -55,7 +56,30 @@ except Exception:
     pass
 
 import os
-print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
+_gk = os.getenv("GEMINI_API_KEY") or ""
+print("Gemini Key =", (_gk[:6] + "..." + _gk[-4:]) if len(_gk) > 12 else "(not set)")
+
+
+# ---- Active AI backend selection (for comparing regular Gemini / Gemini Live / Qwen) ----
+# Set via env var, e.g.:  AI_BACKEND=gemini_regular python app_main.py
+# "gemini_live"    — Gemini Live handles ASR + conversation + spoken reply end-to-end.
+# "gemini_regular" — Gemini Live is used only for real-time ASR (TEXT response
+#                     mode, no spoken reply from it); the transcribed text is
+#                     sent to gemini_client.stream_chat (gemini-2.5-flash) and
+#                     the reply is spoken via local TTS.
+# "qwen"           — same as gemini_regular, but the transcribed text goes to
+#                     omni_client.stream_chat (local Qwen2.5-Omni-3B) instead.
+_VALID_BACKENDS = ("gemini_live", "gemini_regular", "qwen")
+AI_BACKEND = os.getenv("AI_BACKEND", "gemini_live").strip().lower()
+if AI_BACKEND not in _VALID_BACKENDS:
+    print(f"[BACKEND] WARNING: unknown AI_BACKEND={AI_BACKEND!r}, falling back to 'gemini_live'")
+    AI_BACKEND = "gemini_live"
+
+print("=" * 60)
+print(f"  ACTIVE AI BACKEND: {AI_BACKEND}")
+print("=" * 60)
+
+
 
 # ---- [DASHSCOPE FALLBACK] Remote ASR — commented out, kept for reference ----
 # from dashscope import audio as dash_audio
@@ -72,12 +96,22 @@ print("Gemini Key =", os.getenv("GEMINI_API_KEY"))
 # ---- Local Whisper ASR (replaces DashScope) ----
 # ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
 SAMPLE_RATE = 16000
-import whisper as _whisper_lib
-from asr_config import load_whisper_config
-_WHISPER_CFG = load_whisper_config()
-print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
-_whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
-print("[OK] Whisper model ready")
+
+# import whisper as _whisper_lib
+# from asr_config import load_whisper_config
+# _WHISPER_CFG = load_whisper_config()
+# print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
+# _whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
+# print("[OK] Whisper model ready")
+
+
+SAMPLE_RATE = 16000
+_whisper_model = None
+if AI_BACKEND != "gemini_live":
+    import whisper as _whisper_lib
+    print("[...] Loading Whisper model...")
+    _whisper_model = _whisper_lib.load_model("base")
+    print("[OK] Whisper model ready.")
 
 # ---- Server-side Voice Activity Detection (VAD) tuning ----
 # The ESP32 streams PCM16 continuously; these constants control when the
@@ -117,7 +151,17 @@ from audio_stream import (
     is_playing_now,
     current_ai_task,
 )
-from gemini_client import stream_chat, OmniStreamPiece
+from gemini_live_client import GeminiLiveClient
+
+gemini_live = GeminiLiveClient()
+
+_backend_stream_chat = None
+if AI_BACKEND == "gemini_regular":
+    from gemini_client import stream_chat as _backend_stream_chat
+elif AI_BACKEND == "qwen":
+    from omni_client import stream_chat as _backend_stream_chat
+
+
 from asr_core import (
     ASRCallback,
     set_current_recognition,
@@ -137,6 +181,240 @@ def _has_hotword(text: str) -> bool:
             return True
     return False
 
+# ---- Gemini Live callback wiring ----
+# Rolling per-turn buffers for the transcripts Gemini streams back to us.
+_input_text_buf: List[str] = []   # what the user said this turn (from input_audio_transcription)
+_output_text_buf: List[str] = []  # what Gemini said this turn (from output_audio_transcription)
+_esp32_tts_started: bool = False  # whether we've sent TTS:START to the ESP32 for the current turn
+_TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware side
+
+# Persistent audioop.ratecv state, kept across _on_audio calls within a turn
+# so consecutive chunks resample smoothly instead of clicking at boundaries.
+# Reset whenever a new response turn starts (on turn_complete/interrupted).
+_ratecv_state_8k = None
+_ratecv_state_16k = None
+
+async def _on_audio(pcm24k: bytes):
+    """Gemini Live streams 24kHz PCM16 audio deltas.
+
+    Two different downstream consumers need two different sample rates:
+      - the ESP32 TTS websocket expects 8kHz (matches its i2s DAC / the old
+        macOS-TTS output rate)
+      - broadcast_pcm16_realtime / the browser's /stream.wav expects 16kHz
+        (see its import comment and BYTES_PER_20MS_16K)
+    Resampling once to 8kHz and reusing that buffer for both was the bug
+    that made browser audio inaudible/garbled — each consumer now gets its
+    own correctly-rated stream.
+    """
+    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+
+    try:
+        pcm8k, _ratecv_state_8k = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, _ratecv_state_8k)
+        pcm16k, _ratecv_state_16k = audioop.ratecv(pcm24k, 2, 1, 24000, 16000, _ratecv_state_16k)
+    except Exception as e:
+        print(f"[Gemini Live] audio resample failed: {e}", flush=True)
+        return
+
+    if pcm8k:
+        _ws = esp32_audio_ws
+        if _ws and _ws.client_state == WebSocketState.CONNECTED:
+            try:
+                if not _esp32_tts_started:
+                    await _ws.send_text("TTS:START")
+                    _esp32_tts_started = True
+                for i in range(0, len(pcm8k), _TTS_CHUNK):
+                    await _ws.send_bytes(pcm8k[i:i + _TTS_CHUNK])
+            except Exception as e:
+                print(f"[TTS-WS] send failed: {e}", flush=True)
+
+    if pcm16k:
+        # Browser /stream.wav — this is the one that was getting the wrong
+        # sample rate before.
+        await broadcast_pcm16_realtime(pcm16k)
+
+async def _on_input_transcription(text: str):
+    """User speech transcript, streamed incrementally by Gemini Live."""
+    if not text:
+        return
+    _input_text_buf.append(text)
+    try:
+        # Tagged so the UI can tell this apart from the AI's partial text —
+        # see the note in _on_turn_complete about why this also needs a
+        # ui_broadcast_final once the turn ends.
+        await ui_broadcast_partial("(user) " + "".join(_input_text_buf))
+    except Exception:
+        pass
+    combined = "".join(_input_text_buf)
+    if _has_hotword(combined):
+        async with interrupt_lock:
+            print(f"[HOTWORD] '{combined}' -> full reset", flush=True)
+            await full_system_reset("Hotword interrupt")
+
+async def _on_output_transcription(text: str):
+    """Gemini's spoken-response transcript, streamed incrementally."""
+    if not text:
+        return
+    _output_text_buf.append(text)
+    try:
+        await ui_broadcast_partial("[AI] " + "".join(_output_text_buf))
+    except Exception:
+        pass
+
+async def _on_turn_complete():
+    """Fires once Gemini has finished a full spoken response.
+
+    Only relevant for AI_BACKEND == "gemini_live" — gemini_regular/qwen
+    don't connect to Gemini Live at all (they use local Whisper ASR instead,
+    see ws_audio / _run_whisper_and_dispatch), so this callback never fires
+    for those backends.
+
+    NOTE: there's no pre-Gemini gate on the live audio stream — Gemini hears
+    and may respond to everything the user says, including navigation/command
+    phrases like "开始导航". This handler still runs the command dispatcher
+    afterwards so the app's own state (navigation mode, item search, etc.)
+    stays correct, but the user will already have heard Gemini's spoken
+    reply to that utterance by the time it fires. If that's not acceptable,
+    consider gating `streaming` in ws_audio so mic audio isn't forwarded to
+    Gemini at all while in a restrictive navigation state.
+    """
+    global _esp32_tts_started, omni_conversation_active, omni_previous_nav_state
+    global _ratecv_state_8k, _ratecv_state_16k
+
+    _ws = esp32_audio_ws
+    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
+        try:
+            await _ws.send_text("TTS:END")
+        except Exception:
+            pass
+    _esp32_tts_started = False
+    # New turn next time — don't carry resample state across turn boundaries
+    _ratecv_state_8k = None
+    _ratecv_state_16k = None
+
+    # Broadcast the user's transcript as a FINAL message first, so it's
+    # actually visible/persisted in the UI (previously it only ever went out
+    # as a partial, which the AI's own partial immediately overwrote — it
+    # never showed up because it was never sent as a final).
+    user_text = "".join(_input_text_buf).strip()
+    _input_text_buf.clear()
+    if user_text:
+        try:
+            await ui_broadcast_final("(user) " + user_text)
+        except Exception:
+            pass
+
+    # Signal "finished" to any /stream.wav listeners
+    await _signal_stream_finished()
+
+    final_ai_text = "".join(_output_text_buf).strip() or "(empty response)"
+    print(f"[AI] {final_ai_text}", flush=True)
+    try:
+        await ui_broadcast_final("[AI] " + final_ai_text)
+    except Exception:
+        pass
+    _output_text_buf.clear()
+
+    if user_text:
+        async with interrupt_lock:
+            await try_dispatch_command(user_text)
+
+    omni_conversation_active = False
+    if orchestrator and omni_previous_nav_state:
+        orchestrator.force_state(omni_previous_nav_state)
+        if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+        omni_previous_nav_state = None
+
+async def _on_interrupted():
+    """User barged in and cut off Gemini's current response."""
+    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+    print("[Gemini Live] Response interrupted by user", flush=True)
+    _esp32_tts_started = False
+    _ratecv_state_8k = None
+    _ratecv_state_16k = None
+    await hard_reset_audio("gemini_interrupted")
+
+gemini_live.on_audio = _on_audio
+gemini_live.on_input_transcription = _on_input_transcription
+gemini_live.on_output_transcription = _on_output_transcription
+gemini_live.on_turn_complete = _on_turn_complete
+gemini_live.on_interrupted = _on_interrupted
+
+# ---- Helper for the non-live backends (gemini_regular / qwen) ----
+# These backends are text-only for this comparison — no TTS, no audio out.
+# Only AI_BACKEND == "gemini_live" touches audio at all; ASR for the other
+# two still runs through Gemini Live (in TEXT response mode, see
+# startup_gemini) purely so transcription stays consistent across all three
+# tests, but their replies are text-in/text-out to the UI only.
+
+async def _signal_stream_finished():
+    """Tell any /stream.wav listeners the current (gemini_live) audio
+    response is over. Only used by the gemini_live path — the text-only
+    backends never open an audio stream in the first place."""
+    from audio_stream import stream_clients  # local import to avoid circular dependency
+    for sc in list(stream_clients):
+        if not sc.abort_event.is_set():
+            try: sc.q.put_nowait(b"\x00" * BYTES_PER_20MS_16K)  # one frame of silence
+            except Exception: pass
+            try: sc.q.put_nowait(None)
+            except Exception: pass
+
+async def run_backend_turn(user_text: str):
+    """Generate a text reply using the selected non-live backend and
+    broadcast it to the UI. No audio synthesis — gemini_regular/qwen are
+    being compared as text backends here, with Gemini Live handling the
+    full audio pipeline separately when AI_BACKEND == "gemini_live"."""
+    global omni_conversation_active, omni_previous_nav_state
+
+    if _backend_stream_chat is None:
+        print(f"[BACKEND] No stream_chat available for AI_BACKEND={AI_BACKEND!r}", flush=True)
+        return
+
+    content_list = []
+    if last_frames:
+        try:
+            _, jpeg_bytes = last_frames[-1]
+            img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+            })
+        except Exception:
+            pass
+    content_list.append({"type": "text", "text": user_text})
+
+    txt_buf: List[str] = []
+    try:
+        async for piece in _backend_stream_chat(content_list, voice="Cherry", audio_format="wav"):
+            if piece.text_delta:
+                txt_buf.append(piece.text_delta)
+                try:
+                    await ui_broadcast_partial("[AI] " + "".join(txt_buf))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[BACKEND:{AI_BACKEND}] generation failed: {e}", flush=True)
+        try:
+            await ui_broadcast_final(f"[AI] Error occurred: {e}")
+        except Exception:
+            pass
+        txt_buf = []
+
+    final_text = "".join(txt_buf).strip()
+    if final_text:
+        print(f"[AI] {final_text}", flush=True)
+        try:
+            await ui_broadcast_final("[AI] " + final_text)
+        except Exception:
+            pass
+
+    omni_conversation_active = False
+    if orchestrator and omni_previous_nav_state:
+        orchestrator.force_state(omni_previous_nav_state)
+        if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+        omni_previous_nav_state = None
+
+
+
 # ---- Synchronous recorder ----
 import sync_recorder
 import signal
@@ -147,6 +425,43 @@ UDP_IP   = "0.0.0.0"
 UDP_PORT = 12345
 
 app = FastAPI()
+
+# ---------- Event-loop watchdog ----------
+# We have chased the multi-second event-loop stalls (ESP32 "send took 10011 ms",
+# websockets "1011 keepalive ping timeout") through four wrong theories now.
+# Stop guessing and measure.
+#
+# asyncio's own slow_callback_duration only reports *after* a callback finally
+# yields — useless for code that never yields, and blind to GIL contention from
+# a run_in_executor() worker thread. So this watchdog runs on a real OS thread
+# outside the loop: it keeps ticking even while the loop's thread is frozen in
+# synchronous code, and dumps EVERY thread's live stack the instant it notices
+# the loop stopped making progress. That names the exact file:line doing the
+# blocking, in whichever thread it is actually happening.
+_loop_heartbeat = time.monotonic()
+
+
+async def _loop_heartbeat_task():
+    """Runs on the event loop; refreshes the timestamp the watchdog watches."""
+    global _loop_heartbeat
+    while True:
+        _loop_heartbeat = time.monotonic()
+        await asyncio.sleep(0.05)
+
+
+def _loop_watchdog(threshold: float = 0.2, check_interval: float = 0.05):
+    """Runs on a plain OS thread. If the heartbeat goes stale, the loop is stuck."""
+    while True:
+        time.sleep(check_interval)
+        lag = time.monotonic() - _loop_heartbeat
+        if lag > threshold:
+            print(
+                f"\n[WATCHDOG] event loop blocked for {lag:.3f}s "
+                f"-- dumping all thread stacks:",
+                file=sys.stderr, flush=True,
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            time.sleep(1.0)  # don't re-dump on every check during one long stall
 
 # ====== State and containers ======
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -159,8 +474,14 @@ last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
 camera_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
+
+# Single in-flight slot for fire-and-forget gemini_live.send_image() tasks.
+# Keeps at most one image send outstanding so they can't pile up during a
+# Gemini reconnect and then all fire at once. See /ws/camera handler.
+_gemini_img_task: Optional[asyncio.Task] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+mic_streaming: bool = False
 
 # Global variables for blind-path navigation
 blind_path_navigator = None
@@ -261,7 +582,7 @@ load_navigation_models()
 if DEBUG: print(f"[NAVIGATION] Model loading complete - yolo_seg_model: {yolo_seg_model is not None}")
 
 # Start synchronous recording
-sync_recorder.start_recording()
+# sync_recorder.start_recording()
 
 # Register exit handler to ensure recordings are saved on Ctrl+C
 def cleanup_on_exit():
@@ -432,58 +753,286 @@ def stop_yolomedia():
         if DEBUG: print("[YOLOMEDIA] Worker stopped.", flush=True)
 
 # ========= Custom start_ai_with_text, with special command recognition =========
-async def start_ai_with_text_custom(user_text: str):
-    """Extended AI launch function with special command recognition."""
+# async def start_ai_with_text_custom(user_text: str):
+#     """Extended AI launch function with special command recognition."""
+#     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
+
+#     # Lower-case once so English phrase matching is case-insensitive. Lower-casing
+#     # Chinese characters is a no-op so the existing Chinese checks still work.
+#     user_text = user_text.lower()
+
+#     # ---- General object detection (prompt-free YOLOE, continuous stream) ----
+#     # Draws boxes + labels on the video only — no spoken audio, no text narration.
+#     # Checked before the orchestrator/navigation guards so it works in any mode.
+#     global general_detect_active
+#     if any(k in user_text for k in ["detect objects", "detect object",
+#                                     "list objects", "what objects",
+#                                     "检测物体", "识别物体"]):
+#         if yolomedia_running:
+#             stop_yolomedia()
+#         general_detect_active = True
+#         # Warm up the model in the background so the first frame isn't laggy.
+#         threading.Thread(target=general_detector.load, daemon=True).start()
+#         return
+#     if any(k in user_text for k in ["stop detecting objects", "stop object detection",
+#                                     "stop detecting", "stop objects",
+#                                     "停止检测物体", "停止识别物体"]):
+#         general_detect_active = False
+#         return
+
+#     # In navigation or traffic-light detection mode, only specific words trigger omni dialogue
+#     if orchestrator:
+#         current_state = orchestrator.get_state()
+#         # If in navigation or traffic-light detection mode (not CHAT mode)
+#         if current_state not in ["CHAT", "IDLE"]:
+#             # Check whether the utterance is an allowed dialogue trigger keyword
+#             allowed_keywords = [
+#                 # Chinese
+#                 "帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下",
+#                 # English
+#                 "what is this", "what is that", "what's this", "what's that",
+#                 "describe", "look at", "identify", "find",
+#             ]
+#             is_allowed_query = any(keyword in user_text for keyword in allowed_keywords)
+
+#             # Check whether the utterance is a navigation control command
+#             nav_control_keywords = [
+#                 # Chinese
+#                 "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
+#                 "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯",
+#                 # English
+#                 "start crossing", "stop crossing", "end crossing",
+#                 "start navigation", "stop navigation", "end navigation",
+#                 "detect traffic light", "check traffic light", "stop detection",
+#             ]
+#             is_nav_control = any(keyword in user_text for keyword in nav_control_keywords)
+            
+#             # If neither an allowed query nor a navigation control command, discard
+#             if not is_allowed_query and not is_nav_control:
+#                 if DEBUG:
+#                     mode_name = "Traffic light detection" if current_state == "TRAFFIC_LIGHT_DETECTION" else "Navigation"
+#                     print(f"[{mode_name} mode] Discarding non-dialogue audio: {user_text}")
+#                 return  # discard; do not enter omni
+    
+#     # Check for street-crossing commands — use orchestrator to control
+#     if any(k in user_text for k in ["开始过马路", "帮我过马路",
+#                                      "start crossing", "help me cross", "cross the street"]):
+#         # If currently searching for an item, stop first
+#         if yolomedia_running:
+#             stop_yolomedia()
+#             print("[ITEM_SEARCH] Switching from item-search mode to street-crossing")
+
+#         if orchestrator:
+#             orchestrator.start_crossing()
+#             if DEBUG: print(f"[CROSS_STREET] Street-crossing mode started, state: {orchestrator.get_state()}")
+#             # Play launch voice prompt and broadcast to UI
+#             play_voice_text("Street crossing mode activated.")
+#             await ui_broadcast_final("[System] Street-crossing mode started")
+#         else:
+#             print("[CROSS_STREET] Warning: navigation master not initialized!")
+#             play_voice_text("Failed to start crossing mode, please try again later.")
+#             await ui_broadcast_final("[System] Navigation system not ready")
+#         return
+    
+#     if any(k in user_text for k in ["过马路结束", "结束过马路",
+#                                      "stop crossing", "end crossing", "done crossing"]):
+#         if orchestrator:
+#             orchestrator.stop_navigation()
+#             if DEBUG: print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
+#             # Play stop voice prompt and broadcast to UI
+#             play_voice_text("Navigation stopped.")
+#             await ui_broadcast_final("[System] Street-crossing mode stopped")
+#         else:
+#             await ui_broadcast_final("[System] Navigation system not running")
+#         return
+    
+#     # Check for traffic-light detection command — mutually exclusive with blind-path navigation
+#     if any(k in user_text for k in ["检测红绿灯", "看红绿灯",
+#                                      "detect traffic light", "check traffic light",
+#                                      "what color is the light", "what light"]):
+#         try:
+#             import trafficlight_detection
+            
+#             # Switch orchestrator to traffic-light detection mode (pause blind-path navigation)
+#             if orchestrator:
+#                 orchestrator.start_traffic_light_detection()
+#                 if DEBUG: print(f"[TRAFFIC] Switched to traffic-light detection mode, state: {orchestrator.get_state()}")
+            
+#             # Use main-thread processing instead of a separate thread to avoid dropped frames
+#             success = trafficlight_detection.init_model()  # initialise model only; do not start a thread
+#             trafficlight_detection.reset_detection_state()  # reset state
+
+#             if success:
+#                 await ui_broadcast_final("[System] Traffic-light detection started")
+#             else:
+#                 await ui_broadcast_final("[System] Traffic-light model load failed")
+#         except Exception as e:
+#             print(f"[TRAFFIC] Failed to start traffic-light detection: {e}")
+#             await ui_broadcast_final(f"[System] Start failed: {e}")
+#         return
+    
+#     if any(k in user_text for k in ["停止检测", "停止红绿灯",
+#                                      "stop detection", "stop traffic light"]):
+#         try:
+#             # Restore to dialogue (CHAT) mode
+#             if orchestrator:
+#                 orchestrator.stop_navigation()  # return to CHAT mode
+#                 if DEBUG: print(f"[TRAFFIC] Traffic-light detection stopped, restored to {orchestrator.get_state()} mode")
+
+#             await ui_broadcast_final("[System] Traffic-light detection stopped")
+#         except Exception as e:
+#             print(f"[TRAFFIC] Failed to stop traffic-light detection: {e}")
+#             await ui_broadcast_final(f"[System] Stop failed: {e}")
+#         return
+    
+#     # Check for navigation commands — use orchestrator to control
+#     if any(k in user_text for k in ["开始导航", "盲道导航", "帮我导航",
+#                                      "start navigation", "help me navigate", "navigate me", "blind path"]):
+#         # If currently searching for an item, stop first
+#         if yolomedia_running:
+#             stop_yolomedia()
+#             print("[ITEM_SEARCH] Switching from item-search mode to blind-path navigation")
+
+#         if orchestrator:
+#             orchestrator.start_blind_path_navigation()
+#             if DEBUG: print(f"[NAVIGATION] Blind-path navigation started, state: {orchestrator.get_state()}")
+#             await ui_broadcast_final("[System] Blind-path navigation started")
+#         else:
+#             print("[NAVIGATION] Warning: navigation master not initialized!")
+#             await ui_broadcast_final("[System] Navigation system not ready")
+#         return
+    
+#     if any(k in user_text for k in ["停止导航", "结束导航",
+#                                      "stop navigation", "end navigation"]):
+#         if orchestrator:
+#             orchestrator.stop_navigation()
+#             if DEBUG: print(f"[NAVIGATION] Navigation stopped, state: {orchestrator.get_state()}")
+#             await ui_broadcast_final("[System] Blind-path navigation stopped")
+#         else:
+#             await ui_broadcast_final("[System] Navigation system not running")
+#         return
+
+#     nav_cmd_keywords = [
+#         # Chinese
+#         "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
+#         "立即通过", "现在通过", "继续",
+#         # English
+#         "start crossing", "stop crossing", "end crossing",
+#         "start navigation", "stop navigation", "end navigation",
+#         "pass now", "go now", "continue",
+#     ]
+#     if any(k in user_text for k in nav_cmd_keywords):
+#         if orchestrator:
+#             orchestrator.on_voice_command(user_text)
+#             await ui_broadcast_final("[System] Navigation mode updated")
+#         else:
+#             await ui_broadcast_final("[System] Navigation master not initialized")
+#         return    
+
+#     # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command.
+#     # Try Chinese pattern first, then English ("find <item>" / "look for <item>").
+#     find_pattern_cn = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
+#     find_pattern_en = r"\b(?:find|look\s+for)\s+(?:the\s+|a\s+|an\s+|my\s+)?(.+?)[\.\?\!]?\s*$"
+#     match = re.search(find_pattern_cn, user_text) or re.search(find_pattern_en, user_text)
+        
+#     if match:
+#         # Extract the Chinese item name
+#         item_cn = match.group(1).strip()
+#         if item_cn:
+#             # Use local mapping + Qwen to extract the English class label
+#             label_en, src = extract_english_label(item_cn)
+#             if DEBUG: print(f"[COMMAND] Finder request: '{item_cn}' -> '{label_en}' (src={src})", flush=True)
+
+#             # Switch to item-search mode (pause navigation)
+#             if orchestrator:
+#                 orchestrator.start_item_search()
+#                 if DEBUG: print(f"[ITEM_SEARCH] Switched to item-search mode, state: {orchestrator.get_state()}")
+            
+#             # Pass the English class label to yolomedia (it will auto-switch to YOLOE when the class is not found)
+#             start_yolomedia_with_target(label_en)
+
+#             # Send a confirmation feedback to the frontend / voice output
+#             try:
+#                 await ui_broadcast_final(f"[Item Search] Searching for {item_cn}...")
+#             except Exception:
+#                 pass
+
+#             return
+    
+#     # Check for "found it" (找到了) command
+#     if "找到了" in user_text or "拿到了" in user_text:
+#         if DEBUG: print("[COMMAND] Found command detected", flush=True)
+#         # Stop the yolomedia worker
+#         stop_yolomedia()
+
+#         # Stop item-search mode and restore the previous navigation state
+#         if orchestrator:
+#             orchestrator.stop_item_search(restore_nav=True)
+#             current_state = orchestrator.get_state()
+#             if DEBUG: print(f"[ITEM_SEARCH] Item search ended, current state: {current_state}")
+            
+#             # Give feedback based on the restored state
+#             if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
+#                 await ui_broadcast_final("[Item Search] Item found, resuming navigation.")
+#             else:
+#                 await ui_broadcast_final("[Item Search] Item found.")
+#         else:
+#             await ui_broadcast_final("[Item Search] Item found.")
+        
+#         return
+    
+#     # When omni dialogue starts, switch to CHAT mode
+#     global omni_conversation_active, omni_previous_nav_state
+#     omni_conversation_active = True
+    
+#     # Save the current navigation state and switch to CHAT mode
+#     if orchestrator:
+#         current_state = orchestrator.get_state()
+#         # Only save and switch when already in a navigation mode
+#         if current_state not in ["CHAT", "IDLE"]:
+#             omni_previous_nav_state = current_state
+#             orchestrator.force_state("CHAT")
+#             if DEBUG: print(f"[OMNI] Dialogue started, switching from {current_state} to CHAT mode")
+#         else:
+#             omni_previous_nav_state = None
+#             if DEBUG: print(f"[OMNI] Dialogue started (already in {current_state} mode)")
+    
+#     # If not a special command, run the original AI dialogue logic
+#     # But if yolomedia is running, skip normal AI dialogue for now
+#     if yolomedia_running:
+#         if DEBUG: print("[AI] YOLO media is running, skipping normal AI response", flush=True)
+#         return
+    
+#     # Original AI dialogue logic
+#     await start_ai_with_text(user_text)
+
+
+async def try_dispatch_command(user_text: str) -> bool:
+    """Check user_text for special nav/system commands and run their side effects.
+
+    Returns True if the text was handled as a command (or explicitly
+    discarded) and should NOT also be treated as ordinary conversation;
+    False if it's plain conversational text with no special meaning.
+
+    (Renamed from start_ai_with_text_custom — it no longer decides whether
+    to call the AI itself, since Gemini Live already streams a response to
+    everything heard on the mic. Callers use the return value to decide
+    whether to additionally forward text to Gemini, e.g. for typed prompts.)
+    """
     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
-
-    # Lower-case once so English phrase matching is case-insensitive. Lower-casing
-    # Chinese characters is a no-op so the existing Chinese checks still work.
-    user_text = user_text.lower()
-
-    # ---- General object detection (prompt-free YOLOE, continuous stream) ----
-    # Draws boxes + labels on the video only — no spoken audio, no text narration.
-    # Checked before the orchestrator/navigation guards so it works in any mode.
-    global general_detect_active
-    if any(k in user_text for k in ["detect objects", "detect object",
-                                    "list objects", "what objects",
-                                    "检测物体", "识别物体"]):
-        if yolomedia_running:
-            stop_yolomedia()
-        general_detect_active = True
-        # Warm up the model in the background so the first frame isn't laggy.
-        threading.Thread(target=general_detector.load, daemon=True).start()
-        return
-    if any(k in user_text for k in ["stop detecting objects", "stop object detection",
-                                    "stop detecting", "stop objects",
-                                    "停止检测物体", "停止识别物体"]):
-        general_detect_active = False
-        return
-
+    
     # In navigation or traffic-light detection mode, only specific words trigger omni dialogue
     if orchestrator:
         current_state = orchestrator.get_state()
         # If in navigation or traffic-light detection mode (not CHAT mode)
         if current_state not in ["CHAT", "IDLE"]:
             # Check whether the utterance is an allowed dialogue trigger keyword
-            allowed_keywords = [
-                # Chinese
-                "帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下",
-                # English
-                "what is this", "what is that", "what's this", "what's that",
-                "describe", "look at", "identify", "find",
-            ]
+            allowed_keywords = ["帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下"]
             is_allowed_query = any(keyword in user_text for keyword in allowed_keywords)
-
+            
             # Check whether the utterance is a navigation control command
-            nav_control_keywords = [
-                # Chinese
-                "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
-                "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯",
-                # English
-                "start crossing", "stop crossing", "end crossing",
-                "start navigation", "stop navigation", "end navigation",
-                "detect traffic light", "check traffic light", "stop detection",
-            ]
+            nav_control_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", 
+                                   "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯"]
             is_nav_control = any(keyword in user_text for keyword in nav_control_keywords)
             
             # If neither an allowed query nor a navigation control command, discard
@@ -491,11 +1040,10 @@ async def start_ai_with_text_custom(user_text: str):
                 if DEBUG:
                     mode_name = "Traffic light detection" if current_state == "TRAFFIC_LIGHT_DETECTION" else "Navigation"
                     print(f"[{mode_name} mode] Discarding non-dialogue audio: {user_text}")
-                return  # discard; do not enter omni
+                return True  # discard; do not enter omni
     
     # Check for street-crossing commands — use orchestrator to control
-    if any(k in user_text for k in ["开始过马路", "帮我过马路",
-                                     "start crossing", "help me cross", "cross the street"]):
+    if "开始过马路" in user_text or "帮我过马路" in user_text:
         # If currently searching for an item, stop first
         if yolomedia_running:
             stop_yolomedia()
@@ -511,10 +1059,9 @@ async def start_ai_with_text_custom(user_text: str):
             print("[CROSS_STREET] Warning: navigation master not initialized!")
             play_voice_text("Failed to start crossing mode, please try again later.")
             await ui_broadcast_final("[System] Navigation system not ready")
-        return
+        return True
     
-    if any(k in user_text for k in ["过马路结束", "结束过马路",
-                                     "stop crossing", "end crossing", "done crossing"]):
+    if "过马路结束" in user_text or "结束过马路" in user_text:
         if orchestrator:
             orchestrator.stop_navigation()
             if DEBUG: print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
@@ -523,12 +1070,10 @@ async def start_ai_with_text_custom(user_text: str):
             await ui_broadcast_final("[System] Street-crossing mode stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
-        return
+        return True
     
     # Check for traffic-light detection command — mutually exclusive with blind-path navigation
-    if any(k in user_text for k in ["检测红绿灯", "看红绿灯",
-                                     "detect traffic light", "check traffic light",
-                                     "what color is the light", "what light"]):
+    if "检测红绿灯" in user_text or "看红绿灯" in user_text:
         try:
             import trafficlight_detection
             
@@ -548,10 +1093,9 @@ async def start_ai_with_text_custom(user_text: str):
         except Exception as e:
             print(f"[TRAFFIC] Failed to start traffic-light detection: {e}")
             await ui_broadcast_final(f"[System] Start failed: {e}")
-        return
+        return True
     
-    if any(k in user_text for k in ["停止检测", "停止红绿灯",
-                                     "stop detection", "stop traffic light"]):
+    if "停止检测" in user_text or "停止红绿灯" in user_text:
         try:
             # Restore to dialogue (CHAT) mode
             if orchestrator:
@@ -562,11 +1106,10 @@ async def start_ai_with_text_custom(user_text: str):
         except Exception as e:
             print(f"[TRAFFIC] Failed to stop traffic-light detection: {e}")
             await ui_broadcast_final(f"[System] Stop failed: {e}")
-        return
+        return True
     
     # Check for navigation commands — use orchestrator to control
-    if any(k in user_text for k in ["开始导航", "盲道导航", "帮我导航",
-                                     "start navigation", "help me navigate", "navigate me", "blind path"]):
+    if "开始导航" in user_text or "盲道导航" in user_text or "帮我导航" in user_text:
         # If currently searching for an item, stop first
         if yolomedia_running:
             stop_yolomedia()
@@ -579,40 +1122,30 @@ async def start_ai_with_text_custom(user_text: str):
         else:
             print("[NAVIGATION] Warning: navigation master not initialized!")
             await ui_broadcast_final("[System] Navigation system not ready")
-        return
+        return True
     
-    if any(k in user_text for k in ["停止导航", "结束导航",
-                                     "stop navigation", "end navigation"]):
+    if "停止导航" in user_text or "结束导航" in user_text:
         if orchestrator:
             orchestrator.stop_navigation()
             if DEBUG: print(f"[NAVIGATION] Navigation stopped, state: {orchestrator.get_state()}")
             await ui_broadcast_final("[System] Blind-path navigation stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
-        return
+        return True
 
-    nav_cmd_keywords = [
-        # Chinese
-        "开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航",
-        "立即通过", "现在通过", "继续",
-        # English
-        "start crossing", "stop crossing", "end crossing",
-        "start navigation", "stop navigation", "end navigation",
-        "pass now", "go now", "continue",
-    ]
+    nav_cmd_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", "立即通过", "现在通过", "继续"]
     if any(k in user_text for k in nav_cmd_keywords):
         if orchestrator:
             orchestrator.on_voice_command(user_text)
             await ui_broadcast_final("[System] Navigation mode updated")
         else:
             await ui_broadcast_final("[System] Navigation master not initialized")
-        return    
+        return True
 
-    # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command.
-    # Try Chinese pattern first, then English ("find <item>" / "look for <item>").
-    find_pattern_cn = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
-    find_pattern_en = r"\b(?:find|look\s+for)\s+(?:the\s+|a\s+|an\s+|my\s+)?(.+?)[\.\?\!]?\s*$"
-    match = re.search(find_pattern_cn, user_text) or re.search(find_pattern_en, user_text)
+    # Check for "帮我找/识别一下xxx" (help me find/identify xxx) command
+    # Extended regex to support more keywords
+    find_pattern = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
+    match = re.search(find_pattern, user_text)
         
     if match:
         # Extract the Chinese item name
@@ -636,7 +1169,7 @@ async def start_ai_with_text_custom(user_text: str):
             except Exception:
                 pass
 
-            return
+            return True
     
     # Check for "found it" (找到了) command
     if "找到了" in user_text or "拿到了" in user_text:
@@ -658,7 +1191,7 @@ async def start_ai_with_text_custom(user_text: str):
         else:
             await ui_broadcast_final("[Item Search] Item found.")
         
-        return
+        return True
     
     # When omni dialogue starts, switch to CHAT mode
     global omni_conversation_active, omni_previous_nav_state
@@ -676,14 +1209,17 @@ async def start_ai_with_text_custom(user_text: str):
             omni_previous_nav_state = None
             if DEBUG: print(f"[OMNI] Dialogue started (already in {current_state} mode)")
     
-    # If not a special command, run the original AI dialogue logic
-    # But if yolomedia is running, skip normal AI dialogue for now
+    # Not a special command. If yolomedia is running, skip normal AI dialogue for now.
     if yolomedia_running:
         if DEBUG: print("[AI] YOLO media is running, skipping normal AI response", flush=True)
-        return
-    
-    # Original AI dialogue logic
-    await start_ai_with_text(user_text)
+        return True
+
+    # Plain conversation — not handled here; caller decides what to do with it
+    # (the live mic-audio path just uses this for its side effects since
+    # Gemini already replied; the typed-PROMPT path forwards it to Gemini).
+    return False
+
+
 
 # ========= TTS: macOS 'say' → 8 kHz PCM16 =========
 async def _say_to_pcm8k(text: str) -> bytes:
@@ -728,117 +1264,152 @@ async def _say_to_pcm8k(text: str) -> bytes:
 
 
 # ========= Omni playback launch =========
+# async def start_ai_with_text(user_text: str):
+#     """Start new AI voice output after a hard reset."""
+#     async def _runner():
+#         txt_buf: List[str] = []
+#         rate_state = None
+
+#         # Assemble (image + text) content
+#         content_list = []
+#         if last_frames:
+#             try:
+#                 _, jpeg_bytes = last_frames[-1]
+#                 img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+#                 content_list.append({
+#                     "type": "image_url",
+#                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+#                 })
+#             except Exception:
+#                 pass
+#         content_list.append({"type": "text", "text": user_text})
+
+#         try:
+#             async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
+#                 # Text delta — update UI as text arrives
+#                 if piece.text_delta:
+#                     txt_buf.append(piece.text_delta)
+#                     try:
+#                         await ui_broadcast_partial("[AI] " + "".join(txt_buf))
+#                     except Exception:
+#                         pass
+#                 # piece.audio_b64 is always None from the local model;
+#                 # audio is produced below via macOS 'say' after the full text is ready.
+#                 #
+#                 # [DASHSCOPE FALLBACK] streaming audio path:
+#                 # if piece.audio_b64:
+#                 #     pcm24 = base64.b64decode(piece.audio_b64)
+#                 #     pcm8k, rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, rate_state)
+#                 #     pcm8k = audioop.mul(pcm8k, 2, 0.60)
+#                 #     if pcm8k:
+#                 #         await broadcast_pcm16_realtime(pcm8k)
+
+#             # TTS: feed the complete AI response through the 8 kHz downlink
+#             full_text = "".join(txt_buf).strip()
+#             if full_text:
+#                 try:
+#                     pcm8k = await _say_to_pcm8k(full_text)
+#                     if pcm8k:
+#                         # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
+#                         # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
+#                         _ws = esp32_audio_ws
+#                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
+#                             try:
+#                                 await _ws.send_text("TTS:START")
+#                                 _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
+#                                 for _i in range(0, len(pcm8k), _CHUNK):
+#                                     await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
+#                                 await _ws.send_text("TTS:END")
+#                                 print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
+#                             except Exception as _ws_err:
+#                                 print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
+#                         else:
+#                             print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
+#                         # Also broadcast via /stream.wav so browser clients can hear it
+#                         await broadcast_pcm16_realtime(pcm8k)
+#                 except Exception as tts_err:
+#                     print(f"[TTS] say failed: {tts_err}", flush=True)
+
+#         except asyncio.CancelledError:
+#             # Interrupted by a new round
+#             raise
+#         except Exception as e:
+#             try:
+#                 await ui_broadcast_final(f"[AI] Error occurred: {e}")
+#             except Exception:
+#                 pass
+#         finally:
+#             # Mark omni dialogue as ended and restore the previous navigation mode
+#             global omni_conversation_active, omni_previous_nav_state
+#             omni_conversation_active = False
+            
+#             # Restore the previous navigation state
+#             if orchestrator and omni_previous_nav_state:
+#                 orchestrator.force_state(omni_previous_nav_state)
+#                 if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
+#                 omni_previous_nav_state = None
+#             else:
+#                 if DEBUG: print(f"[OMNI] Dialogue ended (no navigation state to restore)")
+            
+#             # On natural completion, send a "finish" signal to the current connection
+#             from audio_stream import stream_clients  # local import to avoid circular dependency
+#             for sc in list(stream_clients):
+#                 if not sc.abort_event.is_set():
+#                     try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # one frame of silence
+#                     except Exception: pass
+#                     try: sc.q.put_nowait(None)
+#                     except Exception: pass
+
+#             final_text = ("".join(txt_buf)).strip() or "(empty response)"
+#             print(f"[AI] {final_text}", flush=True)
+#             try:
+#                 await ui_broadcast_final("[AI] " + final_text)
+#             except Exception:
+#                 pass
+
+#     # Hard-reset before actually starting to guarantee absolutely no leftover audio
+#     await hard_reset_audio("start_ai_with_text")
+#     loop = asyncio.get_running_loop()
+#     from audio_stream import current_ai_task as _task_holder  # read/write module-level global
+#     from audio_stream import __dict__ as _as_dict
+#     # Set the module-level current_ai_task
+#     task = loop.create_task(_runner())
+#     _as_dict["current_ai_task"] = task
+
+
+# ========= Typed-prompt entry point =========
+# gemini_live is the only backend that touches audio at all — it produces
+# its own spoken reply via _on_audio. gemini_regular/qwen are text-only for
+# this comparison (see run_backend_turn above): no TTS, reply goes to the UI only.
+
+
 async def start_ai_with_text(user_text: str):
-    """Start new AI voice output after a hard reset."""
-    async def _runner():
-        txt_buf: List[str] = []
-        rate_state = None
+    """Route typed text to whichever backend is currently selected.
 
-        # Assemble (image + text) content
-        content_list = []
-        if last_frames:
-            try:
-                _, jpeg_bytes = last_frames[-1]
-                img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-                content_list.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                })
-            except Exception:
-                pass
-        content_list.append({"type": "text", "text": user_text})
-
+    Used for the /ws_audio 'PROMPT:' text path (device-initiated prompts
+    that bypass audio ASR entirely). Ordinary mic audio doesn't go through
+    this function — for AI_BACKEND=="gemini_live" it's streamed straight to
+    gemini_live.send_audio() from ws_audio and the reply arrives via the
+    Live callbacks; for the other backends, ws_audio streams mic audio into
+    a TEXT-mode Live session used purely for ASR, and _on_turn_complete
+    hands the transcribed text to run_backend_turn() the same way this
+    function does for typed prompts.
+    """
+    await hard_reset_audio("start_ai_with_text")
+    if AI_BACKEND == "gemini_live":
+        _output_text_buf.clear()
         try:
-            async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
-                # Text delta — update UI as text arrives
-                if piece.text_delta:
-                    txt_buf.append(piece.text_delta)
-                    try:
-                        await ui_broadcast_partial("[AI] " + "".join(txt_buf))
-                    except Exception:
-                        pass
-                # piece.audio_b64 is always None from the local model;
-                # audio is produced below via macOS 'say' after the full text is ready.
-                #
-                # [DASHSCOPE FALLBACK] streaming audio path:
-                # if piece.audio_b64:
-                #     pcm24 = base64.b64decode(piece.audio_b64)
-                #     pcm8k, rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, rate_state)
-                #     pcm8k = audioop.mul(pcm8k, 2, 0.60)
-                #     if pcm8k:
-                #         await broadcast_pcm16_realtime(pcm8k)
-
-            # TTS: feed the complete AI response through the 8 kHz downlink
-            full_text = "".join(txt_buf).strip()
-            if full_text:
-                try:
-                    pcm8k = await _say_to_pcm8k(full_text)
-                    if pcm8k:
-                        # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
-                        # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
-                        _ws = esp32_audio_ws
-                        if _ws and _ws.client_state == WebSocketState.CONNECTED:
-                            try:
-                                await _ws.send_text("TTS:START")
-                                _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
-                                for _i in range(0, len(pcm8k), _CHUNK):
-                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
-                                await _ws.send_text("TTS:END")
-                                print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
-                            except Exception as _ws_err:
-                                print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
-                        else:
-                            print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
-                        # Also broadcast via /stream.wav so browser clients can hear it
-                        await broadcast_pcm16_realtime(pcm8k)
-                except Exception as tts_err:
-                    print(f"[TTS] say failed: {tts_err}", flush=True)
-
-        except asyncio.CancelledError:
-            # Interrupted by a new round
-            raise
+            await gemini_live.send_text(user_text)
         except Exception as e:
+            print(f"[Gemini Live] send_text failed: {e}", flush=True)
             try:
                 await ui_broadcast_final(f"[AI] Error occurred: {e}")
             except Exception:
                 pass
-        finally:
-            # Mark omni dialogue as ended and restore the previous navigation mode
-            global omni_conversation_active, omni_previous_nav_state
-            omni_conversation_active = False
-            
-            # Restore the previous navigation state
-            if orchestrator and omni_previous_nav_state:
-                orchestrator.force_state(omni_previous_nav_state)
-                if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
-                omni_previous_nav_state = None
-            else:
-                if DEBUG: print(f"[OMNI] Dialogue ended (no navigation state to restore)")
-            
-            # On natural completion, send a "finish" signal to the current connection
-            from audio_stream import stream_clients  # local import to avoid circular dependency
-            for sc in list(stream_clients):
-                if not sc.abort_event.is_set():
-                    try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # one frame of silence
-                    except Exception: pass
-                    try: sc.q.put_nowait(None)
-                    except Exception: pass
+    else:
+        await run_backend_turn(user_text)
 
-            final_text = ("".join(txt_buf)).strip() or "(empty response)"
-            print(f"[AI] {final_text}", flush=True)
-            try:
-                await ui_broadcast_final("[AI] " + final_text)
-            except Exception:
-                pass
 
-    # Hard-reset before actually starting to guarantee absolutely no leftover audio
-    await hard_reset_audio("start_ai_with_text")
-    loop = asyncio.get_running_loop()
-    from audio_stream import current_ai_task as _task_holder  # read/write module-level global
-    from audio_stream import __dict__ as _as_dict
-    # Set the module-level current_ai_task
-    task = loop.create_task(_runner())
-    _as_dict["current_ai_task"] = task
 
 # ---------- Page / Health ----------
 @app.get("/", response_class=HTMLResponse)
@@ -849,6 +1420,10 @@ def root():
 @app.get("/api/health", response_class=PlainTextResponse)
 def health():
     return "OK"
+
+@app.get("/api/backend")
+def get_backend():
+    return JSONResponse({"backend": "AI_BACKEND"})
 
 
 @app.post("/api/restart")
@@ -885,7 +1460,9 @@ async def run_command(payload: CommandPayload):
     if not text:
         return JSONResponse({"error": "empty command"}, status_code=400)
     async with interrupt_lock:
-        await start_ai_with_text_custom(text)
+        handled = await try_dispatch_command(text)
+        if not handled:
+            await start_ai_with_text(text)
     return JSONResponse({"ran": text})
 
 class SettingsPayload(BaseModel):
@@ -1000,7 +1577,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
     Called by both the manual STOP handler and the VAD auto-trigger so the
     logic lives in exactly one place.
     """
-    if not buf:
+    if not buf or _whisper_model is None:
         return
     try:
         # PCM16 int16 → float32 normalised to [-1, 1] at 16 kHz
@@ -1014,7 +1591,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
         print(f"[WHISPER] {text}", flush=True)
 
         if text:
-            await ui_broadcast_final(text)
+            await ui_broadcast_final("(user) "+text)
 
             if _has_hotword(text):
                 async with interrupt_lock:
@@ -1022,7 +1599,9 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
                     await full_system_reset("Hotword interrupt")
             elif not is_playing_now():
                 async with interrupt_lock:
-                    await start_ai_with_text_custom(text)
+                    handled = await try_dispatchcommand(text)
+                    if not handled:
+                     await run_backend_turn(text)
     except Exception as e:
         print(f"[WHISPER] transcribe error: {e}", flush=True)
 
@@ -1043,19 +1622,151 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 #   # keepalive_loop fed silence when idle > 350 ms
 #   # On STOP: recognition.send_audio_frame(SILENCE_20MS) x15, then recognition.stop()
 #
+# @app.websocket("/ws_audio")
+# async def ws_audio(ws: WebSocket):
+#     global esp32_audio_ws
+#     esp32_audio_ws = ws
+#     await ws.accept()
+#     print("[CONNECTED] Mic (ESP32 audio)")
+
+#     streaming: bool = False
+#     pcm_buffer: Optional[bytearray] = None
+#     # VAD state (reset on every START / STOP / auto-trigger)
+#     vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
+#     vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
+#     vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
+
+#     try:
+#         while True:
+#             if WebSocketState and ws.client_state != WebSocketState.CONNECTED:
+#                 break
+#             try:
+#                 msg = await ws.receive()
+#             except WebSocketDisconnect:
+#                 break
+#             except RuntimeError as e:
+#                 if "Cannot call \"receive\"" in str(e):
+#                     break
+#                 raise
+
+#             if "text" in msg and msg["text"] is not None:
+#                 raw = (msg["text"] or "").strip()
+#                 cmd = raw.upper()
+
+#                 if cmd == "START":
+#                     print("[MIC] Listening — waiting for speech...")
+#                     streaming            = True
+#                     pcm_buffer           = bytearray()
+#                     vad_silent_chunks    = 0
+#                     vad_speech_chunks    = 0
+#                     vad_speech_detected  = False
+#                     await ui_broadcast_partial("（Recording…）")
+#                     await ws.send_text("OK:STARTED")
+
+#                 elif cmd == "STOP":
+#                     # Manual STOP from firmware (fallback; firmware currently never sends this)
+#                     print("[MIC] Transcribing...")
+#                     streaming            = False
+#                     buf                  = bytes(pcm_buffer) if pcm_buffer else b""
+#                     pcm_buffer           = None
+#                     vad_silent_chunks    = 0
+#                     vad_speech_chunks    = 0
+#                     vad_speech_detected  = False
+#                     await ws.send_text("OK:STOPPED")
+#                     await _run_whisper_and_dispatch(buf)
+
+#                 elif raw.startswith("PROMPT:"):
+#                     # Device-initiated prompt (bypasses ASR entirely)
+#                     text = raw[len("PROMPT:"):].strip()
+#                     if text:
+#                         async with interrupt_lock:
+#                             await start_ai_with_text_custom(text)
+#                         await ws.send_text("OK:PROMPT_ACCEPTED")
+#                     else:
+#                         await ws.send_text("ERR:EMPTY_PROMPT")
+
+#             elif "bytes" in msg and msg["bytes"] is not None:
+#                 chunk = msg["bytes"]
+#                 if streaming and pcm_buffer is not None:
+#                     pcm_buffer.extend(chunk)
+
+#                     # ---- VAD: classify this 20ms chunk ----
+#                     n = len(chunk)
+#                     if n >= 2:
+#                         s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
+#                         s -= s.mean()   # strip DC offset from PDM mic before measuring energy
+#                         rms = float(np.sqrt(np.mean(s ** 2)))
+#                     else:
+#                         rms = 0.0
+
+#                     # [VAD DEBUG] Log every chunk so we can read the real noise floor.
+#                     # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
+#                     if DEBUG_VAD:
+#                         label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
+#                         print(
+#                             f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
+#                             f"  → {label}"
+#                             f"  speech_chunks={vad_speech_chunks}"
+#                             f"  silent_chunks={vad_silent_chunks}"
+#                             f"  detected={vad_speech_detected}",
+#                             flush=True,
+#                         )
+
+#                     if rms >= VAD_SILENCE_RMS:
+#                         # Voiced chunk
+#                         vad_silent_chunks  = 0
+#                         vad_speech_chunks += 1
+#                         if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+#                             vad_speech_detected = True
+#                             print("[MIC] Speech detected", flush=True)
+#                     else:
+#                         # Silent chunk — only counts after speech has begun
+#                         if vad_speech_detected:
+#                             vad_silent_chunks += 1
+#                             if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
+#                                 print("[MIC] Transcribing...", flush=True)
+#                                 buf         = bytes(pcm_buffer)
+#                                 # Reset buffer + VAD state; keep streaming=True for next utterance
+#                                 pcm_buffer           = bytearray()
+#                                 vad_silent_chunks    = 0
+#                                 vad_speech_chunks    = 0
+#                                 vad_speech_detected  = False
+#                                 await ui_broadcast_partial("（Processing…）")
+#                                 await _run_whisper_and_dispatch(buf)
+#                         else:
+#                             # Pre-speech silence: don't let scattered noise accumulate
+#                             vad_speech_chunks = 0
+
+#     except Exception as e:
+#         print(f"\n[WS ERROR] {e}")
+#     finally:
+#         streaming  = False
+#         pcm_buffer = None
+#         try:
+#             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
+#                 await ws.close(code=1000)
+#         except Exception:
+#             pass
+#         if esp32_audio_ws is ws:
+#             esp32_audio_ws = None
+#         print("[DISCONNECTED] Mic (ESP32 audio)")
+
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
+    global esp32_audio_ws, mic_streaming
+    if esp32_audio_ws is not None:
+        await ws.close(code=1013)
+        return
     esp32_audio_ws = ws
     await ws.accept()
     print("[CONNECTED] Mic (ESP32 audio)")
 
     streaming: bool = False
+    # VAD state — only used when AI_BACKEND != "gemini_live"
     pcm_buffer: Optional[bytearray] = None
-    # VAD state (reset on every START / STOP / auto-trigger)
-    vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
-    vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
-    vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
+    vad_silent_chunks: int = 0
+    vad_speech_chunks: int = 0
+    vad_speech_detected: bool = False
 
     try:
         while True:
@@ -1075,94 +1786,110 @@ async def ws_audio(ws: WebSocket):
                 cmd = raw.upper()
 
                 if cmd == "START":
-                    print("[MIC] Listening — waiting for speech...")
-                    streaming            = True
-                    pcm_buffer           = bytearray()
-                    vad_silent_chunks    = 0
-                    vad_speech_chunks    = 0
-                    vad_speech_detected  = False
+                    streaming = True
+                    if AI_BACKEND == "gemini_live":
+                        print("[MIC] Streaming to Gemini Live...")
+                        mic_streaming = True
+                    else:
+                        print("[MIC] Listening — waiting for speech...")
+                        pcm_buffer          = bytearray()
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
                     await ui_broadcast_partial("（Recording…）")
                     await ws.send_text("OK:STARTED")
 
                 elif cmd == "STOP":
-                    # Manual STOP from firmware (fallback; firmware currently never sends this)
-                    print("[MIC] Transcribing...")
-                    streaming            = False
-                    buf                  = bytes(pcm_buffer) if pcm_buffer else b""
-                    pcm_buffer           = None
-                    vad_silent_chunks    = 0
-                    vad_speech_chunks    = 0
-                    vad_speech_detected  = False
-                    await ws.send_text("OK:STOPPED")
-                    await _run_whisper_and_dispatch(buf)
+                    streaming = False
+                    if AI_BACKEND == "gemini_live":
+                        print("[MIC] Stopped streaming")
+                        mic_streaming = False
+                        await ws.send_text("OK:STOPPED")
+                    else:
+                        print("[MIC] Transcribing...")
+                        buf = bytes(pcm_buffer) if pcm_buffer else b""
+                        pcm_buffer          = None
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
+                        await ws.send_text("OK:STOPPED")
+                        await _run_whisper_and_dispatch(buf)
 
                 elif raw.startswith("PROMPT:"):
                     # Device-initiated prompt (bypasses ASR entirely)
                     text = raw[len("PROMPT:"):].strip()
                     if text:
                         async with interrupt_lock:
-                            await start_ai_with_text_custom(text)
+                            handled = await try_dispatch_command(text)
+                            if not handled:
+                                await start_ai_with_text(text)
                         await ws.send_text("OK:PROMPT_ACCEPTED")
                     else:
                         await ws.send_text("ERR:EMPTY_PROMPT")
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
-                if streaming and pcm_buffer is not None:
-                    pcm_buffer.extend(chunk)
+                if not streaming:
+                    continue
 
-                    # ---- VAD: classify this 20ms chunk ----
-                    n = len(chunk)
-                    if n >= 2:
-                        s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
-                        s -= s.mean()   # strip DC offset from PDM mic before measuring energy
-                        rms = float(np.sqrt(np.mean(s ** 2)))
+                if AI_BACKEND == "gemini_live":
+                    try:
+                        await gemini_live.send_audio(chunk)
+                    except Exception as e:
+                        print(f"[Gemini Live] send_audio failed: {e}", flush=True)
+                    continue
+
+                # ---- gemini_regular / qwen: RMS VAD over the PCM buffer ----
+                if pcm_buffer is None:
+                    continue
+                pcm_buffer.extend(chunk)
+
+                n = len(chunk)
+                if n >= 2:
+                    s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
+                    s -= s.mean()  # strip DC offset from PDM mic before measuring energy
+                    rms = float(np.sqrt(np.mean(s ** 2)))
+                else:
+                    rms = 0.0
+
+                if DEBUG_VAD:
+                    label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
+                    print(
+                        f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
+                        f"  -> {label}"
+                        f"  speech_chunks={vad_speech_chunks}"
+                        f"  silent_chunks={vad_silent_chunks}"
+                        f"  detected={vad_speech_detected}",
+                        flush=True,
+                    )
+
+                if rms >= VAD_SILENCE_RMS:
+                    vad_silent_chunks  = 0
+                    vad_speech_chunks += 1
+                    if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                        vad_speech_detected = True
+                        print("[MIC] Speech detected", flush=True)
+                else:
+                    if vad_speech_detected:
+                        vad_silent_chunks += 1
+                        if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
+                            print("[MIC] Transcribing...", flush=True)
+                            buf = bytes(pcm_buffer)
+                            pcm_buffer          = bytearray()
+                            vad_silent_chunks   = 0
+                            vad_speech_chunks   = 0
+                            vad_speech_detected = False
+                            await ui_broadcast_partial("（Processing…）")
+                            await _run_whisper_and_dispatch(buf)
                     else:
-                        rms = 0.0
-
-                    # [VAD DEBUG] Log every chunk so we can read the real noise floor.
-                    # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
-                    if DEBUG_VAD:
-                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
-                        print(
-                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
-                            f"  → {label}"
-                            f"  speech_chunks={vad_speech_chunks}"
-                            f"  silent_chunks={vad_silent_chunks}"
-                            f"  detected={vad_speech_detected}",
-                            flush=True,
-                        )
-
-                    if rms >= VAD_SILENCE_RMS:
-                        # Voiced chunk
-                        vad_silent_chunks  = 0
-                        vad_speech_chunks += 1
-                        if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
-                            vad_speech_detected = True
-                            print("[MIC] Speech detected", flush=True)
-                    else:
-                        # Silent chunk — only counts after speech has begun
-                        if vad_speech_detected:
-                            vad_silent_chunks += 1
-                            if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
-                                print("[MIC] Transcribing...", flush=True)
-                                buf         = bytes(pcm_buffer)
-                                # Reset buffer + VAD state; keep streaming=True for next utterance
-                                pcm_buffer           = bytearray()
-                                vad_silent_chunks    = 0
-                                vad_speech_chunks    = 0
-                                vad_speech_detected  = False
-                                await ui_broadcast_partial("（Processing…）")
-                                await _run_whisper_and_dispatch(buf)
-                        else:
-                            # Pre-speech silence: don't let scattered noise accumulate
-                            vad_speech_chunks = 0
+                        vad_speech_chunks = 0
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
     finally:
-        streaming  = False
+        streaming = False
         pcm_buffer = None
+        mic_streaming = False
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
@@ -1172,76 +1899,288 @@ async def ws_audio(ws: WebSocket):
             esp32_audio_ws = None
         print("[DISCONNECTED] Mic (ESP32 audio)")
 
-def _process_camera_frame_blocking(data: bytes):
-    """Decode one JPEG frame and run detection/navigation on it.
 
-    Pure synchronous CPU work — safe to run in a thread executor. Does NO
-    websocket or async I/O. Returns (out_jpeg_bytes | None, guidance_text | None);
-    the caller broadcasts the JPEG and speaks the guidance from the event loop.
+
+
+# def _process_camera_frame_blocking(data: bytes):
+#     """Decode one JPEG frame and run detection/navigation on it.
+
+#     Pure synchronous CPU work — safe to run in a thread executor. Does NO
+#     websocket or async I/O. Returns (out_jpeg_bytes | None, guidance_text | None);
+#     the caller broadcasts the JPEG and speaks the guidance from the event loop.
+#     """
+#     try:
+#         arr = np.frombuffer(data, dtype=np.uint8)
+#         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+#         if bgr is None or bgr.size == 0:
+#             return (None, None)
+#     except Exception:
+#         return (None, None)
+
+#     # General object detection takes over the frame while active. Checked before
+#     # the orchestrator so it works even when nav models aren't loaded (laptop).
+#     if general_detect_active and not yolomedia_running:
+#         try:
+#             annotated, _counts = general_detector.detect(
+#                 bgr, conf=float(os.getenv("GENERAL_DET_CONF", "0.25"))
+#             )
+#             out_img = annotated if annotated is not None else bgr
+#         except Exception as e:
+#             if DEBUG:
+#                 print(f"[GENERAL_DET] error: {e}")
+#             out_img = bgr
+#         # No spoken/text guidance — boxes + labels are drawn on the frame itself.
+#         ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+#         return (enc.tobytes() if ok else None, None)
+
+#     # Orchestrator active and item-search not occupying the frame
+#     if orchestrator and not yolomedia_running:
+#         current_state = orchestrator.get_state()
+
+#         # Item-search: yolomedia owns the stream; show raw until it starts sending
+#         if current_state == "ITEM_SEARCH":
+#             if not yolomedia_sending_frames:
+#                 ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+#                 return (enc.tobytes() if ok else None, None)
+#             return (None, None)
+
+#         out_img = bgr
+#         guidance = None
+#         try:
+#             if current_state == "TRAFFIC_LIGHT_DETECTION":
+#                 import trafficlight_detection
+#                 result = trafficlight_detection.process_single_frame(bgr)
+#                 out_img = result['vis_image'] if result['vis_image'] is not None else bgr
+#             else:
+#                 res = orchestrator.process_frame(bgr)
+#                 guidance = res.guidance_text
+#                 out_img = res.annotated_image if res.annotated_image is not None else bgr
+#         except Exception:
+#             pass
+#         ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+#         return (enc.tobytes() if ok else None, guidance)
+
+#     # Fallback: no orchestrator, or yolomedia running. Passthrough raw unless
+#     # yolomedia is already sending its own annotated frames.
+#     if not yolomedia_sending_frames:
+#         ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+#         return (enc.tobytes() if ok else None, None)
+#     return (None, None)
+
+
+# ---------- Non-blocking cv2 helpers ----------
+# cv2.imdecode/imencode are synchronous, CPU-bound calls. Running them
+# directly inside an async def (as the camera handler did before) blocks
+# the whole event loop for their duration — including the coroutines that
+# keep the Gemini Live websocket's keepalive pings answered and audio
+# chunks flowing. Route them through a thread pool instead so a slow frame
+# doesn't stall unrelated async work.
+async def _send_to_viewers(viewers, payload, timeout: float = 0.2) -> None:
+    """Broadcast bytes to all camera viewers WITHOUT letting any one of them
+    block the event loop.
+
+    A bare `await viewer_ws.send_bytes(...)` has no timeout. If a browser tab is
+    slow, backgrounded, or half-dead, its send buffer fills and that await parks
+    the whole /ws/camera receive loop. While parked we stop calling ws.receive(),
+    the ESP32 camera socket's TCP window closes, and the ESP32's
+    NetworkClient::write() burns its 10 x 1s select() retries -> the 10011ms
+    "send took" stalls. It also blocks the asyncio loop long enough for the
+    Gemini client's websocket to miss keepalive pings (1011 internal error).
+
+    Sends run concurrently and are bounded: a viewer that can't keep up simply
+    drops this frame instead of stalling the pipeline. Dead/timed-out viewers
+    are pruned.
     """
-    try:
-        arr = np.frombuffer(data, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if bgr is None or bgr.size == 0:
-            return (None, None)
-    except Exception:
-        return (None, None)
+    if not viewers:
+        return
 
-    # General object detection takes over the frame while active. Checked before
-    # the orchestrator so it works even when nav models aren't loaded (laptop).
-    if general_detect_active and not yolomedia_running:
+    targets = list(viewers)
+
+    async def _one(vws):
         try:
-            annotated, _counts = general_detector.detect(
-                bgr, conf=float(os.getenv("GENERAL_DET_CONF", "0.25"))
-            )
-            out_img = annotated if annotated is not None else bgr
-        except Exception as e:
-            if DEBUG:
-                print(f"[GENERAL_DET] error: {e}")
-            out_img = bgr
-        # No spoken/text guidance — boxes + labels are drawn on the frame itself.
-        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        return (enc.tobytes() if ok else None, None)
-
-    # Orchestrator active and item-search not occupying the frame
-    if orchestrator and not yolomedia_running:
-        current_state = orchestrator.get_state()
-
-        # Item-search: yolomedia owns the stream; show raw until it starts sending
-        if current_state == "ITEM_SEARCH":
-            if not yolomedia_sending_frames:
-                ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                return (enc.tobytes() if ok else None, None)
-            return (None, None)
-
-        out_img = bgr
-        guidance = None
-        try:
-            if current_state == "TRAFFIC_LIGHT_DETECTION":
-                import trafficlight_detection
-                result = trafficlight_detection.process_single_frame(bgr)
-                out_img = result['vis_image'] if result['vis_image'] is not None else bgr
-            else:
-                res = orchestrator.process_frame(bgr)
-                guidance = res.guidance_text
-                out_img = res.annotated_image if res.annotated_image is not None else bgr
+            await asyncio.wait_for(vws.send_bytes(payload), timeout=timeout)
+            return None            # ok
+        except asyncio.TimeoutError:
+            return vws             # too slow this frame — drop it, keep it connected
         except Exception:
-            pass
-        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        return (enc.tobytes() if ok else None, guidance)
+            return vws             # genuinely dead — prune
 
-    # Fallback: no orchestrator, or yolomedia running. Passthrough raw unless
-    # yolomedia is already sending its own annotated frames.
-    if not yolomedia_sending_frames:
-        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        return (enc.tobytes() if ok else None, None)
-    return (None, None)
+        # NOTE: a viewer that repeatedly times out will just keep dropping
+        # frames; it never blocks the loop, which is the point.
 
+    results = await asyncio.gather(*(_one(v) for v in targets), return_exceptions=True)
+    for r in results:
+        if r is not None and not isinstance(r, BaseException):
+            viewers.discard(r)
+
+
+async def _cv2_imdecode_async(data: bytes) -> Optional["np.ndarray"]:
+    loop = asyncio.get_running_loop()
+    def _decode():
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None or bgr.size == 0:
+                return None
+            return bgr
+        except Exception:
+            return None
+    return await loop.run_in_executor(None, _decode)
+
+async def _cv2_imencode_async(img, quality: int):
+    """Returns (ok, jpeg_bytes_or_None)."""
+    loop = asyncio.get_running_loop()
+    def _encode():
+        try:
+            ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            return (ok, enc.tobytes() if ok else None)
+        except Exception:
+            return (False, None)
+    return await loop.run_in_executor(None, _encode)
 
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
+# # async def ws_camera_esp(ws: WebSocket):
+    
+#     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+#     if esp32_camera_ws is not None:
+#         await ws.close(code=1013)
+#         return
+#     esp32_camera_ws = ws
+#     await ws.accept()
+#     print("[CONNECTED] Camera (ESP32)")
+
+#     # Initialize the blind-path navigator
+#     if blind_path_navigator is None and yolo_seg_model is not None:
+#         blind_path_navigator = BlindPathNavigator(yolo_seg_model, obstacle_detector)
+#         if DEBUG: print("[NAVIGATION] Blind-path navigator initialized")
+#     else:
+#         if blind_path_navigator is None and yolo_seg_model is None:
+#             print("[NAVIGATION] Warning: YOLO model not loaded, cannot initialize navigator")
+
+#     # Initialize the street-crossing navigator
+#     if cross_street_navigator is None:
+#         if yolo_seg_model:
+#             cross_street_navigator = CrossStreetNavigator(
+#                 seg_model=yolo_seg_model,
+#                 coco_model=None,  # traffic-light detection disabled
+#                 obs_model=None    # obstacle detection also disabled for now (faster)
+#             )
+#             if DEBUG: print("[CROSS_STREET] Street-crossing navigator initialized")
+#         else:
+#             print("[CROSS_STREET] Error: segmentation model missing, cannot initialize street-crossing navigator")
+
+#     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
+#         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
+#         if DEBUG: print("[NAV MASTER] Master state machine initialized")
+#     loop = asyncio.get_running_loop()
+#     frame_counter = 0
+
+#     # ---- Drop-to-latest pipeline ----------------------------------------
+#     # The receive loop below drains the socket and keeps only the NEWEST frame.
+#     # A separate processor task runs YOLO/nav on that newest frame in a thread
+#     # (so it never blocks the receive loop) and broadcasts the annotated result.
+#     # Frames that arrive while the processor is busy are overwritten (dropped),
+#     # so detection always runs on the freshest frame instead of a growing
+#     # backlog — this is what kills the video/detection lag.
+#     holder = {"data": None}
+#     frame_event = asyncio.Event()
+
+#     async def _processor():
+#         while True:
+#             await frame_event.wait()
+#             frame_event.clear()
+#             data = holder["data"]
+#             if data is None:
+#                 continue
+#             try:
+#                 out_jpeg, guidance = await loop.run_in_executor(
+#                     None, _process_camera_frame_blocking, data
+#                 )
+#             except Exception as e:
+#                 out_jpeg, guidance = None, None
+#                 if DEBUG:
+#                     print(f"[NAV MASTER] processor error: {e}")
+
+#             # Speak/broadcast navigation guidance from the event loop
+#             if guidance:
+#                 try:
+#                     play_voice_text(guidance)
+#                     await ui_broadcast_final(f"[NAV] {guidance}")
+#                 except Exception:
+#                     pass
+
+#             # Broadcast the annotated frame to browser viewers
+#             if out_jpeg and camera_viewers:
+#                 dead = []
+#                 for viewer_ws in list(camera_viewers):
+#                     try:
+#                         await viewer_ws.send_bytes(out_jpeg)
+#                     except Exception:
+#                         dead.append(viewer_ws)
+#                 for d in dead:
+#                     camera_viewers.discard(d)
+
+#     processor_task = asyncio.create_task(_processor())
+
+#     try:
+#         while True:
+#             msg = await ws.receive()
+#             if "bytes" in msg and msg["bytes"] is not None:
+#                 data = msg["bytes"]
+#                 frame_counter += 1
+
+#                 # Cheap per-frame bookkeeping stays in the receive loop so it
+#                 # sees every frame (recording, latest-frame cache, yolomedia feed).
+#                 try:
+#                     sync_recorder.record_frame(data)
+#                 except Exception as e:
+#                     if frame_counter % 100 == 0:  # avoid log spam
+#                         print(f"[RECORDER] Failed to record frame: {e}")
+#                 try:
+#                     last_frames.append((time.time(), data))
+#                 except Exception:
+#                     pass
+#                 bridge_io.push_raw_jpeg(data)
+
+#                 # Hand the newest frame to the processor. If an older unprocessed
+#                 # frame is still sitting here, it's overwritten (dropped).
+#                 holder["data"] = data
+#                 frame_event.set()
+
+#             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+#                 break
+#     except WebSocketDisconnect:
+#         pass
+#     except Exception as e:
+#         print(f"[CAMERA ERROR] {e}")
+#     finally:
+#         processor_task.cancel()
+#         try:
+#             await processor_task
+#         except (asyncio.CancelledError, Exception):
+#             pass
+#         try:
+#             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
+#                 await ws.close(code=1000)
+#         except Exception:
+#             pass
+#         esp32_camera_ws = None
+#         print("[DISCONNECTED] Camera (ESP32)")
+
+#         # Clean up navigation state
+#         if blind_path_navigator:
+#             blind_path_navigator.reset()
+#         if cross_street_navigator:
+#             cross_street_navigator.reset()
+#         if orchestrator:
+#             orchestrator.reset()
+#             if DEBUG: print("[NAV MASTER] Master reset")
+
+
+@app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, _gemini_img_task
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
@@ -1272,91 +2211,225 @@ async def ws_camera_esp(ws: WebSocket):
     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         if DEBUG: print("[NAV MASTER] Master state machine initialized")
-    loop = asyncio.get_running_loop()
     frame_counter = 0
 
-    # ---- Drop-to-latest pipeline ----------------------------------------
-    # The receive loop below drains the socket and keeps only the NEWEST frame.
-    # A separate processor task runs YOLO/nav on that newest frame in a thread
-    # (so it never blocks the receive loop) and broadcasts the annotated result.
-    # Frames that arrive while the processor is busy are overwritten (dropped),
-    # so detection always runs on the freshest frame instead of a growing
-    # backlog — this is what kills the video/detection lag.
-    holder = {"data": None}
-    frame_event = asyncio.Event()
+    # ---- Reader / processor split ----
+    #
+    # THE STALL FIX. Previously this was ONE loop:
+    #     while True:
+    #         msg = await ws.receive()
+    #         ... record / decode / infer / encode / broadcast / gemini ...
+    #
+    # i.e. we only asked for the next frame after the entire per-frame chain
+    # finished. That is what caused the ESP32's "send took 10011 ms":
+    #
+    #   uvicorn (websockets legacy impl) never overrides read_limit, so the
+    #   library default of 65536 bytes applies. At ~13KB per VGA JPEG that is
+    #   only ~5 frames of buffer — far below the max_queue=32 message cap.
+    #   Whenever our per-frame work took longer than ~5 frame intervals, the
+    #   StreamReader crossed its high-water mark and asyncio called
+    #   transport.pause_reading(). That stops reading the OS socket and closes
+    #   the TCP window ON THE WIRE — while the event loop sits perfectly idle.
+    #   The ESP32 then burns NetworkClient::write()'s 10 x 1s select() retries.
+    #
+    # That is why the event-loop watchdog never fired: nothing was blocked. The
+    # loop was idle *by design*, waiting on work we hadn't asked for yet.
+    #
+    # So: read and process are now decoupled. The reader does nothing but
+    # receive() -> stash -> receive(), so the socket is always drained and the
+    # window never closes. The processor takes only the newest frame; anything
+    # it couldn't keep up with is dropped, which is correct for a live stream.
+    holder: dict = {"data": None}
+    frame_ready = asyncio.Event()
+    reader_alive = True
 
-    async def _processor():
-        while True:
-            await frame_event.wait()
-            frame_event.clear()
-            data = holder["data"]
-            if data is None:
-                continue
-            try:
-                out_jpeg, guidance = await loop.run_in_executor(
-                    None, _process_camera_frame_blocking, data
-                )
-            except Exception as e:
-                out_jpeg, guidance = None, None
-                if DEBUG:
-                    print(f"[NAV MASTER] processor error: {e}")
+    async def _reader():
+        """Drain the socket as fast as the ESP32 sends. Never do work here."""
+        nonlocal reader_alive
+        try:
+            while True:
+                msg = await ws.receive()
+                if "bytes" in msg and msg["bytes"] is not None:
+                    holder["data"] = msg["bytes"]   # overwrite = drop stale frame
+                    frame_ready.set()
+                elif msg.get("type") in ("websocket.close", "websocket.disconnect"):
+                    break
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as e:
+            print(f"[CAMERA] reader error: {e}")
+        finally:
+            reader_alive = False
+            frame_ready.set()   # wake the processor so it can exit
 
-            # Speak/broadcast navigation guidance from the event loop
-            if guidance:
-                try:
-                    play_voice_text(guidance)
-                    await ui_broadcast_final(f"[NAV] {guidance}")
-                except Exception:
-                    pass
-
-            # Broadcast the annotated frame to browser viewers
-            if out_jpeg and camera_viewers:
-                dead = []
-                for viewer_ws in list(camera_viewers):
-                    try:
-                        await viewer_ws.send_bytes(out_jpeg)
-                    except Exception:
-                        dead.append(viewer_ws)
-                for d in dead:
-                    camera_viewers.discard(d)
-
-    processor_task = asyncio.create_task(_processor())
+    reader_task = asyncio.create_task(_reader())
 
     try:
         while True:
-            msg = await ws.receive()
-            if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
+            await frame_ready.wait()
+            frame_ready.clear()
+            if not reader_alive:
+                break
+            data = holder["data"]
+            holder["data"] = None
+            if data is None:
+                continue
+            if True:
                 frame_counter += 1
 
-                # Cheap per-frame bookkeeping stays in the receive loop so it
-                # sees every frame (recording, latest-frame cache, yolomedia feed).
+                # A WebSocket send interrupted mid-frame (e.g. during the
+                # ESP32 reconnect churn) can hand us a truncated JPEG. cv2
+                # will often still "decode" it rather than returning None,
+                # but the undecoded tail renders solid black — and
+                # gemini_live.send_image() below does zero validation of its
+                # own. Reject anything missing its SOI/EOI markers before it
+                # reaches either path.
+                if len(data) < 4 or data[:2] != b"\xff\xd8" or data[-2:] != b"\xff\xd9":
+                    if frame_counter % 30 == 0:
+                        print(f"[CAMERA] Dropping truncated/corrupt frame ({len(data)} bytes)")
+                    continue
+
+                # Record the raw frame.
+                # record_frame() does a cv2.imdecode() plus video_writer.write()
+                # (H.264 encode + disk write) inline. Small next to YOLO, but it is
+                # still synchronous blocking I/O on the event loop — and if the disk
+                # stalls it adds straight to the stall budget. Offload it.
                 try:
-                    sync_recorder.record_frame(data)
+                    _loop = asyncio.get_running_loop()
+                    await _loop.run_in_executor(None, sync_recorder.record_frame, data)
                 except Exception as e:
                     if frame_counter % 100 == 0:  # avoid log spam
                         print(f"[RECORDER] Failed to record frame: {e}")
+                
                 try:
                     last_frames.append((time.time(), data))
                 except Exception:
                     pass
+
+                # Give Gemini Live visual context while the mic is actively
+                # streaming (Google's own guidance: send video frames during
+                # audio activity). NOTE: this used to gate on
+                # omni_conversation_active, but that flag is only ever set
+                # True post-hoc inside _on_turn_complete/try_dispatch_command
+                # — by the time it flips True, the turn it was meant for is
+                # already over, so no frame ever actually went out. Gating on
+                # mic_streaming (set live in ws_audio on START/STOP) fixes that.
+                # Throttled to ~2 fps since Live API input doesn't need full
+                # camera framerate and this avoids saturating the session.
+                if mic_streaming and frame_counter % 15 == 0:
+                    # Do NOT bare-await (parks this receive loop on Google's API ->
+                    # ESP32 TCP window closes -> 10s send stalls), but also do NOT
+                    # fire unbounded create_task()s: during a Gemini reconnect
+                    # (2/4/8/16/30s backoff) they pile up and then all become
+                    # runnable at once, hammering the session. Single in-flight slot:
+                    # if the previous image send hasn't finished, skip this frame.
+                    # Frames are throttled to ~2fps anyway and are inherently
+                    # droppable — a stale frame is worth less than a backlog.
+                    if _gemini_img_task is None or _gemini_img_task.done():
+                        _gemini_img_task = asyncio.create_task(gemini_live.send_image(data))
+                        _gemini_img_task.add_done_callback(
+                            lambda t: (not t.cancelled() and t.exception() is not None)
+                            and print(f"[Gemini Live] send_image failed: {t.exception()}", flush=True)
+                        )
+
+                # Push to bridge_io (for use by yolomedia)
                 bridge_io.push_raw_jpeg(data)
+                
+                # Unified decoding (off the event loop — see _cv2_imdecode_async)
+                bgr = await _cv2_imdecode_async(data)
+                if bgr is None and frame_counter % 30 == 0:
+                    print(f"[JPEG] Decode failed: data length={len(data)}")
 
-                # Hand the newest frame to the processor. If an older unprocessed
-                # frame is still sitting here, it's overwritten (dropped).
-                holder["data"] = data
-                frame_event.set()
+                # Hand off to the master state machine first (when item-search is not occupying the frame)
+                # In item-search mode, skip navigation processing and let yolomedia take over the frame
+                if orchestrator and not yolomedia_running and bgr is not None:
+                    current_state = orchestrator.get_state()
+                    
+                    # Item-search mode: skip frame processing and wait for yolomedia to send processed frames
+                    if current_state == "ITEM_SEARCH":
+                        # In item-search mode, if yolomedia has not yet started sending frames, show the raw frame
+                        if not yolomedia_sending_frames and camera_viewers:
+                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
+                            if ok:
+                                await _send_to_viewers(camera_viewers, jpeg_data)
+                        continue  # skip subsequent navigation processing
+                    
+                    out_img = bgr
+                    try:
+                        # Check whether we are in traffic-light detection mode
+                        if current_state == "TRAFFIC_LIGHT_DETECTION":
+                            # Was: "process directly in the main thread to avoid
+                            # dropped frames" — but a synchronous inference call here
+                            # blocks the whole asyncio loop, which stops ws.receive(),
+                            # closes the ESP32's TCP window, and causes the 10s
+                            # NetworkClient::write() stalls (and Gemini keepalive
+                            # timeouts). Offloaded to a thread like the cv2 helpers.
+                            import trafficlight_detection
+                            _loop = asyncio.get_running_loop()
+                            result = await _loop.run_in_executor(
+                                None,
+                                functools.partial(
+                                    trafficlight_detection.process_single_frame,
+                                    bgr,
+                                    ui_broadcast_callback=ui_broadcast_final,
+                                ),
+                            )
+                            out_img = result['vis_image'] if result['vis_image'] is not None else bgr
+                        else:
+                            # Other modes: normal navigation processing.
+                            # orchestrator.process_frame -> blind.process_frame ->
+                            # yolo_model.predict(): a large YOLO-seg model run on EVERY
+                            # frame with no caching, on CPU here ("CUDA not detected").
+                            # That is hundreds of ms to seconds of fully synchronous
+                            # work; running it inline froze the event loop. Offload it.
+                            _loop = asyncio.get_running_loop()
+                            res = await _loop.run_in_executor(None, orchestrator.process_frame, bgr)
 
-            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
-                break
+                            # Voice guidance (throttled internally)
+                            # Note: during omni dialogue the mode is CHAT, so no navigation voice is generated
+                            if res.guidance_text:
+                                try:
+                                    # Play voice first, then broadcast to UI
+                                    play_voice_text(res.guidance_text)
+                                    await ui_broadcast_final(f"[NAV] {res.guidance_text}")
+                                except Exception:
+                                    pass
+
+                            # Output image
+                            out_img = res.annotated_image if res.annotated_image is not None else bgr
+                    except Exception as e:
+                        if frame_counter % 100 == 0:
+                            print(f"[NAV MASTER] Error processing frame: {e}")
+
+                    # Broadcast the image
+                    if camera_viewers and out_img is not None:
+                        ok, jpeg_data = await _cv2_imencode_async(out_img, JPEG_QUALITY)
+                        if ok:
+                            await _send_to_viewers(camera_viewers, jpeg_data)
+                    # Handed off to state machine; proceed to next frame
+                    continue
+
+                # [Fallback] Item-search is occupying the frame or decoding failed; fall back to the raw frame
+                if not yolomedia_sending_frames and camera_viewers:
+                    try:
+                        if bgr is None:
+                            bgr = await _cv2_imdecode_async(data)
+                        if bgr is not None:
+                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
+                            if ok:
+                                await _send_to_viewers(camera_viewers, jpeg_data)
+                    except Exception as e:
+                        print(f"[CAMERA] Broadcast error: {e}")
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[CAMERA ERROR] {e}")
     finally:
-        processor_task.cancel()
+        # The reader owns ws.receive(); shut it down before closing the socket.
+        reader_task.cancel()
         try:
-            await processor_task
+            await reader_task
         except (asyncio.CancelledError, Exception):
             pass
         try:
@@ -1375,6 +2448,8 @@ async def ws_camera_esp(ws: WebSocket):
         if orchestrator:
             orchestrator.reset()
             if DEBUG: print("[NAV MASTER] Master reset")
+
+
 
 # ---------- WebSocket: browser subscribes to camera frames ----------
 @app.websocket("/ws/viewer")
@@ -1415,14 +2490,7 @@ async def ws_thermal_esp(ws: WebSocket):
                         print(f"[THERMAL] received {thermal_frame_count} frames "
                               f"({len(data)} bytes), forwarding to {len(camera_viewers)} viewer(s)",
                               flush=True)
-                    dead = []
-                    for viewer_ws in list(camera_viewers):
-                        try:
-                            await viewer_ws.send_bytes(data)
-                        except Exception:
-                            dead.append(viewer_ws)
-                    for d in dead:
-                        camera_viewers.discard(d)
+                    await _send_to_viewers(camera_viewers, data)
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -1623,6 +2691,19 @@ class UDPProto(asyncio.DatagramProtocol):
 
 
 
+@app.on_event("startup")
+async def startup_gemini():
+    if AI_BACKEND == "gemini_live":
+        await gemini_live.connect(response_modality="AUDIO")
+
+    # gemini_regular/qwen don't touch Gemini Live at all — they use local
+    # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
+
+        
+
+
+
+
 # === New: register a send callback for bridge_io (broadcast JPEG to /ws/viewer) ===
 @app.on_event("startup")
 async def on_startup_register_bridge_sender():
@@ -1643,19 +2724,11 @@ async def on_startup_register_bridge_sender():
                 if DEBUG: print("[YOLOMEDIA] Starting to send processed frames", flush=True)
             
             async def _broadcast():
-                if not camera_viewers:
-                    return
-                dead = []
-                for ws in list(camera_viewers):
-                    try:
-                        await ws.send_bytes(jpeg_bytes)
-                    except Exception as e:
-                        dead.append(ws)
-                for ws in dead:
-                    try:
-                        camera_viewers.remove(ws)
-                    except Exception:
-                        pass
+                # Was a bare `await ws.send_bytes(...)` per viewer with no timeout —
+                # the same unbounded-send bug fixed elsewhere, missed here. This
+                # runs on the main loop via run_coroutine_threadsafe, so a slow
+                # viewer would block the loop exactly like the /ws/camera path did.
+                await _send_to_viewers(camera_viewers, jpeg_bytes)
             
             # Use the saved main-thread event loop
             future = asyncio.run_coroutine_threadsafe(_broadcast(), main_loop)
@@ -1684,6 +2757,17 @@ async def on_startup():
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
     print("[OK] Server running on port 8081")
+
+@app.on_event("startup")
+async def on_startup_watchdog():
+    faulthandler.enable()  # also gives native tracebacks on hard crashes
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    loop.slow_callback_duration = 0.2  # asyncio's own "Executing X took Ns" log
+    asyncio.create_task(_loop_heartbeat_task())
+    threading.Thread(target=_loop_watchdog, daemon=True).start()
+    print("[WATCHDOG] event-loop watchdog armed (200ms threshold)", flush=True)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():

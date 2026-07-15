@@ -1,8 +1,20 @@
-// ===== all_in_one_merged.ino — XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (ICM42688 SPI) =====
+// ===== all_in_one_merged.ino — XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (MPU-6050 I2C) =====
 
+
+// ---- Choose network type: set to 1 for campus (WPA2-Enterprise), 0 for home ----
+#define USE_ENTERPRISE_WIFI 0
 
 #include <WiFi.h>
 #include <esp_wifi.h>
+// WPA2-Enterprise headers — API differs between ESP32 Arduino core 3.x and 2.x
+#if USE_ENTERPRISE_WIFI
+  #include "esp_idf_version.h"
+  #if ESP_IDF_VERSION_MAJOR >= 5
+    #include "esp_eap_client.h"     // core 3.x
+  #else
+    #include "esp_wpa2.h"           // core 2.x
+  #endif
+#endif
 #include <esp_camera.h>
 #include <ArduinoWebsockets.h>
 #include "ESP_I2S.h"
@@ -16,13 +28,25 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PRST";
-const char* WIFI_PASS   = "phone12345";
-const char* SERVER_HOST = "192.168.2.3";
+// Network type is selected by USE_ENTERPRISE_WIFI at the top of this file
+// (1 = campus WPA2-Enterprise, 0 = home/hotspot).
+
+// Home / hotspot (simple password) — used when USE_ENTERPRISE_WIFI = 0
+const char* WIFI_SSID   = "PromisingGuys";
+const char* WIFI_PASS   = "aloekanal2026";
+
+// Campus WPA2-Enterprise (BMCC / eduroam) — used when USE_ENTERPRISE_WIFI = 1
+const char* ENT_SSID     = "eduroam";                       // or BMCC network name
+const char* EAP_IDENTITY = "your_login@login.cuny.edu";     // your student login
+const char* EAP_USERNAME = "your_login@login.cuny.edu";     // usually same as identity
+const char* EAP_PASSWORD = "your_password";                 // your student password
+
+const char* SERVER_HOST = "192.168.12.143";
 const uint16_t SERVER_PORT = 8081;
 
-static const char* CAM_WS_PATH = "/ws/camera";
-static const char* AUD_WS_PATH = "/ws_audio";
+static const char* CAM_WS_PATH     = "/ws/camera";
+static const char* AUD_WS_PATH     = "/ws_audio";
+static const char* THERMAL_WS_PATH = "/ws/thermal";
 
 // ===== Camera config =====
 #define CAMERA_MODEL_XIAO_ESP32S3
@@ -30,7 +54,10 @@ static const char* AUD_WS_PATH = "/ws_audio";
 
 framesize_t g_frame_size = FRAMESIZE_VGA;
 #define JPEG_QUALITY  17
-#define FB_COUNT      2
+// 3 buffers, not 2. qFrames holds 3 pointers but FB_COUNT capped real in-flight
+// capacity at 2, so one buffer held by a blocking send + one filling = capture
+// starts failing (the fail=2 in [CAM-CAP]). PSRAM is 8MB; a VGA JPEG is ~10-20KB.
+#define FB_COUNT      3
 volatile int g_target_fps = 0;
 
 
@@ -59,16 +86,34 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.2.3";
+const char* UDP_HOST  = "192.168.12.143";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
 
+// ===== Thermal (MLX90640 over I2C, shares bus with IMU) =====
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
+
+#define THERMAL_ADDR       0x33
+#define THERMAL_EMISSIVITY 0.95
+#define THERMAL_TA_SHIFT   8
+
+paramsMLX90640 mlx90640;
+static float thermalPixels[32 * 24];
+bool thermalReady = false;
+
+// Guards every Wire transaction — IMU (taskImuLoop) and thermal (taskThermalLoop)
+// share the same I2C bus and must never talk to it at the same time.
+SemaphoreHandle_t i2cMutex;
+
 // ===== WS / Queues / I2S =====
 WebsocketsClient wsCam;
 WebsocketsClient wsAud;
+WebsocketsClient wsThermal;
 volatile bool cam_ws_ready = false;
 volatile bool aud_ws_ready = false;
+volatile bool thermal_ws_ready = false;
 volatile bool snapshot_in_progress = false; // Pause live capture during a high-res snapshot
 
 typedef camera_fb_t* fb_ptr_t;
@@ -139,8 +184,8 @@ bool init_camera() {
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_aec2(s, 1);            // extended AEC: allows longer integration in low light
-    s->set_ae_level(s, 2);        // bias AE brighter (-2..+2); counters bright-lamp-in-frame metering
-    // s->set_aec_value(s, 40);   // manual exposure only applies when AE is off (SET:AEC=<v> via UI)
+    // s->set_ae_level(s, 2);        // bias AE brighter (-2..+2); counters bright-lamp-in-frame metering
+    s->set_aec_value(s, 40);   // manual exposure only applies when AE is off (SET:AEC=<v> via UI)
   }
   return true;
 }
@@ -156,7 +201,14 @@ inline void enqueue_frame(camera_fb_t* fb) {
         frame_dropped_count++;  
       }
     }
-    xQueueSend(qFrames, &fb, 0);
+    // Retry after freeing a slot. Check the result: if this somehow also fails,
+    // fb would leak (obtained but never returned), permanently shrinking the
+    // FB_COUNT pool. Not reachable in practice (we just freed a slot and we're
+    // the only producer), but with only 2 buffers a single leak is fatal.
+    if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
+      esp_camera_fb_return(fb);
+      frame_dropped_count++;
+    }
   }
 }
 
@@ -203,7 +255,9 @@ void taskCamSend(void*) {
   unsigned long last_log = 0;
   unsigned long send_timeout_count = 0;
   unsigned long last_sent_time = 0;
-  
+  unsigned long consec_fail_count = 0;
+  const unsigned long MAX_CONSEC_FAILS = 5;  // tolerate transient send failures before tearing down the socket
+
   for(;;){
     fb_ptr_t fb = nullptr;
     if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
@@ -224,17 +278,23 @@ void taskCamSend(void*) {
         if (ok) {
           frame_sent_count++;
           last_sent_time = millis();
-          
+          consec_fail_count = 0;
 
           if (send_time > 100) {
             Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
           }
         } else {
           ws_send_fail_count++;
-          Serial.println("[CAM-SEND] ERROR: WebSocket send failed, closing...");
+          consec_fail_count++;
           esp_camera_fb_return(fb);
-          wsCam.close(); 
-          cam_ws_ready = false;
+          if (consec_fail_count >= MAX_CONSEC_FAILS) {
+            Serial.printf("[CAM-SEND] ERROR: %lu consecutive send failures, closing...\n", consec_fail_count);
+            wsCam.close();
+            cam_ws_ready = false;
+            consec_fail_count = 0;
+          } else {
+            Serial.printf("[CAM-SEND] WARNING: send failed (%lu/%lu), dropping frame\n", consec_fail_count, MAX_CONSEC_FAILS);
+          }
           continue;
         }
         
@@ -274,8 +334,34 @@ void init_i2s_in(){
   Serial.println("[I2S IN] PDM RX @16kHz 16bit MONO ready");
 }
 
+// void taskMicCapture(void*){
+//   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
+//   for(;;){
+//     if (run_audio_stream && aud_ws_ready) {
+//       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
+//       int16_t* out = reinterpret_cast<int16_t*>(ch.data);
+//       int i = 0;
+//       while (i < samples_per_chunk){
+//         int v = i2sIn.read();
+//         if (v == -1) { delay(1); continue; }
+//         out[i++] = (int16_t)v;
+//       }
+//       if (xQueueSend(qAudio, &ch, 0) != pdPASS){
+//         AudioChunk dump;
+//         xQueueReceive(qAudio, &dump, 0);
+//         xQueueSend(qAudio, &ch, 0);
+//       }
+//     } else {
+//       vTaskDelay(pdMS_TO_TICKS(5));
+//     }
+//   }
+// }
+
+
 void taskMicCapture(void*){
   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
+  unsigned long last_log = 0;
+  unsigned long chunks_captured = 0;
   for(;;){
     if (run_audio_stream && aud_ws_ready) {
       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
@@ -286,6 +372,7 @@ void taskMicCapture(void*){
         if (v == -1) { delay(1); continue; }
         out[i++] = (int16_t)v;
       }
+      chunks_captured++;
       if (xQueueSend(qAudio, &ch, 0) != pdPASS){
         AudioChunk dump;
         xQueueReceive(qAudio, &dump, 0);
@@ -294,21 +381,61 @@ void taskMicCapture(void*){
     } else {
       vTaskDelay(pdMS_TO_TICKS(5));
     }
+
+    // Was: Serial.println("MIC CAPTURING"/"MIC NOT CAPTURING") on every
+    // iteration — up to 200x/sec while idle, 50x/sec while streaming.
+    // Serial.print holds a mutex shared across cores/tasks on ESP32-Arduino,
+    // so that much traffic can starve other tasks (including loop(), which
+    // handles wsAud reconnects) — log a summary every 5s instead.
+    unsigned long now = millis();
+    if (now - last_log > 5000) {
+      Serial.printf("[MIC-CAP] streaming=%d, chunks_captured=%lu\n",
+                    (run_audio_stream && aud_ws_ready) ? 1 : 0, chunks_captured);
+      last_log = now;
+      chunks_captured = 0;
+    }
   }
 }
+
+// void taskMicUpload(void*){
+//   for(;;){
+//     if (run_audio_stream && aud_ws_ready){
+//       AudioChunk ch;
+//       if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
+//         wsAud.sendBinary((const char*)ch.data, ch.n);
+//       }
+//     } else {
+//       vTaskDelay(pdMS_TO_TICKS(10));
+//     }
+//   }
+// }
+
 
 void taskMicUpload(void*){
   for(;;){
     if (run_audio_stream && aud_ws_ready){
       AudioChunk ch;
       if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
-        wsAud.sendBinary((const char*)ch.data, ch.n);
+        bool ok = wsAud.sendBinary((const char*)ch.data, ch.n);
+        if (!ok) {
+          // Was previously unchecked — a failed send here just silently
+          // dropped audio with no signal to reconnect, unlike taskCamSend.
+          // Close explicitly so loop() sees !wsAud.available() and
+          // reconnects deliberately instead of the stale-socket flapping
+          // (a new connection opening before the old one's close is
+          // noticed server-side, seen as back-to-back CONNECTED logs with
+          // no DISCONNECTED in between on the server).
+          Serial.println("[MIC-UPL] ERROR: WebSocket send failed, closing...");
+          wsAud.close();
+          aud_ws_ready = false;
+        }
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
 }
+
 
 // ====================================================================
 // Speaker (I2S TX) + HTTP /stream.wav (chunked-safe)
@@ -742,7 +869,10 @@ inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
 // No third-party library — avoids the sensor_t typedef collision with
 // esp_camera.h that Adafruit_Sensor.h causes.
 
-#define MPU_ADDR          0x68  // I2C address when ADO=LOW (GY-521 default)
+// IMU is an MPU-6050. Confirmed by WHO_AM_I = 0x68 read from the chip
+// (an ICM42688 would return 0x47). The wiring diagram labelled it ICM42688,
+// but the silicon reports MPU-6050.
+#define MPU_ADDR          0x68  // I2C address when AD0=LOW (GY-521 default)
 #define MPU_REG_WHO_AM_I  0x75  // read-only ID register; MPU-6050 returns 0x68
 #define MPU_REG_PWR_MGMT1 0x6B  // bit6=SLEEP; write 0x00 to wake the chip
 #define MPU_REG_GYRO_CFG  0x1B  // bits[4:3]=FS_SEL; 0x18 → ±2000 dps
@@ -779,17 +909,21 @@ static void mpu_read14(uint8_t* dst) {
 }
 
 bool imu_init_i2c() {
-  Wire.begin(IMU_I2C_SDA, IMU_I2C_SCL);
+  // Wire.begin() happens once in setup(), before this task starts.
   delay(5);
+
+  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) return false;
 
   uint8_t who = mpu_read1(MPU_REG_WHO_AM_I);
   Serial.printf("[IMU] WHO_AM_I=0x%02X (expect 0x68)\n", who);
-  if (who != 0x68) return false;
+  if (who != 0x68) { xSemaphoreGive(i2cMutex); return false; }
 
   mpu_write(MPU_REG_PWR_MGMT1, 0x00);  // clear SLEEP bit — chip starts sampling
   delay(10);
   mpu_write(MPU_REG_GYRO_CFG,  0x18);  // FS_SEL=3  → ±2000 dps
   mpu_write(MPU_REG_ACCEL_CFG, 0x18);  // AFS_SEL=3 → ±16 g
+  xSemaphoreGive(i2cMutex);
+
   Serial.println("[IMU] MPU-6050 init OK (I2C)");
   return true;
 }
@@ -797,7 +931,11 @@ bool imu_init_i2c() {
 bool imu_read_once(float& tempC, float& ax, float& ay, float& az,
                    float& gx,   float& gy, float& gz) {
   uint8_t raw[14];
+  // 250ms: a thermal frame read (834 words) can hold the bus for a while.
+  // Waiting is much better than falsely reporting a read failure.
+  if (!xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(250))) return false;
   mpu_read14(raw);
+  xSemaphoreGive(i2cMutex);
 
   // All values are 16-bit signed big-endian (high byte first).
   auto s16 = [](uint8_t hi, uint8_t lo) -> int16_t {
@@ -830,7 +968,11 @@ void taskImuLoop(void*){
 
     float tempC, ax, ay, az, gx, gy, gz;
     if (!imu_read_once(tempC, ax, ay, az, gx, gy, gz)){
-      inited = false; vTaskDelay(pdMS_TO_TICKS(50)); continue;
+      // A failed read here is almost always just a mutex timeout because the
+      // thermal task is holding the I2C bus (an 834-word frame read is slow).
+      // That is NOT a sensor failure — do not tear down and re-init, just skip
+      // this cycle. Re-initing on every contention event caused an init storm.
+      vTaskDelay(pdMS_TO_TICKS(20)); continue;
     }
 
     if (!ema_inited){ ax_f=ax; ay_f=ay; az_f=az; ema_inited=true; }
@@ -858,6 +1000,89 @@ void taskImuLoop(void*){
 }
 
 // ====================================================================
+// Thermal (MLX90640) — read loop + WebSocket send
+// ====================================================================
+bool initThermal() {
+  Serial.println("[THERMAL] Initializing...");
+  // Wire.begin() already done once in setup() — do not call it here.
+
+  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) return false;
+
+  Wire.beginTransmission(THERMAL_ADDR);
+  if (Wire.endTransmission() != 0) {
+    xSemaphoreGive(i2cMutex);
+    Serial.println("[THERMAL] MLX90640 not found");
+    return false;
+  }
+
+  // static: 832 words = 1664 bytes — too big for the task stack.
+  static uint16_t eeMLX90640[832];
+  if (MLX90640_DumpEE(THERMAL_ADDR, eeMLX90640) != 0) {
+    xSemaphoreGive(i2cMutex);
+    Serial.println("[THERMAL] DumpEE failed");
+    return false;
+  }
+  if (MLX90640_ExtractParameters(eeMLX90640, &mlx90640) != 0) {
+    xSemaphoreGive(i2cMutex);
+    Serial.println("[THERMAL] ExtractParameters failed");
+    return false;
+  }
+  MLX90640_SetChessMode(THERMAL_ADDR);      // required by the real Melexis driver
+  MLX90640_SetRefreshRate(THERMAL_ADDR, 0x05);
+  xSemaphoreGive(i2cMutex);
+
+  Serial.println("[THERMAL] Ready");
+  return true;
+}
+
+void taskThermalLoop(void*) {
+  for (;;) {
+    if (!thermalReady) {
+      thermalReady = initThermal();
+      if (!thermalReady) { vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
+    }
+
+    static uint16_t frame[834];
+    static int consecutive_fails = 0;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(200))) {
+      int status = MLX90640_GetFrameData(THERMAL_ADDR, frame);
+      xSemaphoreGive(i2cMutex);
+      if (status < 0) {
+        // A single bad frame is usually just bus contention with the IMU task.
+        // Only tear down and re-init after several consecutive failures —
+        // re-initing on every hiccup caused an init storm.
+        if (++consecutive_fails >= 5) {
+          Serial.println("[THERMAL] repeated read failures, re-initializing");
+          thermalReady = false;
+          consecutive_fails = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+        continue;
+      }
+      consecutive_fails = 0;   // good frame — reset the counter
+    } else {
+      // Mutex timeout = IMU holds the bus. Not a sensor failure; just skip.
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    float Ta = MLX90640_GetTa(frame, &mlx90640);
+    float tr = Ta - THERMAL_TA_SHIFT;
+    MLX90640_CalculateTo(frame, &mlx90640, THERMAL_EMISSIVITY, tr, thermalPixels);
+
+    if (thermal_ws_ready) {
+      static uint8_t payload[4 + sizeof(thermalPixels)];
+      memcpy(payload, "THRM", 4);
+      memcpy(payload + 4, thermalPixels, sizeof(thermalPixels));
+      bool ok = wsThermal.sendBinary((const char*)payload, sizeof(payload));
+      if (!ok) Serial.println("[THRM-SEND] WebSocket send failed");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Hz — sensor's own refresh rate is ~4 Hz
+  }
+}
+
+// ====================================================================
 // Setup / Loop
 // ====================================================================
 void setup() {
@@ -870,10 +1095,64 @@ void setup() {
   esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
+#if USE_ENTERPRISE_WIFI
+  // ---- WPA2-Enterprise (campus WiFi: BMCC / eduroam) ----
+  #if ESP_IDF_VERSION_MAJOR >= 5
+    // ESP32 Arduino core 3.x API
+    esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+    esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+    esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+    esp_wifi_sta_enterprise_enable();
+  #else
+    // ESP32 Arduino core 2.x API
+    esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+    esp_wifi_sta_wpa2_ent_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+    esp_wifi_sta_wpa2_ent_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+    esp_wifi_sta_wpa2_ent_enable();
+  #endif
+  WiFi.begin(ENT_SSID);   // no password arg for enterprise
+  Serial.print("[WiFi] connecting (enterprise)");
+#else
+  // ---- Simple password (home / hotspot) ----
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] connecting");
-  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+#endif
+
+  int wifi_tries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (++wifi_tries > 60) {   // ~18s timeout
+      Serial.println("\n[WiFi] connect failed, rebooting...");
+      delay(1000);
+      esp_restart();
+    }
+  }
   Serial.println(" OK " + WiFi.localIP().toString());
+
+  // CRITICAL: re-assert power-save OFF *after* association.
+  //
+  // setSleep(false)/esp_wifi_set_ps(WIFI_PS_NONE) are also called before
+  // WiFi.begin() above, but the ESP32 WiFi driver re-enables modem power-save
+  // when the STA actually associates with the AP, silently overriding the
+  // pre-begin() setting. When that happens the radio sleeps between DTIM
+  // beacons and the TX path goes dark for hundreds of ms to seconds — which
+  // NetworkClient::write()'s select() sees as "not writable", burning its
+  // 10 x 1s retries -> the "send took 10011 ms" stalls. This is independent of
+  // anything the server does, which is why server-side fixes never helped.
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  // Verify it actually took, instead of assuming.
+  wifi_ps_type_t ps_mode;
+  if (esp_wifi_get_ps(&ps_mode) == ESP_OK) {
+    Serial.printf("[WiFi] power save after assoc = %d (0=NONE, want 0)\n", (int)ps_mode);
+    if (ps_mode != WIFI_PS_NONE) {
+      Serial.println("[WiFi] WARNING: power save still ON — retrying");
+      esp_wifi_set_ps(WIFI_PS_NONE);
+    }
+  }
+  Serial.printf("[WiFi] RSSI=%d dBm\n", WiFi.RSSI());
 
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
 
@@ -886,10 +1165,23 @@ void setup() {
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
-  xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
-  xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
+  i2cMutex = xSemaphoreCreateMutex();
+  // Bring up the I2C bus once, here, before the IMU/thermal tasks start —
+  // neither task calls Wire.begin() itself, so they never race to init it.
+  Wire.begin(IMU_I2C_SDA, IMU_I2C_SCL);
+  // 400kHz. This was dropped to 100kHz earlier while chasing 0xFF reads, but the
+  // real cause of those was a broken wire (the I2C scanner later found the bus
+  // silent, then fine once re-soldered). Speed matters here: thermal's
+  // GetFrameData reads 832 words while holding i2cMutex — at 100kHz that's a
+  // ~130ms+ hold, which blows past the IMU's mutex timeout and starves it.
+  // At 400kHz the same read is ~4x shorter, so both sensors share the bus.
+  Wire.setClock(400000);
+
+  xTaskCreatePinnedToCore(taskCamCapture,  "cam_cap",  10240, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(taskCamSend,     "cam_snd",   8192, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(taskMicCapture,  "mic_cap",   4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskMicUpload,   "mic_upl",   4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskThermalLoop, "thermal",   8192, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
 
@@ -1028,26 +1320,62 @@ void setup() {
       xQueueSend(qTTS, &ch, 0);  // non-blocking; drop if queue full
     }
   });
+
+  // No onMessage handler — the server's /ws/thermal endpoint only reads
+  // frames from us, it never sends anything back.
+  wsThermal.onEvent([](WebsocketsEvent ev, String){
+    if (ev == WebsocketsEvent::ConnectionOpened) { thermal_ws_ready = true;  Serial.println("[WS-THRM] open"); }
+    if (ev == WebsocketsEvent::ConnectionClosed) { thermal_ws_ready = false; Serial.println("[WS-THRM] closed"); }
+  });
 }
 
 void loop() {
-  if (!wsCam.available()) {
-    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
-      Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
+  static unsigned long last_wifi_check = 0;
+  unsigned long now_wifi = millis();
+  if (now_wifi - last_wifi_check > 1000) {
+    last_wifi_check = now_wifi;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WIFI] Link down, reconnecting...");
+      WiFi.reconnect();
+    }
   }
 
-  if (!wsAud.available()) {
+  // Non-blocking reconnect logic. A failed socket connect must NEVER block the
+  // loop, or wsCam.poll() gets starved and the server drops the camera. Each
+  // socket retries on its own millis() timer instead of delay().
+  static unsigned long last_cam_retry = 0, last_aud_retry = 0, last_thrm_retry = 0;
+  unsigned long now_rc = millis();
+
+  if (!wsCam.available() && now_rc - last_cam_retry > 1000) {
+    last_cam_retry = now_rc;
+    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH))
+      Serial.println("[WS-CAM] connected");
+    else
+      Serial.println("[WS-CAM] retry...");
+  }
+
+  if (!wsAud.available() && now_rc - last_aud_retry > 2000) {
+    last_aud_retry = now_rc;
     if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
       Serial.println("[WS-AUD] connected");
-      delay(50);
       run_audio_stream = true;
       wsAud.send("START");
       startStreamWav();   // /stream.wav (chunked)
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
+    } else {
+      Serial.println("[WS-AUD] retry...");
+    }
+  }
+
+  if (!wsThermal.available() && now_rc - last_thrm_retry > 2000) {
+    last_thrm_retry = now_rc;
+    if (wsThermal.connect(SERVER_HOST, SERVER_PORT, THERMAL_WS_PATH))
+      Serial.println("[WS-THRM] connected");
+    else
+      Serial.println("[WS-THRM] retry...");
   }
 
   wsCam.poll();
   wsAud.poll();
+  wsThermal.poll();
   delay(2);
 }

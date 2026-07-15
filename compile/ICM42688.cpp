@@ -11,6 +11,7 @@ ICM42688::ICM42688(TwoWire &bus, uint8_t address) {
 int ICM42688::begin() {
   uint8_t who_am_i = 0;
   readRegisters(ICM42688_WHO_AM_I, 1, &who_am_i);
+  Serial.printf("[IMU] WHO_AM_I read = 0x%02X (ICM42688 expects 0x47)\n", who_am_i);
   if(who_am_i != ICM42688_DEVICE_ID) {
     return -1; // Wrong device
   }
@@ -77,7 +78,7 @@ void ICM42688::writeRegister(uint8_t reg, uint8_t data) {
 uint8_t ICM42688::readRegister(uint8_t reg) {
   _bus->beginTransmission(_address);
   _bus->write(reg);
-  _bus->endTransmission(false);
+  _bus->endTransmission(true);   // full STOP — matches working I2C scanner
   _bus->requestFrom(_address, (uint8_t)1);
   uint8_t data = _bus->read();
   return data;
@@ -86,7 +87,7 @@ uint8_t ICM42688::readRegister(uint8_t reg) {
 void ICM42688::readRegisters(uint8_t reg, uint8_t count, uint8_t *dest) {
   _bus->beginTransmission(_address);
   _bus->write(reg);
-  _bus->endTransmission(false);
+  _bus->endTransmission(true);   // full STOP — matches working I2C scanner
   _bus->requestFrom(_address, count);
   for(uint8_t i = 0; i < count; i++){
     dest[i] = _bus->read();

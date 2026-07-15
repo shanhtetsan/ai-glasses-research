@@ -11,6 +11,9 @@
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
+  const thermalCanvas = document.getElementById('thermalCanvas');
+  const thermalCtx = thermalCanvas ? thermalCanvas.getContext('2d') : null;
+  const thermalStatus = document.getElementById('thermalStatus');
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -213,6 +216,82 @@
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0;
 
+  function drawThermalFrame(buf){
+    if (!thermalCtx || !thermalCanvas) return;
+
+    const bytes = new Uint8Array(buf);
+    let offset = 0;
+    if (bytes.length >= 4 && bytes[0] === 84 && bytes[1] === 72 && bytes[2] === 82 && bytes[3] === 77) {
+      offset = 4;
+    }
+
+    const payloadBytes = bytes.length - offset;
+    if (payloadBytes !== 768 * 4) return;
+
+    const view = new DataView(buf, offset);
+    const values = new Float32Array(768);
+    for (let i = 0; i < 768; i++) {
+      values[i] = view.getFloat32(i * 4, true);
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (Number.isFinite(v)) {
+        min = Math.min(min, v);
+        max = Math.max(max, v);
+      }
+    }
+
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max === min) {
+      if (thermalStatus) thermalStatus.textContent = 'Thermal: no valid data';
+      return;
+    }
+
+    const width = 32;
+    const height = 24;
+    const imageData = thermalCtx.createImageData(width, height);
+    const out = imageData.data;
+
+    const range = max - min;
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        const srcIndex = row * width + col;
+        const value = values[srcIndex];
+        const t = (value - min) / range;
+        const p = (row * width + col) * 4;
+
+        let r = 0;
+        let g = 0;
+        let b = 255;
+        if (t > 0.5) {
+          const u = (t - 0.5) / 0.5;
+          r = Math.round(255 * u);
+          b = Math.round(255 * (1 - u));
+        } else {
+          const u = t / 0.5;
+          b = Math.round(255 * (1 - u));
+          g = Math.round(255 * u);
+        }
+
+        out[p + 0] = r;
+        out[p + 1] = g;
+        out[p + 2] = b;
+        out[p + 3] = 255;
+      }
+    }
+
+    thermalCanvas.width = width;
+    thermalCanvas.height = height;
+    thermalCtx.putImageData(imageData, 0, 0);
+    thermalCtx.imageSmoothingEnabled = false;
+
+    if (thermalStatus) {
+      thermalStatus.textContent = `Thermal: Min ${min.toFixed(1)}°C · Max ${max.toFixed(1)}°C`;
+    }
+  }
+
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
     if ('createImageBitmap' in window){
@@ -240,10 +319,29 @@
     wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
     setBadge($camStatus, false, 'Camera: connecting…');
     wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Camera: connected');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Camera: disconnected');
-    wsCam.onerror = ()=> setBadge($camStatus, false, 'Camera: error');
-    wsCam.onmessage = (ev)=> drawBlob(ev.data);
+    wsCam.onopen  = ()=> {
+      setBadge($camStatus, true, 'Camera: connected');
+      if (thermalStatus) thermalStatus.textContent = 'Thermal: waiting for stream…';
+    };
+    wsCam.onclose = ()=> {
+      setBadge($camStatus, false, 'Camera: disconnected');
+      if (thermalStatus) thermalStatus.textContent = 'Thermal: disconnected';
+    };
+    wsCam.onerror = ()=> {
+      setBadge($camStatus, false, 'Camera: error');
+      if (thermalStatus) thermalStatus.textContent = 'Thermal: error';
+    };
+    wsCam.onmessage = (ev)=> {
+      const data = ev.data;
+      if (data instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(data);
+        if (bytes.length >= 4 && bytes[0] === 84 && bytes[1] === 72 && bytes[2] === 82 && bytes[3] === 77) {
+          drawThermalFrame(data);
+          return;
+        }
+      }
+      drawBlob(data);
+    };
   }
 
   function connectASR(){
