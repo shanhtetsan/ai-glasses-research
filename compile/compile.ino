@@ -16,9 +16,15 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
+<<<<<<< Updated upstream
 const char* WIFI_SSID   = "YOUR_WIFI_SSID";       // set to your network before flashing
 const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
 const char* SERVER_HOST = "YOUR_SERVER_IP";       // the laptop running app_main.py, same LAN
+=======
+const char* WIFI_SSID   = "IanLeeiPhone";
+const char* WIFI_PASS   = "ianleeiphone1";
+const char* SERVER_HOST = "172.20.10.14";
+>>>>>>> Stashed changes
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -59,8 +65,13 @@ const int TTS_RATE = 16000;
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
+<<<<<<< Updated upstream
 #define IMU_I2C_SCL   6   // D5
 const char* UDP_HOST  = "YOUR_SERVER_IP";  // same as SERVER_HOST
+=======
+#define IMU_I2C_SCL   6   // D5=
+const char* UDP_HOST  = "172.20.10.14";
+>>>>>>> Stashed changes
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
