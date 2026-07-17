@@ -159,6 +159,9 @@ from asr_core import (
 )
 from audio_player import initialize_audio_system, play_voice_text
 
+from gemini_live_client import GeminiLiveClient
+gemini_live = GeminiLiveClient()
+
 def _has_hotword(text: str) -> bool:
     """Return True if text contains any interrupt keyword (mirrors ASRCallback logic)."""
     t = _normalize_cn(text)
