@@ -307,7 +307,9 @@ async def _on_turn_complete():
 
     if user_text:
         async with interrupt_lock:
-            await try_dispatch_command(user_text)
+            # gemini_live already spoke the reply live over audio; this call
+            # is only for side effects (nav start/stop, item search, etc.)
+            await start_ai_with_text_custom(user_text)
 
     omni_conversation_active = False
     if orchestrator and omni_previous_nav_state:
@@ -1267,7 +1269,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
                     await full_system_reset("Hotword interrupt")
             elif not is_playing_now():
                 async with interrupt_lock:
-                    handled = await try_dispatch_command(text)
+                    handled = await start_ai_with_text_custom(text)
                     if not handled:
                         await run_backend_turn(text)
     except Exception as e:
