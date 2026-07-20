@@ -577,6 +577,8 @@ async def run_backend_turn(user_text: str, speech_end_ts: Optional[float] = None
     if last_frames:
         try:
             _, jpeg_bytes = last_frames[-1]
+            if ENABLE_LOWLIGHT_ENHANCE:
+                jpeg_bytes = await _enhance_lowlight_jpeg_async(jpeg_bytes)
             img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
             content_list.append({
                 "type": "image_url",
@@ -1579,6 +1581,79 @@ async def _cv2_imencode_async(img, quality: int):
             return (False, None)
     return await loop.run_in_executor(None, _encode)
 
+# ---- Low-light enhancement for the Gemini-bound frame only ----
+# Off by default risk: set False at any time to fall back to the exact
+# behavior you have today (raw ESP32 JPEG bytes sent straight to Gemini).
+# Only ever applied to the throttled ~2fps frame already destined for
+# gemini_live.send_image() — never touches the navigation/YOLO path or the
+# browser viewer stream, so it cannot affect anything else in the app.
+ENABLE_LOWLIGHT_ENHANCE = False
+
+# CLAHE object is expensive-ish to construct; reuse one instance.
+_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+
+def _enhance_lowlight_bgr(bgr) -> "np.ndarray":
+    """CLAHE (adaptive local contrast) on the luminance channel + a gentle
+    gamma lift. Cheap (a few ms on a typical frame size) and safe to run
+    synchronously inside the executor thread alongside decode/encode."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = _clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # Gentle gamma lift (<1.0 brightens) — skip if the frame is already bright
+    # enough that lifting it would just wash out highlights.
+    mean_l = float(np.mean(l))
+    if mean_l < 110:
+        gamma = 0.75
+        inv_gamma = 1.0 / gamma
+        table = (np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)])
+                 .astype("uint8"))
+        out = cv2.LUT(out, table)
+
+    return out
+
+async def _enhance_lowlight_jpeg_async(data: bytes, quality: int = 85) -> bytes:
+    """Decode -> enhance -> re-encode a JPEG, off the event loop.
+    Returns the original bytes unchanged on any failure (never raises)."""
+    loop = asyncio.get_running_loop()
+    def _run():
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return data
+            enhanced = _enhance_lowlight_bgr(bgr)
+            ok, enc = cv2.imencode(".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            return enc.tobytes() if ok else data
+        except Exception as e:
+            print(f"[LOWLIGHT] enhance failed, using raw frame: {e}", flush=True)
+            return data
+    return await loop.run_in_executor(None, _run)
+
+async def _encode_for_viewer_async(bgr, quality: int):
+    """Same job as _cv2_imencode_async, but applies the low-light enhancement
+    first when ENABLE_LOWLIGHT_ENHANCE is on. Used for every frame sent to
+    /ws/viewer (the browser UI) so you can visually A/B it, same flag that
+    gates the Gemini-bound frame. Falls back to encoding the unmodified
+    frame if enhancement raises for any reason."""
+    loop = asyncio.get_running_loop()
+    def _run():
+        img = bgr
+        if ENABLE_LOWLIGHT_ENHANCE:
+            try:
+                img = _enhance_lowlight_bgr(bgr)
+            except Exception as e:
+                print(f"[LOWLIGHT] viewer enhance failed, using raw frame: {e}", flush=True)
+                img = bgr
+        try:
+            ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            return (ok, enc.tobytes() if ok else None)
+        except Exception:
+            return (False, None)
+    return await loop.run_in_executor(None, _run)
+
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
@@ -1646,7 +1721,10 @@ async def ws_camera_esp(ws: WebSocket):
                 # camera framerate and this avoids saturating the session.
                 if mic_streaming and frame_counter % 15 == 0:
                     try:
-                        await gemini_live.send_image(data)
+                        send_data = data
+                        if ENABLE_LOWLIGHT_ENHANCE:
+                            send_data = await _enhance_lowlight_jpeg_async(data)
+                        await gemini_live.send_image(send_data)
                     except Exception as e:
                         print(f"[Gemini Live] send_image failed: {e}", flush=True)
 
@@ -1667,7 +1745,7 @@ async def ws_camera_esp(ws: WebSocket):
                     if current_state == "ITEM_SEARCH":
                         # In item-search mode, if yolomedia has not yet started sending frames, show the raw frame
                         if not yolomedia_sending_frames and camera_viewers:
-                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
+                            ok, jpeg_data = await _encode_for_viewer_async(bgr, JPEG_QUALITY)
                             if ok:
                                 dead = []
                                 for viewer_ws in list(camera_viewers):
@@ -1709,7 +1787,7 @@ async def ws_camera_esp(ws: WebSocket):
 
                     # Broadcast the image
                     if camera_viewers and out_img is not None:
-                        ok, jpeg_data = await _cv2_imencode_async(out_img, JPEG_QUALITY)
+                        ok, jpeg_data = await _encode_for_viewer_async(out_img, JPEG_QUALITY)
                         if ok:
                             dead = []
                             for viewer_ws in list(camera_viewers):
@@ -1728,7 +1806,7 @@ async def ws_camera_esp(ws: WebSocket):
                         if bgr is None:
                             bgr = await _cv2_imdecode_async(data)
                         if bgr is not None:
-                            ok, jpeg_data = await _cv2_imencode_async(bgr, JPEG_QUALITY)
+                            ok, jpeg_data = await _encode_for_viewer_async(bgr, JPEG_QUALITY)
                             if ok:
                                 dead = []
                                 for viewer_ws in list(camera_viewers):

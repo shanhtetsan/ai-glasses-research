@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "Verizon_3FVRM7";
-const char* WIFI_PASS   = "excess6-fed-map";
-const char* SERVER_HOST = "192.168.1.38";
+const char* WIFI_SSID   = "IanLeeiPhone";
+const char* WIFI_PASS   = "ianleeiphone1";
+const char* SERVER_HOST = "172.20.10.9";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -59,7 +59,7 @@ const int TTS_RATE = 16000;
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5=
-const char* UDP_HOST  = "192.168.1.38";
+const char* UDP_HOST  = "172.20.10.9";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -130,15 +130,25 @@ bool init_camera() {
     s->set_hmirror(s, 1);  // ★ Horizontal mirror to match natural left/right (1=on, 0=off)
     s->set_vflip(s, 0);    // ★ Vertical flip; set to 1 if lens is mounted upside-down
 
+    // s->set_brightness(s, 0);
+    // s->set_contrast(s, 1);
+    // s->set_saturation(s, 1);
+    // s->set_gain_ctrl(s, 1);
+    // s->set_exposure_ctrl(s, 0);
+    // s->set_whitebal(s, 1);
+    // s->set_awb_gain(s, 1);
+    // s->set_aec2(s, 0);
+    // s->set_aec_value(s, 40); // manual exposure only applies when AE is off (SET:AEC=<v> via UI)
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 1);
     s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 0);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_32X);  // let AGC amplify dark scenes (default cap is 2X)
+    s->set_exposure_ctrl(s, 1);   // auto exposure ON by default (UI can toggle via SET:AE_AUTO)
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_aec2(s, 0);
-    s->set_aec_value(s, 40);
+    s->set_aec2(s, 1);            // extended AEC: allows longer integration in low light
+    s->set_ae_level(s, 2);        // bias AE brighter (-2..+2); counters bright-lamp-in-frame metering
   }
   return true;
 }
