@@ -141,13 +141,18 @@ VAD_MAX_BUFFER_SECONDS = 12
 VAD_MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * VAD_MAX_BUFFER_SECONDS  # 16-bit mono PCM
 
 # ---- Import our modules ----
+import audio_stream                # module import (not just names) so we can
+                                    # assign audio_stream.current_ai_task and
+                                    # have is_playing_now() see the update —
+                                    # `from audio_stream import current_ai_task`
+                                    # would bind a stale local copy instead.
 from audio_stream import (
     register_stream_route,         # mount /stream.wav
     broadcast_pcm16_realtime,      # distribute 16k PCM to all connected clients in real time
     hard_reset_audio,              # master switch for audio + AI playback
     BYTES_PER_20MS_16K,
     is_playing_now,
-    current_ai_task,
+    cancel_current_ai,
 )
 from vision_backend import stream_chat, OmniStreamPiece
 from asr_core import (
@@ -185,6 +190,34 @@ _TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware sid
 _ratecv_state_8k = None
 _ratecv_state_16k = None
 
+def _mark_gemini_playing() -> None:
+    """Make is_playing_now() return True for the duration of the current
+    Gemini Live turn, so ws_audio's mic-mute guard actually engages while
+    Gemini is speaking.
+
+    Idempotent — the turn's first _on_audio call creates the marker task;
+    later chunks in the same turn are no-ops since it's still running.
+    Cleared by cancel_current_ai() in _on_turn_complete (normal end) or by
+    hard_reset_audio() -> cancel_current_ai() in _on_interrupted (barge-in).
+    The 1h sleep is just a safety net in case a turn ever ends without
+    either callback firing — both normal paths clear it well before that.
+    """
+    if audio_stream.current_ai_task is not None and not audio_stream.current_ai_task.done():
+        return
+
+    async def _sentinel():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_sentinel())
+
+    def _clear(t: asyncio.Task) -> None:
+        if audio_stream.current_ai_task is t:
+            audio_stream.current_ai_task = None
+
+    task.add_done_callback(_clear)
+    audio_stream.current_ai_task = task
+
+
 async def _on_audio(pcm24k: bytes):
     """Gemini Live streams 24kHz PCM16 audio deltas.
 
@@ -198,6 +231,8 @@ async def _on_audio(pcm24k: bytes):
     own correctly-rated stream.
     """
     global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+
+    _mark_gemini_playing()
 
     try:
         pcm8k, _ratecv_state_8k = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, _ratecv_state_8k)
@@ -281,6 +316,11 @@ async def _on_turn_complete():
     # New turn next time — don't carry resample state across turn boundaries
     _ratecv_state_8k = None
     _ratecv_state_16k = None
+
+    # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
+    # in _on_audio. (The interrupted/barge-in case is cleared separately, via
+    # hard_reset_audio() -> cancel_current_ai() in _on_interrupted.)
+    await cancel_current_ai()
 
     # Broadcast the user's transcript as a FINAL message first, so it's
     # actually visible/persisted in the UI (previously it only ever went out
