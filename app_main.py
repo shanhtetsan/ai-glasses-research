@@ -1366,6 +1366,17 @@ async def ws_audio(ws: WebSocket):
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
+
+                if AI_BACKEND == "gemini_live":
+                    # Gemini Live owns the mic entirely in this mode — it runs
+                    # its own server-side VAD/turn-detection on the raw stream,
+                    # so the local RMS-VAD/Whisper pipeline below must stay out
+                    # of the way (it would otherwise fire its own transcription
+                    # off the same audio and double-dispatch commands).
+                    if streaming and not is_playing_now():
+                        await gemini_live.send_audio(chunk)
+                    continue
+
                 if streaming and pcm_buffer is not None:
                     # Mute the mic while the AI is speaking. Without this the
                     # glasses' own TTS echoes back into the mic, gets VAD-segmented
