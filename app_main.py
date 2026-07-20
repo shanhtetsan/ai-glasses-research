@@ -1597,6 +1597,30 @@ async def ws_camera_esp(ws: WebSocket):
 
     processor_task = asyncio.create_task(_processor())
 
+    # ---- Gemini Live video feed (separate single-slot pipeline) ---------
+    # Decoupled from the nav _processor above so a slow/degraded Gemini
+    # connection can never add latency to navigation frame processing.
+    # send_image() already has its own 3s timeout (see gemini_live_client.py);
+    # this drop-to-latest holder/event is the "single in-flight slot" that
+    # timeout assumes the caller provides.
+    gemini_frame_holder = {"data": None}
+    gemini_frame_event = asyncio.Event()
+
+    async def _gemini_image_pump():
+        while True:
+            await gemini_frame_event.wait()
+            gemini_frame_event.clear()
+            data = gemini_frame_holder["data"]
+            if data is None:
+                continue
+            try:
+                await gemini_live.send_image(data)
+            except Exception as e:
+                if DEBUG:
+                    print(f"[Gemini Live] send_image failed: {e}")
+
+    gemini_pump_task = asyncio.create_task(_gemini_image_pump()) if AI_BACKEND == "gemini_live" else None
+
     try:
         while True:
             msg = await ws.receive()
@@ -1622,6 +1646,10 @@ async def ws_camera_esp(ws: WebSocket):
                 holder["data"] = data
                 frame_event.set()
 
+                if gemini_pump_task is not None:
+                    gemini_frame_holder["data"] = data
+                    gemini_frame_event.set()
+
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -1634,6 +1662,12 @@ async def ws_camera_esp(ws: WebSocket):
             await processor_task
         except (asyncio.CancelledError, Exception):
             pass
+        if gemini_pump_task is not None:
+            gemini_pump_task.cancel()
+            try:
+                await gemini_pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
