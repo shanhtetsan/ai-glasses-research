@@ -1340,6 +1340,17 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
     global esp32_audio_ws
+    # Evict-and-replace rather than reject: unlike ws_camera_esp, a stale
+    # mic connection blocks the VAD/dispatch pipeline, so a reconnect needs
+    # to fail over immediately instead of waiting on ping-timeout detection
+    # to notice the old one is dead.
+    old_ws = esp32_audio_ws
+    if old_ws is not None:
+        print("[MIC] New connection superseding previous one")
+        try:
+            await old_ws.close(code=1001)
+        except Exception:
+            pass
     esp32_audio_ws = ws
     await ws.accept()
     print("[CONNECTED] Mic (ESP32 audio)")
