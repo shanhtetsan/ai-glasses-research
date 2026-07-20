@@ -2042,9 +2042,15 @@ async def on_shutdown():
     # Stop YOLO media processing
     stop_yolomedia()
 
+    # Stop the Gemini Live session first, so its receive_task can't fire any
+    # more _on_audio/_on_turn_complete callbacks while we tear down audio
+    # state below.
+    if AI_BACKEND == "gemini_live":
+        await gemini_live.disconnect()
+
     # Stop audio and AI tasks
     await hard_reset_audio("shutdown")
-    
+
     print("[SHUTDOWN] Resource cleanup complete")
 
 # app_main.py —— after the existing @app.on_event("startup") in the file, add another startup hook
