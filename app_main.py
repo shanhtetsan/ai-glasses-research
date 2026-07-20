@@ -2029,6 +2029,13 @@ async def on_startup_init_audio():
     threading.Thread(target=_init, daemon=True).start()
 
 @app.on_event("startup")
+async def startup_gemini():
+    if AI_BACKEND == "gemini_live":
+        await gemini_live.connect(response_modality="AUDIO")
+    # gemini_regular/qwen don't touch Gemini Live at all — they use local
+    # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
+
+@app.on_event("startup")
 async def on_startup():
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
