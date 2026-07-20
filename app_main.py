@@ -2074,5 +2074,15 @@ if __name__ == "__main__":
     uvicorn.run(
         app, host="0.0.0.0", port=8081,
         log_level="warning", access_log=False,
-        loop="asyncio", workers=1, reload=False
+        loop="asyncio", workers=1, reload=False,
+        # Stock 20s/20s defaults were too aggressive for the ESP32's WiFi —
+        # confirmed root cause of "1011 keepalive ping timeout" disconnects.
+        # This is a single Config-level setting shared by every websocket
+        # route in this process (mic, camera, thermal, viewer, ui, imu) —
+        # uvicorn has no per-route override. That's fine here: mic and
+        # camera share one physical device, one WiFi radio, and one Arduino
+        # loop() scheduling both sockets, so they have the same jitter
+        # profile anyway.
+        ws_ping_interval=30.0,
+        ws_ping_timeout=60.0,
     )
