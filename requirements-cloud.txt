@@ -34,5 +34,12 @@ google-genai==2.10.0
 opencv-python-headless==4.8.1.78
 numpy==1.24.3
 
+# gemini_client.py (vision_backend.py's default MODEL_BACKEND=gemini path,
+# imported unconditionally by app_main.py regardless of AI_BACKEND unless
+# MODEL_BACKEND is explicitly set to "qwen") decodes base64 image data-URLs
+# via PIL.Image before passing them to generate_content_stream(). No
+# torch/CUDA dependency — safe to include outright rather than guard.
+Pillow==10.1.0
+
 # Environment & Configuration
 python-dotenv==1.0.0
