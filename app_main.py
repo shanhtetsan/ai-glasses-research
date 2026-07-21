@@ -6,13 +6,47 @@ from collections import deque
 from dataclasses import dataclass
 import re
 # Add after other imports:
-from qwen_extractor import extract_english_label
-from navigation_master import NavigationMaster, OrchestratorResult 
-# New: import blind-path navigator
-from workflow_blindpath import BlindPathNavigator
-# New: import cross-street navigator
-from workflow_crossstreet import CrossStreetNavigator
-import torch
+
+# extract_english_label (item-search voice command) needs the `openai`
+# package for its DashScope-compatible client. Not installed in the
+# cloud/gemini_live-only deploy (see requirements-cloud.txt) — degrade to
+# item-search-disabled rather than crash the whole server on import (see
+# the extract_english_label is None guard at its one call site).
+try:
+    from qwen_extractor import extract_english_label
+except ImportError as e:
+    print(f"[ITEM_SEARCH] openai not installed, item-search label extraction disabled: {e}")
+    extract_english_label = None
+
+# Blind-path/cross-street navigation + obstacle detection need torch and
+# ultralytics. navigation_master.py, workflow_blindpath.py,
+# workflow_crossstreet.py, and obstacle_detector_client.py all import torch
+# at their own module level, so importing *any* of them pulls torch in
+# transitively even without the `import torch` below — all four have to be
+# inside this same guard, not just the last three. Not installed in the
+# cloud/gemini_live-only deploy (see requirements-cloud.txt) — degrade to
+# navigation-disabled rather than crash the whole server on import, same
+# pattern as yolomedia below. load_navigation_models() already tolerates
+# these being None.
+try:
+    from navigation_master import NavigationMaster, OrchestratorResult
+    # New: import blind-path navigator
+    from workflow_blindpath import BlindPathNavigator
+    # New: import cross-street navigator
+    from workflow_crossstreet import CrossStreetNavigator
+    from obstacle_detector_client import ObstacleDetectorClient
+    import torch
+    from ultralytics import YOLO
+except ImportError as e:
+    print(f"[NAVIGATION] torch/ultralytics not installed, navigation disabled: {e}")
+    NavigationMaster = None
+    OrchestratorResult = None
+    BlindPathNavigator = None
+    CrossStreetNavigator = None
+    ObstacleDetectorClient = None
+    torch = None
+    YOLO = None
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
@@ -21,14 +55,7 @@ from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
 import numpy as np
-from ultralytics import YOLO
-from obstacle_detector_client import ObstacleDetectorClient
 import general_detector  # prompt-free YOLOE general object detection (lazy-loaded)
-
-import torch
-
-
-import mediapipe as mp
 import bridge_io
 import threading
 # import yolomedia  # must be in the same directory as app_main.py, filename is yolomedia.py
@@ -94,12 +121,20 @@ print("=" * 60)
 # ---- Local Whisper ASR (replaces DashScope) ----
 # ESP32 sends PCM16 at 16 kHz; Whisper expects float32 at 16 kHz — same rate.
 SAMPLE_RATE = 16000
-import whisper as _whisper_lib
 from asr_config import load_whisper_config
 _WHISPER_CFG = load_whisper_config()
-print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
-_whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
-print("[OK] Whisper model ready")
+# openai-whisper imports torch internally, so this needs the same guard as
+# navigation above. _run_whisper_and_dispatch (gemini_regular/qwen's local
+# ASR path — gemini_live doesn't use this at all) already early-returns on
+# `_whisper_model is None`, so no other call site needs touching.
+try:
+    import whisper as _whisper_lib
+    print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
+    _whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
+    print("[OK] Whisper model ready")
+except ImportError as e:
+    print(f"[WHISPER] torch/whisper not installed, local ASR disabled: {e}")
+    _whisper_model = None
 
 # ---- Server-side Voice Activity Detection (VAD) tuning ----
 # The ESP32 streams PCM16 continuously; these constants control when the
@@ -506,6 +541,10 @@ general_detect_active = False       # True while "detect objects" mode is runnin
 def load_navigation_models():
     """Load the models required for blind-path navigation."""
     global yolo_seg_model, obstacle_detector
+
+    if YOLO is None or torch is None:
+        print("[NAVIGATION] torch/ultralytics unavailable — navigation disabled")
+        return
 
     try:
         seg_model_path = os.getenv(
@@ -944,6 +983,10 @@ async def start_ai_with_text_custom(user_text: str):
         # Extract the Chinese item name
         item_cn = match.group(1).strip()
         if item_cn:
+            if extract_english_label is None:
+                if DEBUG: print("[ITEM_SEARCH] extract_english_label unavailable (openai not installed), skipping", flush=True)
+                await ui_broadcast_final("[System] Item search unavailable")
+                return
             # Use local mapping + Qwen to extract the English class label
             label_en, src = extract_english_label(item_cn)
             if DEBUG: print(f"[COMMAND] Finder request: '{item_cn}' -> '{label_en}' (src={src})", flush=True)

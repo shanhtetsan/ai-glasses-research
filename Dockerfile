@@ -1,45 +1,32 @@
-# AI Glass System - Dockerfile
-# 基于 NVIDIA CUDA 的 Python 镜像
+# AI Glass System - Dockerfile (cloud / gemini_live-only deploy)
+# Lightweight image: no CUDA, no torch/ultralytics/mediapipe — navigation
+# features degrade gracefully at startup when those packages are absent
+# (see app_main.py's try/except import guards). For the full local/GPU
+# stack with blind-path + cross-street navigation, install requirements.txt
+# instead.
 
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM python:3.11-slim
 
-# 设置环境变量
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV CUDA_HOME=/usr/local/cuda
-ENV PATH=${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
-# 设置工作目录
 WORKDIR /app
 
-# 安装系统依赖
+# System dependencies: curl for the healthcheck; libgl1/libglib for cv2
+# even in the headless build (some of its codecs still dlopen these).
 RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    python3-dev \
-    portaudio19-dev \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    git \
-    wget \
     curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 升级 pip
 RUN python3 -m pip install --upgrade pip
 
-# 复制 requirements.txt
-COPY requirements.txt .
+# 复制 requirements-cloud.txt
+COPY requirements-cloud.txt .
 
-# 安装 Python 依赖
-RUN pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --index-url https://download.pytorch.org/whl/cu118
-RUN pip install --no-cache-dir -r requirements.txt
+# 安装 Python 依赖 (cloud subset only — see requirements-cloud.txt)
+RUN pip install --no-cache-dir -r requirements-cloud.txt
 
 # 复制应用代码
 COPY . .
@@ -56,4 +43,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 
 # 启动命令
 CMD ["python3", "app_main.py"]
-

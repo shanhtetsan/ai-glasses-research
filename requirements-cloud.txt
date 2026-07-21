@@ -1,0 +1,27 @@
+# AI Glass System - Cloud (gemini_live-only) Dependencies
+# Python 3.9 - 3.11 supported
+#
+# Scoped to what gemini_live's code path actually needs: WS/HTTP server,
+# the Gemini Live SDK, and JPEG encode/decode for the camera pipeline.
+# Deliberately excludes torch/torchvision/ultralytics/mediapipe (blind-path
+# and cross-street navigation, obstacle/general-object detection) and
+# dashscope/openai/pyaudio/pydub/pygame (the old DashScope/local-TTS path) —
+# see app_main.py's try/except import guards for how those degrade to
+# navigation-disabled instead of crashing at startup when absent.
+
+# Core Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets==12.0
+python-multipart==0.0.6
+starlette==0.27.0
+
+# Gemini Live SDK (gemini_live_client.py: `from google import genai`)
+google-genai==2.10.0
+
+# Camera pipeline (JPEG decode/encode) — headless build, no GUI libs
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+
+# Environment & Configuration
+python-dotenv==1.0.0
