@@ -723,14 +723,18 @@ class BlindPathNavigator:
             # Play the selected voice
             if final_guidance_text:
                 try:
+                    # Lazy import: app_main imports this module at startup, before
+                    # AI_BACKEND is defined, so importing at module scope would be
+                    # circular. By call time app_main has finished loading.
+                    from app_main import AI_BACKEND
                     # For combined crosswalk voice: play only the first part to stay real-time
                     if selected_voice.get('source') == 'crosswalk' and ',' in final_guidance_text:
                         voice_parts = split_combined_voice(final_guidance_text)
                         logger.info(f"[Crosswalk voice] combined: {len(voice_parts)} parts, playing only first part")
-                        if voice_parts:
+                        if voice_parts and AI_BACKEND != "gemini_live":
                             play_voice_text(voice_parts[0])
                             logger.info(f"[Voice] priority={selected_voice['priority']}: {voice_parts[0]}")
-                    else:
+                    elif AI_BACKEND != "gemini_live":
                         play_voice_text(final_guidance_text)
                         logger.info(f"[Voice] priority={selected_voice['priority']}: {final_guidance_text}")
                 except Exception as e:

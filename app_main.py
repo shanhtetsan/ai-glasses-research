@@ -813,12 +813,16 @@ async def start_ai_with_text_custom(user_text: str):
         if orchestrator:
             orchestrator.start_crossing()
             if DEBUG: print(f"[CROSS_STREET] Street-crossing mode started, state: {orchestrator.get_state()}")
-            # Play launch voice prompt and broadcast to UI
-            play_voice_text("Street crossing mode activated.")
+            # Play launch voice prompt and broadcast to UI. Local say-based TTS
+            # is only for gemini_regular/qwen — gemini_live speaks via its own
+            # _on_audio path, so firing this too would double-speak.
+            if AI_BACKEND != "gemini_live":
+                play_voice_text("Street crossing mode activated.")
             await ui_broadcast_final("[System] Street-crossing mode started")
         else:
             print("[CROSS_STREET] Warning: navigation master not initialized!")
-            play_voice_text("Failed to start crossing mode, please try again later.")
+            if AI_BACKEND != "gemini_live":
+                play_voice_text("Failed to start crossing mode, please try again later.")
             await ui_broadcast_final("[System] Navigation system not ready")
         return
     
@@ -828,7 +832,8 @@ async def start_ai_with_text_custom(user_text: str):
             orchestrator.stop_navigation()
             if DEBUG: print(f"[CROSS_STREET] Navigation stopped, state: {orchestrator.get_state()}")
             # Play stop voice prompt and broadcast to UI
-            play_voice_text("Navigation stopped.")
+            if AI_BACKEND != "gemini_live":
+                play_voice_text("Navigation stopped.")
             await ui_broadcast_final("[System] Street-crossing mode stopped")
         else:
             await ui_broadcast_final("[System] Navigation system not running")
@@ -1630,7 +1635,8 @@ async def ws_camera_esp(ws: WebSocket):
             # Speak/broadcast navigation guidance from the event loop
             if guidance:
                 try:
-                    play_voice_text(guidance)
+                    if AI_BACKEND != "gemini_live":
+                        play_voice_text(guidance)
                     await ui_broadcast_final(f"[NAV] {guidance}")
                 except Exception:
                     pass
