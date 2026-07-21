@@ -115,23 +115,35 @@ class GeminiLiveClient:
             )
         )
 
-    async def send_image(self, frame):
+        
+   
+    async def send_image(self, image_bytes):
         if not self.connected:
+            print("[Gemini Live] send_image skipped: not connected")
             return
+        
+        # print(f"[Gemini Live] Sending image of {len(image_bytes)} bytes")
 
-        # Bounded even though callers now fire this via create_task: without
-        # a timeout a stalled/degraded Gemini socket can leave this await
-        # pending indefinitely, and a pile of never-finishing tasks would
-        # defeat the caller's "single in-flight slot" backpressure guard.
-        await asyncio.wait_for(
-            self.session.send_realtime_input(
-                video=types.Blob(
-                    data=frame,
-                    mime_type="image/jpeg"
-                )
-            ),
-            timeout=3.0,
-        )
+        try:
+            await asyncio.wait_for(
+                self.session.send_realtime_input(
+                    video = types.Blob(
+                        data = image_bytes,
+                        mime_type = "image/jpeg"
+                    )
+                ),
+                timeout = 3.0,
+            )
+            # print("[Gemini Live] Image sent successfully")
+
+        except Exception as e:
+            print(f"[Gemini Live] send_image failed: {e}")
+            raise 
+
+  
+
+   
+
 
     async def receive_loop(self):
         while self.connected:

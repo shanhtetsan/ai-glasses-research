@@ -361,6 +361,17 @@ async def _on_interrupted():
     """User barged in and cut off Gemini's current response."""
     global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
     print("[Gemini Live] Response interrupted by user", flush=True)
+
+    # Same as _on_turn_complete: tell the firmware the TTS stream is over so
+    # tts_playing clears and the mic un-mutes. Without this, a barge-in left
+    # the ESP32 stuck in TTS mode until the next full turn happened to send
+    # its own TTS:START/TTS:END pair.
+    _ws = esp32_audio_ws
+    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
+        try:
+            await _ws.send_text("TTS:END")
+        except Exception:
+            pass
     _esp32_tts_started = False
     _ratecv_state_8k = None
     _ratecv_state_16k = None

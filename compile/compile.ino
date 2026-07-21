@@ -1054,14 +1054,27 @@ void loop() {
     } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
   }
 
-  if (!wsAud.available()) {
+  // Non-blocking reconnect: wsCam.poll()/wsAud.poll() below must run every
+  // iteration no matter what state the audio socket is in. delay(2000) on
+  // every failed attempt (the old code) stole 2s of every loop() pass for as
+  // long as /ws_audio stayed disconnected, stalling wsCam.poll() right along
+  // with it — that block is exactly the kind of mic dropout/instability this
+  // is meant to fix. A millis() cooldown skips the attempt entirely when it's
+  // not due yet, so a failed audio connection now costs nothing extra on the
+  // other ~999 iterations out of every 1000.
+  static unsigned long last_aud_retry = 0;
+  unsigned long now_aud = millis();
+  if (!wsAud.available() && (now_aud - last_aud_retry >= 2000)) {
+    last_aud_retry = now_aud;
     if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
       Serial.println("[WS-AUD] connected");
       delay(50);
       run_audio_stream = true;
       wsAud.send("START");
       startStreamWav();   // /stream.wav (chunked)
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
+    } else {
+      Serial.println("[WS-AUD] retry in 2s...");
+    }
   }
 
   wsCam.poll();
