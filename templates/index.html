@@ -195,6 +195,20 @@
     .app{grid-template-columns:1fr; height:auto}
     .chat{height:60vh}
   }
+
+  #thermalCanvas{
+    position:absolute; right:20px; bottom:20px;
+    width:260px; height:195px;
+    border-radius:12px; border:1px solid var(--line);
+    background:#000; z-index:40; box-shadow:0 10px 30px rgba(0,0,0,.25);
+  }
+  #thermalInfo{
+    position:absolute; right:20px; bottom:225px;
+    color:var(--text); background:var(--panel); backdrop-filter: blur(8px) saturate(130%);
+    padding:8px 12px; border-radius:10px; font-size:13px; z-index:45;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
+  }
+  #thermalInfo div{margin:2px 0}
 </style>
 </head>
 <body>
@@ -202,7 +216,14 @@
 <div class="app">
   <!-- main stage (left) -->
   <section class="stage">
-    <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+    <div class="canvas-wrap">
+      <canvas id="canvas"></canvas>
+      <canvas id="thermalCanvas"></canvas>
+      <div id="thermalInfo">
+        <div id="thermalMax">Max: --°C</div>
+        <div id="thermalMin">Min: --°C</div>
+      </div>
+    </div>
 
     <!-- top-left: IMU float panel (horizontal) -->
     <div class="imu-float">

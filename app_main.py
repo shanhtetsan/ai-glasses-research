@@ -467,6 +467,7 @@ RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
 camera_viewers: Set[WebSocket] = set()
+thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
@@ -1761,12 +1762,22 @@ async def ws_viewer(ws: WebSocket):
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
-# ---------- WebSocket: ESP32 thermal entry (MLX90640, "THRM" binary) ----------
+def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
+    """Normalize + INFERNO-colorize a 24x32 float32 °C frame, resized to 320x240 BGR."""
+    lo, hi = np.percentile(frame, [5, 95])
+    if hi <= lo:
+        hi = lo + 1e-6
+    normed = np.clip((frame - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    colored = cv2.applyColorMap(normed, cv2.COLORMAP_INFERNO)
+    return cv2.resize(colored, (320, 240), interpolation=cv2.INTER_CUBIC)
+
+# ---------- WebSocket: ESP32 thermal entry ("THRM" + 24x32 float32 binary) ----------
 @app.websocket("/ws/thermal")
 async def ws_thermal_esp(ws: WebSocket):
-    """Dedicated socket for MLX90640 thermal frames — kept separate from the
-    camera socket so the two streams never interfere. Forwards each frame
-    straight to the browser viewers."""
+    """Dedicated socket for thermal sensor frames — kept separate from the
+    camera socket so the two streams never interfere. Colorizes each frame
+    and broadcasts the JPEG + max/min temps to thermal_viewers ONLY — NOT
+    camera_viewers, which is the RGB camera_esp/viewer pair's frame set."""
     await ws.accept()
     print("[CONNECTED] Thermal (ESP32)", flush=True)
     thermal_frame_count = 0
@@ -1775,20 +1786,27 @@ async def ws_thermal_esp(ws: WebSocket):
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
-                if len(data) >= 4 and data[:4] == b"THRM":
+                if len(data) >= 4 and data[:4] == b"THRM" and len(data) - 4 == 3072:
                     thermal_frame_count += 1
                     if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
-                        print(f"[THERMAL] received {thermal_frame_count} frames "
-                              f"({len(data)} bytes), forwarding to {len(camera_viewers)} viewer(s)",
-                              flush=True)
-                    dead = []
-                    for viewer_ws in list(camera_viewers):
-                        try:
-                            await viewer_ws.send_bytes(data)
-                        except Exception:
-                            dead.append(viewer_ws)
-                    for d in dead:
-                        camera_viewers.discard(d)
+                        print(f"[THERMAL] received {thermal_frame_count} frames, "
+                              f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
+
+                    frame = np.frombuffer(data[4:], dtype="<f4").reshape(24, 32)
+                    colorized = _colorize_thermal(frame)
+                    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if ok and thermal_viewers:
+                        jpeg_bytes = enc.tobytes()
+                        stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
+                        dead = []
+                        for viewer_ws in list(thermal_viewers):
+                            try:
+                                await viewer_ws.send_bytes(jpeg_bytes)
+                                await viewer_ws.send_text(stats)
+                            except Exception:
+                                dead.append(viewer_ws)
+                        for d in dead:
+                            thermal_viewers.discard(d)
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -1797,6 +1815,21 @@ async def ws_thermal_esp(ws: WebSocket):
         print(f"[THERMAL ERROR] {e}", flush=True)
     finally:
         print("[DISCONNECTED] Thermal (ESP32)", flush=True)
+
+# ---------- WebSocket: browser subscribes to thermal frames ----------
+@app.websocket("/ws/thermal_viewer")
+async def ws_thermal_viewer(ws: WebSocket):
+    await ws.accept()
+    thermal_viewers.add(ws)
+    print(f"[THERMAL-VIEWER] Browser connected. Total viewers: {len(thermal_viewers)}", flush=True)
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except WebSocketDisconnect:
+        print("[THERMAL-VIEWER] Browser disconnected", flush=True)
+    finally:
+        thermal_viewers.discard(ws)
+        print(f"[THERMAL-VIEWER] Removed. Total viewers: {len(thermal_viewers)}", flush=True)
 
 # ---------- WebSocket: browser subscribes to IMU data ----------
 @app.websocket("/ws")

@@ -11,6 +11,10 @@
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
+  const thermalCanvas = document.getElementById('thermalCanvas');
+  const thermalCtx    = thermalCanvas.getContext('2d');
+  thermalCanvas.width  = 260;
+  thermalCanvas.height = 195;
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -211,7 +215,7 @@
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
-  let wsCam, wsUI, frames = 0, fpsTimer = 0;
+  let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
 
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
@@ -244,6 +248,39 @@
     wsCam.onclose = ()=> setBadge($camStatus, false, 'Camera: disconnected');
     wsCam.onerror = ()=> setBadge($camStatus, false, 'Camera: error');
     wsCam.onmessage = (ev)=> drawBlob(ev.data);
+  }
+
+  function drawThermalBlob(buf){
+    const blob = new Blob([buf], {type:'image/jpeg'});
+    if ('createImageBitmap' in window){
+      createImageBitmap(blob).then(bmp=>{
+        thermalCtx.drawImage(bmp, 0, 0, thermalCanvas.width, thermalCanvas.height);
+      }).catch(()=>{});
+    }else{
+      const img = new Image();
+      img.onload = ()=>{ thermalCtx.drawImage(img,0,0,thermalCanvas.width,thermalCanvas.height); URL.revokeObjectURL(img.src); };
+      img.src = URL.createObjectURL(blob);
+    }
+  }
+
+  function connectThermal(){
+    clearTimeout(thermalReconnectTimer);
+    if (wsThermal) { wsThermal.onclose = null; try{ wsThermal.close(); }catch(e){} }
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    wsThermal = new WebSocket(`${proto}://${location.host}/ws/thermal_viewer`);
+    wsThermal.binaryType = 'arraybuffer';
+    wsThermal.onmessage = (ev)=>{
+      if (typeof ev.data === 'string'){
+        try{
+          const s = JSON.parse(ev.data);
+          document.getElementById('thermalMax').textContent = 'Max: ' + s.max.toFixed(1) + '°C';
+          document.getElementById('thermalMin').textContent = 'Min: ' + s.min.toFixed(1) + '°C';
+        }catch(e){}
+      } else {
+        drawThermalBlob(ev.data);
+      }
+    };
+    wsThermal.onclose = ()=>{ thermalReconnectTimer = setTimeout(connectThermal, 2000); };
   }
 
   function connectASR(){
@@ -302,10 +339,11 @@
     messages.forEach(msg => msg.remove());
     lastTimestamp = 0;
   };
-  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); };
+  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); connectThermal(); };
 
   connectCamera();
   connectASR();
+  connectThermal();
 })();
 
 
