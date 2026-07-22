@@ -2132,10 +2132,35 @@ async def on_startup_init_audio():
     
     threading.Thread(target=_init, daemon=True).start()
 
+def _log_gemini_connect_failure(task: "asyncio.Task") -> None:
+    """Done-callback for the background gemini_live.connect() task below.
+
+    Nothing awaits that task, so an exception in it would otherwise only
+    ever surface as asyncio's generic "Task exception was never retrieved"
+    warning — easy to miss, and exactly the kind of silent failure that
+    made a missing GEMINI_API_KEY hard to diagnose before. This makes it
+    loud instead: the server keeps running (non-blocking startup is the
+    point), but every send_audio/send_image/send_text call will silently
+    no-op until this is fixed and the server restarted, so this needs to
+    be impossible to miss in the logs.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print("=" * 60)
+        print("  [Gemini Live] STARTUP CONNECT FAILED")
+        print(f"  {type(exc).__name__}: {exc}")
+        print("  Server is running, but Gemini Live is NOT connected —")
+        print("  every send_audio/send_image/send_text call will silently")
+        print("  no-op until this is fixed and the server is restarted.")
+        print("=" * 60)
+
 @app.on_event("startup")
 async def startup_gemini():
     if AI_BACKEND == "gemini_live":
-        await gemini_live.connect(response_modality="AUDIO")
+        task = asyncio.create_task(gemini_live.connect(response_modality="AUDIO"))
+        task.add_done_callback(_log_gemini_connect_failure)
     # gemini_regular/qwen don't touch Gemini Live at all — they use local
     # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
 
