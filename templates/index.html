@@ -155,6 +155,9 @@
   /* hidden but kept: calibration/sliders (used by main.js) */
   .hidden-controls{display:none}
 
+  /* mobile-only presentational elements: hidden by default, enabled inside the mobile media query */
+  .mobile-only-ui{display:none}
+
   /* settings panel */
   .settings-toggle{background:transparent;border:1px solid #304057;color:#9fb0c3;font-size:18px;padding:4px 8px;border-radius:8px;cursor:pointer;line-height:1}
   .settings-toggle:hover{background:#1a2332;border-color:#3d5a80}
@@ -164,8 +167,9 @@
   .settings-panel.open{display:block}
   .settings-panel h3{margin:0 0 12px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
   .dev-controls{padding:12px 14px;border-top:1px solid var(--line);background:#0c121a}
-  .dev-controls h3{margin:0 0 10px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-  .dev-controls h3 small{margin-left:8px;font-size:10px;color:#5b6b7a;text-transform:none;letter-spacing:0;font-weight:400}
+  .dev-controls summary{margin:0 0 10px 0;font-size:13px;color:#ffd769;font-weight:600;text-transform:uppercase;letter-spacing:.5px;list-style:none;cursor:default}
+  .dev-controls summary::-webkit-details-marker{display:none}
+  .dev-controls summary small{margin-left:8px;font-size:10px;color:#5b6b7a;text-transform:none;letter-spacing:0;font-weight:400}
   .dev-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
   .dev-label{flex:1;font-size:12px;color:#c8d3de}
   .dev-controls button{font-size:12px;padding:4px 12px;border-radius:6px;cursor:pointer;border:1px solid var(--line)}
@@ -193,7 +197,112 @@
 
   @media (max-width:1100px){
     .app{grid-template-columns:1fr; height:auto}
+    .stage{height:50vh}
     .chat{height:60vh}
+
+    .mobile-only-ui{display:flex}
+
+    /* Camera/ASR badges are combined into the live-status pill on mobile */
+    #camStatus, #asrStatus{display:none}
+
+    /* Focus/Data view toggle, above the camera area */
+    .mobile-view-toggle{justify-content:center; gap:8px; padding:10px 16px 6px}
+    .mvt-btn{
+      background:rgba(18,24,33,.65); border:1px solid #2d3b50; color:var(--muted);
+      font-size:12px; font-weight:600; padding:6px 18px; border-radius:999px; cursor:pointer;
+    }
+    .mvt-btn.active{background:#1f6feb; border-color:#1f6feb; color:#fff}
+
+    /* combined live-status pill: top-left of the camera view */
+    .mobile-status-pill{
+      position:absolute; left:8px; top:8px; z-index:60; align-items:center; gap:6px;
+      background:rgba(10,16,23,.75); backdrop-filter:blur(6px) saturate(140%);
+      border:1px solid rgba(255,255,255,.12); border-radius:999px;
+      padding:5px 10px; font-size:11px; font-weight:600; color:var(--text);
+    }
+    .msp-dot{width:7px; height:7px; border-radius:50%; background:var(--ok); box-shadow:0 0 8px var(--ok); flex:none}
+    .mobile-status-pill.err .msp-dot{background:var(--err); box-shadow:0 0 8px var(--err)}
+
+    /* RGB/Thermal toggle: top-right of the camera view */
+    .mobile-cam-toggle{
+      position:absolute; right:8px; top:8px; z-index:60; gap:2px;
+      background:rgba(10,16,23,.75); backdrop-filter:blur(6px) saturate(140%);
+      border:1px solid rgba(255,255,255,.12); border-radius:999px; padding:3px;
+    }
+    .mct-btn{
+      background:transparent; border:none; color:var(--muted);
+      font-size:11px; font-weight:600; padding:5px 10px; border-radius:999px; cursor:pointer;
+    }
+    .mct-btn.active{background:#1f6feb; color:#fff}
+
+    /* FPS badge mirror: bottom-right of the camera view (RGB mode only) */
+    #mobileFpsBadge{
+      position:absolute; right:8px; bottom:8px; z-index:60;
+      background:rgba(10,16,23,.75); border:1px solid rgba(255,255,255,.12);
+      border-radius:999px; padding:4px 10px; font-size:11px; color:var(--muted);
+    }
+
+    /* RGB/Thermal switching within the same camera area */
+    #thermalCanvas{display:none}
+    #thermalInfo{display:none}
+    body.thermal-active #canvas{display:none}
+    body.thermal-active #thermalCanvas{
+      display:block; position:absolute; inset:0; width:100%; height:100%; z-index:15;
+      border-radius:0; box-shadow:none;
+    }
+    body.thermal-active #thermalInfo{
+      display:block; position:absolute; left:8px; bottom:8px; right:auto; top:auto; z-index:60;
+      background:rgba(10,16,23,.75); border-radius:10px; padding:6px 10px; font-size:11px;
+    }
+    body.thermal-active #mobileFpsBadge{display:none}
+
+    /* IMU float panel -> compact corner chip (Focus view) */
+    body:not(.data-view) .imu-float{
+      position:absolute; left:8px; top:auto; bottom:8px; right:auto;
+      width:120px; padding:6px; border-radius:10px; z-index:55;
+    }
+    body.thermal-active:not(.data-view) .imu-float{bottom:88px}
+    body:not(.data-view) .imu-row{grid-template-columns:1fr}
+    body:not(.data-view) #imu_view{display:none}
+    body:not(.data-view) #imu_hud{
+      height:auto !important; max-height:none !important; overflow:visible !important; padding:4px !important;
+    }
+    body:not(.data-view) #data-panel{
+      position:static !important; min-width:0 !important; width:auto !important;
+      padding:0 !important; font-size:10px !important;
+    }
+    body:not(.data-view) #data-panel > div:nth-child(1),
+    body:not(.data-view) #data-panel > div:nth-child(4),
+    body:not(.data-view) #data-panel > div:nth-child(5){display:none !important}
+    body:not(.data-view) #data-panel > div:nth-child(2){
+      grid-template-columns:1fr !important; gap:2px !important; margin-bottom:2px !important;
+    }
+    body:not(.data-view) #data-panel > div:nth-child(3){margin-bottom:0 !important}
+    body:not(.data-view) #panel-roll,
+    body:not(.data-view) #panel-pitch,
+    body:not(.data-view) #panel-yaw{font-size:13px !important}
+
+    /* Data view: camera shrinks to a strip, IMU expands into a full panel below */
+    body.data-view .stage{display:flex; flex-direction:column; height:auto}
+    body.data-view .canvas-wrap{position:relative; inset:auto; height:140px; width:100%; flex:0 0 auto}
+    body.data-view .imu-float{
+      position:static; width:100%; margin-top:10px; border-radius:12px; padding:12px;
+    }
+    body.data-view #imu_view{display:none}
+    body.data-view #imu_hud{
+      height:auto !important; max-height:none !important; overflow:visible !important; padding:0 !important;
+    }
+    body.data-view #data-panel{position:static !important; min-width:0 !important; width:100% !important; padding:0 !important}
+
+    /* dev controls: collapsed via <details>/<summary> on mobile (both views) */
+    details.dev-controls > summary{cursor:pointer}
+    details.dev-controls > summary::before{content:'▸ '}
+    details.dev-controls[open] > summary::before{content:'▾ '}
+
+    /* settings panel: cap expanded height so it scrolls instead of pushing
+       the rest of the page down. Closed-by-default (display:none) behavior
+       is untouched — this only bounds the .open state's height. */
+    .settings-panel.open{max-height:60vh; overflow-y:auto}
   }
 
   #thermalCanvas{
@@ -214,6 +323,12 @@
 <body>
 
 <div class="app">
+  <!-- mobile-only: Focus/Data view toggle, above the camera area -->
+  <div class="mobile-view-toggle mobile-only-ui" id="mobileViewToggle">
+    <button type="button" class="mvt-btn active" data-view="focus">Focus</button>
+    <button type="button" class="mvt-btn" data-view="data">Data</button>
+  </div>
+
   <!-- main stage (left) -->
   <section class="stage">
     <div class="canvas-wrap">
@@ -223,6 +338,16 @@
         <div id="thermalMax">Max: --°C</div>
         <div id="thermalMin">Min: --°C</div>
       </div>
+
+      <!-- mobile-only: combined live-status pill, RGB/Thermal toggle, FPS mirror -->
+      <div class="mobile-status-pill mobile-only-ui" id="mobileStatusPill">
+        <span class="msp-dot"></span><span id="mspText">live</span>
+      </div>
+      <div class="mobile-cam-toggle mobile-only-ui" id="mobileCamToggle">
+        <button type="button" class="mct-btn active" data-mode="rgb">RGB</button>
+        <button type="button" class="mct-btn" data-mode="thermal">Thermal</button>
+      </div>
+      <div class="mobile-only-ui" id="mobileFpsBadge">FPS: --</div>
     </div>
 
     <!-- top-left: IMU float panel (horizontal) -->
@@ -339,8 +464,8 @@
         <button id="btnApplySettings">Apply</button>
       </div>
     </div>
-    <div class="dev-controls" id="devControls">
-      <h3>Dev Controls <small>click instead of speaking</small></h3>
+    <details class="dev-controls" id="devControls" open>
+      <summary>Dev Controls <small>click instead of speaking</small></summary>
       <div class="dev-row"><span class="dev-label">Object Detection</span>
         <button class="dev-start" onclick="sendCmd('detect objects', this)">Start</button>
         <button class="dev-stop"  onclick="sendCmd('stop detecting objects', this)">Stop</button>
@@ -358,7 +483,7 @@
         <button class="dev-stop"  onclick="sendCmd('stop traffic light', this)">Stop</button>
       </div>
       <span id="devStatus" class="dev-status"></span>
-    </div>
+    </details>
     <div class="chat-list">
       <div class="live">
         <h2>Live ASR (Partial)</h2>
@@ -533,6 +658,88 @@ window.sendCmd = async function(text, btn){
   });
 
   loadSettings();
+})();
+</script>
+
+<!-- mobile-only presentational layer: Focus/Data view, RGB/Thermal toggle, live-status pill, dev-controls collapse.
+     Reuses existing state (badge classes set by main.js, #fps text, thermal/IMU DOM) rather than duplicating logic. -->
+<script>
+(function(){
+  const body = document.body;
+  const MOBILE_MQ = '(max-width:1100px)';
+
+  // ---- Focus / Data view toggle (persisted per device) ----
+  const viewBtns = document.querySelectorAll('.mvt-btn');
+  function applyView(view){
+    body.classList.toggle('data-view', view === 'data');
+    viewBtns.forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    window.dispatchEvent(new Event('resize')); // let main.js re-fit the canvas + IMU renderer
+  }
+  let savedView = 'focus';
+  try { savedView = localStorage.getItem('mobileView') || 'focus'; } catch(e){}
+  applyView(savedView);
+  viewBtns.forEach(b => b.addEventListener('click', ()=>{
+    applyView(b.dataset.view);
+    try { localStorage.setItem('mobileView', b.dataset.view); } catch(e){}
+  }));
+
+  // ---- RGB / Thermal toggle (same camera area) ----
+  const camBtns = document.querySelectorAll('.mct-btn');
+  function applyCamMode(mode){
+    body.classList.toggle('thermal-active', mode === 'thermal');
+    camBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+    window.dispatchEvent(new Event('resize'));
+  }
+  camBtns.forEach(b => b.addEventListener('click', ()=> applyCamMode(b.dataset.mode)));
+  applyCamMode('rgb');
+
+  // ---- combined live-status pill (mirrors #camStatus / #asrStatus classes) ----
+  const pill = document.getElementById('mobileStatusPill');
+  const pillText = document.getElementById('mspText');
+  const camStatus = document.getElementById('camStatus');
+  const asrStatus = document.getElementById('asrStatus');
+  function refreshPill(){
+    if (!pill || !camStatus || !asrStatus) return;
+    const camOk = camStatus.classList.contains('ok');
+    const asrOk = asrStatus.classList.contains('ok');
+    if (camOk && asrOk){
+      pill.classList.remove('err');
+      pillText.textContent = 'live';
+    } else {
+      pill.classList.add('err');
+      const down = [];
+      if (!camOk) down.push('camera');
+      if (!asrOk) down.push('asr');
+      pillText.textContent = 'reconnecting — ' + down.join(', ');
+    }
+  }
+  if (camStatus && asrStatus){
+    new MutationObserver(refreshPill).observe(camStatus, {attributes:true, attributeFilter:['class']});
+    new MutationObserver(refreshPill).observe(asrStatus, {attributes:true, attributeFilter:['class']});
+    refreshPill();
+  }
+
+  // ---- FPS badge mirror (camera-view overlay reads the existing #fps text) ----
+  const fpsSrc = document.getElementById('fps');
+  const fpsMobile = document.getElementById('mobileFpsBadge');
+  if (fpsSrc && fpsMobile){
+    new MutationObserver(()=>{ fpsMobile.textContent = fpsSrc.textContent; })
+      .observe(fpsSrc, {childList:true, characterData:true, subtree:true});
+    fpsMobile.textContent = fpsSrc.textContent;
+  }
+
+  // ---- dev-controls: collapsed by default on mobile, locked open on desktop ----
+  const dc = document.getElementById('devControls');
+  if (dc){
+    if (window.matchMedia(MOBILE_MQ).matches) dc.open = false;
+    const summary = dc.querySelector('summary');
+    if (summary) summary.addEventListener('click', (e)=>{
+      if (!window.matchMedia(MOBILE_MQ).matches) e.preventDefault();
+    });
+    window.addEventListener('resize', ()=>{
+      if (!window.matchMedia(MOBILE_MQ).matches) dc.open = true;
+    });
+  }
 })();
 </script>
 </body>
