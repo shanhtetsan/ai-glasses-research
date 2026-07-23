@@ -149,6 +149,16 @@ except ImportError as e:
 VAD_SILENCE_RMS    = 300
 JPEG_QUALITY       = 80
 
+# CAMERA_ROTATION_DEG — corrects physical camera mounting orientation
+# (0/90/180/270) in software, so a remount doesn't need a firmware change.
+# Applied to every consumer of camera frames: nav/detection, browser
+# broadcast (both via _process_camera_frame_blocking), and Gemini Live
+# vision (via _rotate_jpeg_bytes in the ws_camera_esp gemini pump — that
+# path reads raw ESP32 bytes directly and bypasses
+# _process_camera_frame_blocking, so it needs its own rotation call).
+CAMERA_ROTATION_DEG = 0
+_ROTATE_REENCODE_QUALITY = 90  # re-encode quality for the raw-bytes (Gemini) path; independent of JPEG_QUALITY, which is the browser-broadcast setting
+
 # VAD_SILENCE_MS    — milliseconds of continuous silence (after speech has
 #                     been detected) that trigger auto-transcription.
 #                     700 ms = 35 chunks × 20 ms. Raise for slower speakers;
@@ -223,7 +233,6 @@ _TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware sid
 # so consecutive chunks resample smoothly instead of clicking at boundaries.
 # Reset whenever a new response turn starts (on turn_complete/interrupted).
 _ratecv_state_8k = None
-_ratecv_state_16k = None
 
 def _mark_gemini_playing() -> None:
     """Make is_playing_now() return True for the duration of the current
@@ -256,22 +265,21 @@ def _mark_gemini_playing() -> None:
 async def _on_audio(pcm24k: bytes):
     """Gemini Live streams 24kHz PCM16 audio deltas.
 
-    Two different downstream consumers need two different sample rates:
-      - the ESP32 TTS websocket expects 8kHz (matches its i2s DAC / the old
-        macOS-TTS output rate)
-      - broadcast_pcm16_realtime / the browser's /stream.wav expects 16kHz
-        (see its import comment and BYTES_PER_20MS_16K)
-    Resampling once to 8kHz and reusing that buffer for both was the bug
-    that made browser audio inaudible/garbled — each consumer now gets its
-    own correctly-rated stream.
+    Both downstream consumers — the ESP32 TTS websocket and
+    broadcast_pcm16_realtime (the browser's /stream.wav) — need 8kHz PCM:
+    audio_stream.STREAM_SR is 8000 and its WAV header is generated from that
+    constant, so /stream.wav's declared rate is 8kHz regardless of consumer.
+    A single 24k->8k resample is shared by both; previously this resampled a
+    second time to 16k for the browser path on the mistaken belief that
+    /stream.wav expected 16kHz, which fed 16kHz PCM into an 8kHz-labeled WAV
+    stream and made browser audio play back at roughly double speed.
     """
-    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+    global _esp32_tts_started, _ratecv_state_8k
 
     _mark_gemini_playing()
 
     try:
         pcm8k, _ratecv_state_8k = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, _ratecv_state_8k)
-        pcm16k, _ratecv_state_16k = audioop.ratecv(pcm24k, 2, 1, 24000, 16000, _ratecv_state_16k)
     except Exception as e:
         print(f"[Gemini Live] audio resample failed: {e}", flush=True)
         return
@@ -288,10 +296,11 @@ async def _on_audio(pcm24k: bytes):
             except Exception as e:
                 print(f"[TTS-WS] send failed: {e}", flush=True)
 
-    if pcm16k:
-        # Browser /stream.wav — this is the one that was getting the wrong
-        # sample rate before.
-        await broadcast_pcm16_realtime(pcm16k)
+    if pcm8k:
+        # Browser /stream.wav — shares the same 8kHz PCM as the ESP32 send
+        # above (audio_stream.STREAM_SR is 8000; see this function's
+        # docstring for why a separate 16kHz resample was wrong here).
+        await broadcast_pcm16_realtime(pcm8k)
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
@@ -339,7 +348,7 @@ async def _on_turn_complete():
     Gemini at all while in a restrictive navigation state.
     """
     global _esp32_tts_started, omni_conversation_active, omni_previous_nav_state
-    global _ratecv_state_8k, _ratecv_state_16k
+    global _ratecv_state_8k
 
     _ws = esp32_audio_ws
     if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
@@ -350,7 +359,6 @@ async def _on_turn_complete():
     _esp32_tts_started = False
     # New turn next time — don't carry resample state across turn boundaries
     _ratecv_state_8k = None
-    _ratecv_state_16k = None
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
     # in _on_audio. (The interrupted/barge-in case is cleared separately, via
@@ -394,7 +402,7 @@ async def _on_turn_complete():
 
 async def _on_interrupted():
     """User barged in and cut off Gemini's current response."""
-    global _esp32_tts_started, _ratecv_state_8k, _ratecv_state_16k
+    global _esp32_tts_started, _ratecv_state_8k
     print("[Gemini Live] Response interrupted by user", flush=True)
 
     # Same as _on_turn_complete: tell the firmware the TTS stream is over so
@@ -409,7 +417,6 @@ async def _on_interrupted():
             pass
     _esp32_tts_started = False
     _ratecv_state_8k = None
-    _ratecv_state_16k = None
     await hard_reset_audio("gemini_interrupted")
 
 gemini_live.on_audio = _on_audio
@@ -1233,6 +1240,7 @@ class SettingsPayload(BaseModel):
     vad_silence_rms: Optional[int] = None
     vad_silence_ms: Optional[int] = None
     vad_min_speech_ms: Optional[int] = None
+    camera_rotation_deg: Optional[int] = None
 
 @app.get("/api/settings")
 def get_settings():
@@ -1241,14 +1249,17 @@ def get_settings():
         "vad_silence_rms": VAD_SILENCE_RMS,
         "vad_silence_ms": VAD_SILENCE_MS,
         "vad_min_speech_ms": VAD_MIN_SPEECH_MS,
+        "camera_rotation_deg": CAMERA_ROTATION_DEG,
     })
 
 @app.post("/api/settings")
 def update_settings(payload: SettingsPayload):
     global JPEG_QUALITY, VAD_SILENCE_RMS, VAD_SILENCE_MS, VAD_MIN_SPEECH_MS
-    global VAD_SILENCE_CHUNKS, VAD_MIN_SPEECH_CHUNKS
+    global VAD_SILENCE_CHUNKS, VAD_MIN_SPEECH_CHUNKS, CAMERA_ROTATION_DEG
     if payload.jpeg_quality is not None:
         JPEG_QUALITY = max(1, min(100, payload.jpeg_quality))
+    if payload.camera_rotation_deg is not None and payload.camera_rotation_deg in (0, 90, 180, 270):
+        CAMERA_ROTATION_DEG = payload.camera_rotation_deg
     if payload.vad_silence_rms is not None:
         VAD_SILENCE_RMS = max(50, min(5000, payload.vad_silence_rms))
     if payload.vad_silence_ms is not None:
@@ -1262,6 +1273,7 @@ def update_settings(payload: SettingsPayload):
         "vad_silence_rms": VAD_SILENCE_RMS,
         "vad_silence_ms": VAD_SILENCE_MS,
         "vad_min_speech_ms": VAD_MIN_SPEECH_MS,
+        "camera_rotation_deg": CAMERA_ROTATION_DEG,
     })
 
 class CameraCommand(BaseModel):
@@ -1558,6 +1570,38 @@ async def ws_audio(ws: WebSocket):
             esp32_audio_ws = None
         print("[DISCONNECTED] Mic (ESP32 audio)")
 
+def _apply_camera_rotation(bgr):
+    """Correct physical camera mounting orientation. Single source of truth
+    shared by _process_camera_frame_blocking (nav/detection/browser) and
+    _rotate_jpeg_bytes (Gemini Live vision's raw-bytes path) so both stay in
+    sync if the rotation options ever change.
+    """
+    if CAMERA_ROTATION_DEG == 90:
+        return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+    elif CAMERA_ROTATION_DEG == 180:
+        return cv2.rotate(bgr, cv2.ROTATE_180)
+    elif CAMERA_ROTATION_DEG == 270:
+        return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return bgr
+
+def _rotate_jpeg_bytes(data: bytes) -> bytes:
+    """Decode/rotate/re-encode one raw JPEG frame. For consumers that read
+    ESP32 bytes directly instead of going through _process_camera_frame_blocking
+    — currently just the Gemini Live vision pump (see ws_camera_esp). No-op
+    cost when CAMERA_ROTATION_DEG == 0 is enforced by the caller skipping
+    this function entirely, not by this function itself.
+    """
+    try:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None or bgr.size == 0:
+            return data
+        bgr = _apply_camera_rotation(bgr)
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), _ROTATE_REENCODE_QUALITY])
+        return enc.tobytes() if ok else data
+    except Exception:
+        return data
+
 def _process_camera_frame_blocking(data: bytes):
     """Decode one JPEG frame and run detection/navigation on it.
 
@@ -1570,6 +1614,7 @@ def _process_camera_frame_blocking(data: bytes):
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is None or bgr.size == 0:
             return (None, None)
+        bgr = _apply_camera_rotation(bgr)
     except Exception:
         return (None, None)
 
@@ -1726,6 +1771,13 @@ async def ws_camera_esp(ws: WebSocket):
             if data is None:
                 continue
             try:
+                # This holder is fed the raw ESP32 bytes directly (see the
+                # receive loop below) and never passes through
+                # _process_camera_frame_blocking, so rotation has to be
+                # applied here too — otherwise Gemini vision would see an
+                # unrotated frame while nav/browser see a corrected one.
+                if CAMERA_ROTATION_DEG != 0:
+                    data = await loop.run_in_executor(None, _rotate_jpeg_bytes, data)
                 await gemini_live.send_image(data)
             except Exception as e:
                 if DEBUG:

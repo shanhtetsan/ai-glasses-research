@@ -23,8 +23,8 @@ using namespace websockets;
 #define THERMAL_ENABLED 0
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "IanLeeiPhone";
-const char* WIFI_PASS   = "ianleeiphone1";
+const char* WIFI_SSID   = "PromisingGuys";
+const char* WIFI_PASS   = "aloekanal2026";
 const char* SERVER_HOST = "openaiglasses-for-navigation.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
@@ -229,7 +229,7 @@ typedef struct {
 } AudioChunk;
 QueueHandle_t qAudio;
 
-#define TTS_QUEUE_DEPTH 48
+#define TTS_QUEUE_DEPTH 16
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 volatile bool tts_playing = false;
@@ -854,6 +854,7 @@ void stopStreamWav(){
 // ====================================================================
 void taskTTSPlay(void*){
   static int32_t stereo32Buf[1024*2];
+  static bool first_chunk_pending = true;
   for(;;){
     if (!tts_playing){ vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     TTSChunk ch;
@@ -861,7 +862,12 @@ void taskTTSPlay(void*){
       if (ch.n == 0) {                     // TTS:END sentinel from server
         tts_playing = false;
         run_audio_stream = true;           // playback truly finished — un-mute the mic
+        first_chunk_pending = true;        // next session should log its first chunk again
         continue;
+      }
+      if (first_chunk_pending) {
+        Serial.printf("[TTS-PLAY] chunk n=%u, i2s write starting\n", ch.n);
+        first_chunk_pending = false;
       }
       size_t inSamp  = ch.n / 2;
       int16_t* inPtr = (int16_t*)ch.data;
@@ -1268,27 +1274,41 @@ void setup() {
         xQueueReset(qAudio);        // drop any mic frames already captured
         tts_reset_queue();
         tts_playing = true;
+        Serial.println("[TTS] START received, tts_playing=true");
       } else if (s == "TTS:END") {
-        TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
-        // Ensure the end-sentinel actually lands. If qTTS is briefly full the
-        // sentinel could be dropped, leaving tts_playing stuck true and the mic
-        // muted forever. Retry, then hard-recover if it still won't queue.
-        int tries = 0;
-        while (xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(20)) != pdPASS && tries < 10) {
-          tries++;
-        }
-        if (tries >= 10) {
+        Serial.println("[TTS] END received, sentinel queued");
+        if (!qTTS) {
+          Serial.println("[TTS] qTTS is NULL, cannot send end-sentinel");
           tts_playing = false;      // fallback: force idle so the mic recovers
           run_audio_stream = true;
+        } else {
+          TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
+          // Ensure the end-sentinel actually lands. If qTTS is briefly full the
+          // sentinel could be dropped, leaving tts_playing stuck true and the mic
+          // muted forever. Retry, then hard-recover if it still won't queue.
+          int tries = 0;
+          while (xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(20)) != pdPASS && tries < 10) {
+            tries++;
+          }
+          if (tries >= 10) {
+            tts_playing = false;      // fallback: force idle so the mic recovers
+            run_audio_stream = true;
+          }
         }
       }
     } else if (msg.isBinary()) {
       if (!tts_playing) return;
+      if (!qTTS) {
+        static bool warned = false;
+        if (!warned) { Serial.println("[TTS] qTTS is NULL, dropping TTS audio"); warned = true; }
+        return;
+      }
       TTSChunk ch = {};
       size_t n = min((size_t)msg.length(), sizeof(ch.data));
       ch.n = (uint16_t)n;
       memcpy(ch.data, msg.rawData().c_str(), n);  // rawData() is std::string — safe for null bytes in PCM
-      xQueueSend(qTTS, &ch, 0);  // non-blocking; drop if queue full
+      bool queued_ok = xQueueSend(qTTS, &ch, 0) == pdPASS;  // non-blocking; drop if queue full
+      Serial.printf("[TTS] binary frame: %u bytes, tts_playing=%d, queued=%d\n", (unsigned)n, tts_playing, queued_ok);
     }
   });
 
@@ -1340,13 +1360,6 @@ void setup() {
     delay(50);
     run_audio_stream = true;
     wsAud.send("START");
-    // Give wsAud's just-completed TLS allocation a moment to settle before
-    // starting a third WiFiClientSecure connection (/stream.wav) — starting
-    // it in the same instant as wsCam/wsAud claiming their own TLS buffers
-    // is the worst moment for heap fragmentation and was causing cli.connect()
-    // in taskHttpPlay to fail silently and retry forever.
-    delay(300);
-    startStreamWav();   // /stream.wav (chunked)
   }
 
 #if THERMAL_ENABLED
@@ -1367,6 +1380,16 @@ void setup() {
   qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
+  if (!qTTS) {
+    Serial.println("[FATAL] qTTS allocation failed - insufficient heap, retrying...");
+    delay(200);
+    qTTS = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
+    if (!qTTS) {
+      Serial.println("[FATAL] qTTS allocation failed twice - insufficient heap, reboot...");
+      delay(1500);
+      esp_restart();
+    }
+  }
 
   i2cMutex = xSemaphoreCreateMutex();
   initI2cBus();  // bring up the shared I2C bus once, before the IMU/thermal tasks start
@@ -1437,9 +1460,6 @@ void loop() {
       delay(50);
       run_audio_stream = true;
       wsAud.send("START");
-      // Same TLS-allocation settling delay as the setup() call site above.
-      delay(300);
-      startStreamWav();   // /stream.wav (chunked)
     } else {
       Serial.println("[WS-AUD] retry in 2s...");
     }
