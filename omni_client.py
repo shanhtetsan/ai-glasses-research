@@ -160,31 +160,66 @@ def _build_qwen_messages(
 #     if response_text:
 #         yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
 
+
 async def stream_chat(
     content_list,
     voice="Aoede",
     audio_format="wav",
 ):
-
     image = None
     prompt = ""
 
     for item in content_list:
-
         if item["type"] == "image_url":
-
-            image = _decode_data_url(
-                item["image_url"]["url"]
-            )
-
+            image = _decode_data_url(item["image_url"]["url"])
         elif item["type"] == "text":
-
             prompt += item["text"]
 
     parts = []
-
     if image:
-
         parts.append(image)
-
     parts.append(prompt)
+
+    qwen_content = []
+    pil_images = []
+    if image is not None:
+        pil_images.append(image)
+        qwen_content.append({"type": "image"})
+    qwen_content.append({"type": "text", "text": prompt})
+
+    messages = [{"role": "user", "content": qwen_content}]
+
+    text_prompt = _processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    proc_inputs = _processor(
+        text=text_prompt,
+        images=pil_images if pil_images else None,
+        padding=True,
+        return_tensors="pt",
+    ).to("mps")
+
+    prompt_len = proc_inputs.input_ids.shape[1]
+    loop = asyncio.get_event_loop()
+
+    def _generate() -> str:
+        with torch.no_grad():
+            output_ids = _model.generate(
+                **proc_inputs,
+                thinker_max_new_tokens=256,
+                generation_mode="text",
+            )
+        new_ids = output_ids[0][prompt_len:]
+        return _processor.decode(new_ids, skip_special_tokens=True).strip()
+
+    response_text = await loop.run_in_executor(None, _generate)
+
+    if response_text:
+        yield OmniStreamPiece(text_delta=response_text, audio_b64=None)
+
+
+
+
+
+
