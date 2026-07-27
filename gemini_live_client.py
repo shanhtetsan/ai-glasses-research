@@ -159,14 +159,23 @@ class GeminiLiveClient:
                         if server_content.interrupted:
                             if self.on_interrupted:
                                 await self.on_interrupted()
-                # The `async for` above ended on its own (server closed the
-                # response stream without erroring) — if we're not shutting
-                # down deliberately, treat this the same as a dropped
-                # connection and try to reconnect rather than exiting silently.
-                if not self._shutting_down:
-                    print("[Gemini Live] Response stream ended unexpectedly")
-                    self.connected = False
-                    await self._reconnect_with_backoff()
+                # The `async for` above ended on its own (no exception). This
+                # used to be treated as a dead connection requiring a full
+                # reconnect — but real-world logs showed this firing after
+                # *every single turn*, regardless of how long the session had
+                # been open (34s, then 19s, then 21s — no consistent
+                # duration), always right when a response finished. That
+                # pattern doesn't match a connection dying; it matches
+                # session.receive()'s stream being scoped to one turn at a
+                # time for this session. So: just loop back and call
+                # session.receive() again on the SAME session first — if the
+                # connection really is still alive, this keeps conversation
+                # context intact and skips the reconnect delay entirely. If
+                # the session actually is dead, the next receive() call will
+                # raise, and the except block below handles that properly.
+                if self._shutting_down:
+                    return
+                continue
             except asyncio.CancelledError:
                 print("[Gemini Live] receive loop task cancelled")
                 return
