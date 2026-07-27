@@ -16,9 +16,9 @@ struct WavFmt;
 using namespace websockets;
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "Verizon_3FVRM7";
-const char* WIFI_PASS   = "excess6-fed-map";
-const char* SERVER_HOST = "192.168.1.38";
+const char* WIFI_SSID   = "IanLeeiPhone";
+const char* WIFI_PASS   = "ianleeiphone1";
+const char* SERVER_HOST = "172.20.10.2";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -49,17 +49,24 @@ const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Speaker (I2S TX → MAX98357A) =====
-#define I2S_SPK_BCLK D1
-#define I2S_SPK_LRCK D2
-#define I2S_SPK_DIN  D3
-const int TTS_RATE = 16000;
+#define I2S_SPK_BCLK D7
+#define I2S_SPK_LRCK D8
+#define I2S_SPK_DIN  D9
+// The websocket TTS:START/chunks/TTS:END path (taskTTSPlay, below) never
+// reconfigures i2sOut's sample rate at runtime — unlike the separate HTTP
+// /stream.wav path, which reads the rate out of the incoming WAV header
+// and calls i2sOut.begin() again if it changes. Since app_main.py always
+// sends 8kHz PCM over the websocket TTS path (see pcm8k in _on_audio /
+// _speak_and_broadcast), this boot-time value has to match that, or
+// every response plays back at roughly 2x speed / an octave too high.
+const int TTS_RATE = 8000;
 
 // ===== IMU (MPU-6050 over I2C) / UDP =====
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
 // Change these if you wired the GY-521 to different pins.
 #define IMU_I2C_SDA   5   // D4
 #define IMU_I2C_SCL   6   // D5=
-const char* UDP_HOST  = "192.168.1.38";
+const char* UDP_HOST  = "172.20.10.2";
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -138,7 +145,8 @@ bool init_camera() {
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_aec2(s, 0);
-    s->set_aec_value(s, 40);
+    s->set_aec_value(s, 40); // manual exposure only applies when AE is off (SET:AEC=<v> via UI)
+  
   }
   return true;
 }
@@ -345,7 +353,7 @@ void init_i2s_out(){
     Serial.println("[I2S OUT] init failed");
     while(1){ delay(1000); }
   }
-  Serial.println("[I2S OUT] STD TX @16kHz 32bit STEREO ready");
+  Serial.printf("[I2S OUT] STD TX @%dHz 32bit STEREO ready\n", TTS_RATE);
 }
 
 struct WavFmt {
@@ -1005,6 +1013,10 @@ void setup() {
   });
 
   wsAud.onMessage([](WebsocketsMessage msg){
+    static uint32_t tts_chunks_this_turn = 0;
+    static uint32_t tts_bytes_this_turn = 0;
+    static uint32_t tts_dropped_not_playing = 0;
+
     if (msg.isText()){
       String s = msg.data(); s.trim();
       if (s == "RESTART"){
@@ -1013,17 +1025,30 @@ void setup() {
       } else if (s == "TTS:START") {
         tts_reset_queue();
         tts_playing = true;
+        tts_chunks_this_turn = 0;
+        tts_bytes_this_turn = 0;
+        Serial.println("[TTS] START received");
       } else if (s == "TTS:END") {
         TTSChunk sentinel = {};  // ch.n == 0 tells taskTTSPlay the stream is done
         xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(10));
+        Serial.printf("[TTS] END received — %u chunks, %u bytes this turn (dropped while not playing: %u)\n",
+                      tts_chunks_this_turn, tts_bytes_this_turn, tts_dropped_not_playing);
+        tts_dropped_not_playing = 0;
       }
     } else if (msg.isBinary()) {
-      if (!tts_playing) return;
+      if (!tts_playing) {
+        tts_dropped_not_playing++;
+        return;
+      }
       TTSChunk ch = {};
       size_t n = min((size_t)msg.length(), sizeof(ch.data));
       ch.n = (uint16_t)n;
       memcpy(ch.data, msg.rawData().c_str(), n);  // rawData() is std::string — safe for null bytes in PCM
-      xQueueSend(qTTS, &ch, 0);  // non-blocking; drop if queue full
+      tts_chunks_this_turn++;
+      tts_bytes_this_turn += n;
+      if (xQueueSend(qTTS, &ch, 0) != pdPASS) {  // non-blocking; drop if queue full
+        Serial.println("[TTS] WARNING: qTTS full, dropping chunk");
+      }
     }
   });
 }
@@ -1049,3 +1074,4 @@ void loop() {
   wsAud.poll();
   delay(2);
 }
+
