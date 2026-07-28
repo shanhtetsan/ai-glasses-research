@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, tempfile, wave
+import os, sys, time, json, asyncio, base64, audioop, tempfile, wave, struct
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -279,16 +279,14 @@ async def _on_audio(pcm24k: bytes):
         return
 
     if pcm8k:
-        _ws = esp32_audio_ws
-        if _ws and _ws.client_state == WebSocketState.CONNECTED:
-            try:
-                if not _esp32_tts_started:
-                    await _ws.send_text("TTS:START")
-                    _esp32_tts_started = True
-                for i in range(0, len(pcm8k), _TTS_CHUNK):
-                    await _ws.send_bytes(pcm8k[i:i + _TTS_CHUNK])
-            except Exception as e:
-                print(f"[TTS-WS] send failed: {e}", flush=True)
+        try:
+            if not _esp32_tts_started:
+                await send_control_to_esp32("TTS:START")
+                _esp32_tts_started = True
+            for i in range(0, len(pcm8k), _TTS_CHUNK):
+                await send_framed_to_esp32(FRAME_TYPE_AUDIO, pcm8k[i:i + _TTS_CHUNK])
+        except Exception as e:
+            print(f"[TTS-WS] send failed: {e}", flush=True)
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
@@ -338,10 +336,9 @@ async def _on_turn_complete():
     global _esp32_tts_started, omni_conversation_active, omni_previous_nav_state
     global _ratecv_state_8k
 
-    _ws = esp32_audio_ws
-    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
+    if _esp32_tts_started:
         try:
-            await _ws.send_text("TTS:END")
+            await send_control_to_esp32("TTS:END")
         except Exception:
             pass
     _esp32_tts_started = False
@@ -397,10 +394,9 @@ async def _on_interrupted():
     # tts_playing clears and the mic un-mutes. Without this, a barge-in left
     # the ESP32 stuck in TTS mode until the next full turn happened to send
     # its own TTS:START/TTS:END pair.
-    _ws = esp32_audio_ws
-    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
+    if _esp32_tts_started:
         try:
-            await _ws.send_text("TTS:END")
+            await send_control_to_esp32("TTS:END")
         except Exception:
             pass
     _esp32_tts_started = False
@@ -509,9 +505,82 @@ last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
 camera_viewers: Set[WebSocket] = set()
 thermal_viewers: Set[WebSocket] = set()
-esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
-esp32_audio_ws: Optional[WebSocket] = None
+
+# Single multiplexed ESP32 connection, replacing the old esp32_camera_ws /
+# esp32_audio_ws pair (and the thermal/IMU sockets, which never kept a
+# reference at all since nothing was ever sent back on them). Camera, mic,
+# thermal, IMU, and control traffic (SET:*, TTS:START/END, RESET, ...) all
+# travel over this one connection now — see FRAME_TYPE_* / build_frame() /
+# parse_frame() below and the /ws/multiplex handler.
+esp32_ws: Optional[WebSocket] = None
+
+# ---------------------------------------------------------------------
+# Multiplex framing: [1B Type][2B Seq][2B Length][4B Timestamp][N payload],
+# big-endian. Mirrors compile.ino's sendFramed()/parser exactly — see the
+# comment above wsMain's declaration there for the full rationale,
+# including why Length is treated as an integrity check rather than the
+# thing that determines the payload's end (a WebSocket message is already
+# self-delimiting; Length can never desync a *later* frame the way it
+# would in a raw byte-stream protocol). The 2-byte Length field still caps
+# any single frame's payload at 65535 bytes — camera frames are the one
+# type at real risk of hitting that; see send_framed_to_esp32() below.
+FRAME_TYPE_CAMERA  = 0x01
+FRAME_TYPE_AUDIO   = 0x02
+FRAME_TYPE_THERMAL = 0x03
+FRAME_TYPE_IMU     = 0x04
+FRAME_TYPE_CONTROL = 0x05
+FRAME_HDR_FMT = ">BHHI"  # type, seq, length, timestamp_ms — 9 bytes
+FRAME_HDR_LEN = 9
+FRAME_MAX_PAYLOAD = 0xFFFF
+
+_esp32_frame_seq = 0
+
+def parse_frame(data: bytes) -> Optional[Tuple[int, int, int, int, bytes]]:
+    """Returns (type, seq, declared_len, ts_ms, payload) or None if the
+    message is too short to contain a header. payload is sized from the
+    actual message length, not declared_len — see the framing comment
+    above; declared_len is returned for logging/integrity-check purposes
+    only, the caller should not slice by it."""
+    if len(data) < FRAME_HDR_LEN:
+        return None
+    type_byte, seq, declared_len, ts_ms = struct.unpack(FRAME_HDR_FMT, data[:FRAME_HDR_LEN])
+    payload = data[FRAME_HDR_LEN:]
+    if declared_len != len(payload):
+        print(f"[MUX] type=0x{type_byte:02x} seq={seq}: declared_len={declared_len} "
+              f"!= actual_len={len(payload)} (using actual)", flush=True)
+    return type_byte, seq, declared_len, ts_ms, payload
+
+def build_frame(type_byte: int, payload: bytes) -> bytes:
+    global _esp32_frame_seq
+    _esp32_frame_seq = (_esp32_frame_seq + 1) & 0xFFFF
+    ts_ms = int(time.time() * 1000) & 0xFFFFFFFF
+    header = struct.pack(FRAME_HDR_FMT, type_byte, _esp32_frame_seq, len(payload), ts_ms)
+    return header + payload
+
+async def send_framed_to_esp32(type_byte: int, payload: bytes) -> bool:
+    """Sends one multiplex frame to the ESP32 over esp32_ws. Used for
+    TTS PCM (0x02) and control text (0x05, via send_control_to_esp32) —
+    the only two directions the server ever sends."""
+    ws = esp32_ws
+    if not (ws and ws.client_state == WebSocketState.CONNECTED):
+        return False
+    if len(payload) > FRAME_MAX_PAYLOAD:
+        print(f"[MUX] refusing to send type=0x{type_byte:02x}: "
+              f"{len(payload)} bytes exceeds {FRAME_MAX_PAYLOAD}-byte length-field limit", flush=True)
+        return False
+    try:
+        await ws.send_bytes(build_frame(type_byte, payload))
+        return True
+    except Exception as e:
+        print(f"[MUX] send failed: {e}", flush=True)
+        return False
+
+async def send_control_to_esp32(text: str) -> bool:
+    """Control/keepalive frame (Type 0x05) — replaces the old plain
+    send_text() calls for TTS:START/TTS:END/RESET/SET:* commands. Same
+    exact strings, just wrapped in the shared frame format."""
+    return await send_framed_to_esp32(FRAME_TYPE_CONTROL, text.encode("utf-8"))
 
 # Global variables for blind-path navigation
 blind_path_navigator = None
@@ -731,8 +800,7 @@ async def full_system_reset(reason: str = ""):
 
     # 5) Notify ESP32
     try:
-        if esp32_audio_ws and (esp32_audio_ws.client_state == WebSocketState.CONNECTED):
-            await esp32_audio_ws.send_text("RESET")
+        await send_control_to_esp32("RESET")
     except Exception:
         pass
 
@@ -1101,21 +1169,21 @@ async def start_ai_with_text(user_text: str):
                 try:
                     pcm8k = await _say_to_pcm8k(full_text)
                     if pcm8k:
-                        # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
-                        # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
-                        _ws = esp32_audio_ws
-                        if _ws and _ws.client_state == WebSocketState.CONNECTED:
+                        # Primary path: send raw mono-16 PCM to ESP32 over the
+                        # multiplex WebSocket (Type 0x02 frames). Firmware
+                        # taskTTSPlay consumes qTTS and writes to i2sOut.
+                        if esp32_ws and esp32_ws.client_state == WebSocketState.CONNECTED:
                             try:
-                                await _ws.send_text("TTS:START")
+                                await send_control_to_esp32("TTS:START")
                                 _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
                                 for _i in range(0, len(pcm8k), _CHUNK):
-                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
-                                await _ws.send_text("TTS:END")
+                                    await send_framed_to_esp32(FRAME_TYPE_AUDIO, pcm8k[_i:_i + _CHUNK])
+                                await send_control_to_esp32("TTS:END")
                                 print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
                             except Exception as _ws_err:
                                 print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
                         else:
-                            print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
+                            print("[TTS-WS] esp32_ws not connected — skipping WebSocket send", flush=True)
                         # Also broadcast via /stream.wav so browser clients can hear it
                         await broadcast_pcm16_realtime(pcm8k)
                 except Exception as tts_err:
@@ -1276,40 +1344,40 @@ class CameraCommand(BaseModel):
 
 @app.post("/api/camera")
 async def camera_command(cmd: CameraCommand):
-    if esp32_camera_ws is None:
-        return JSONResponse({"error": "ESP32 camera not connected"}, status_code=503)
+    if esp32_ws is None:
+        return JSONResponse({"error": "ESP32 not connected"}, status_code=503)
     sent = []
     try:
         if cmd.framesize:
             v = cmd.framesize.upper()
             if v in ("VGA", "SVGA", "XGA"):
-                await esp32_camera_ws.send_text(f"SET:FRAMESIZE={v}")
+                await send_control_to_esp32(f"SET:FRAMESIZE={v}")
                 sent.append(f"FRAMESIZE={v}")
         if cmd.quality is not None:
             q = max(5, min(40, cmd.quality))
-            await esp32_camera_ws.send_text(f"SET:QUALITY={q}")
+            await send_control_to_esp32(f"SET:QUALITY={q}")
             sent.append(f"QUALITY={q}")
         if cmd.fps is not None:
             f = max(0, min(60, cmd.fps))
-            await esp32_camera_ws.send_text(f"SET:FPS={f}")
+            await send_control_to_esp32(f"SET:FPS={f}")
             sent.append(f"FPS={f}")
         if cmd.exposure_auto is not None:
-            await esp32_camera_ws.send_text(f"SET:AE_AUTO={1 if cmd.exposure_auto else 0}")
+            await send_control_to_esp32(f"SET:AE_AUTO={1 if cmd.exposure_auto else 0}")
             sent.append(f"AE_AUTO={1 if cmd.exposure_auto else 0}")
         if cmd.exposure_value is not None:
             v = max(0, min(1200, cmd.exposure_value))
-            await esp32_camera_ws.send_text(f"SET:AEC={v}")
+            await send_control_to_esp32(f"SET:AEC={v}")
             sent.append(f"AEC={v}")
         if cmd.gain_ceiling is not None:
             v = max(0, min(6, cmd.gain_ceiling))
-            await esp32_camera_ws.send_text(f"SET:GAINCEIL={v}")
+            await send_control_to_esp32(f"SET:GAINCEIL={v}")
             sent.append(f"GAINCEIL={v}")
         if cmd.aec2 is not None:
-            await esp32_camera_ws.send_text(f"SET:AEC2={1 if cmd.aec2 else 0}")
+            await send_control_to_esp32(f"SET:AEC2={1 if cmd.aec2 else 0}")
             sent.append(f"AEC2={1 if cmd.aec2 else 0}")
         if cmd.ae_level is not None:
             v = max(-2, min(2, cmd.ae_level))
-            await esp32_camera_ws.send_text(f"SET:AE_LEVEL={v}")
+            await send_control_to_esp32(f"SET:AE_LEVEL={v}")
             sent.append(f"AE_LEVEL={v}")
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1397,166 +1465,16 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 #   # keepalive_loop fed silence when idle > 350 ms
 #   # On STOP: recognition.send_audio_frame(SILENCE_20MS) x15, then recognition.stop()
 #
-@app.websocket("/ws_audio")
-async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
-    # Evict-and-replace rather than reject: unlike ws_camera_esp, a stale
-    # mic connection blocks the VAD/dispatch pipeline, so a reconnect needs
-    # to fail over immediately instead of waiting on ping-timeout detection
-    # to notice the old one is dead.
-    old_ws = esp32_audio_ws
-    if old_ws is not None:
-        print("[MIC] New connection superseding previous one")
-        try:
-            await old_ws.close(code=1001)
-        except Exception:
-            pass
-    esp32_audio_ws = ws
-    await ws.accept()
-    print("[CONNECTED] Mic (ESP32 audio)")
-
-    streaming: bool = False
-    pcm_buffer: Optional[bytearray] = None
-    # VAD state (reset on every START / STOP / auto-trigger)
-    vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
-    vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
-    vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
-
-    try:
-        while True:
-            if WebSocketState and ws.client_state != WebSocketState.CONNECTED:
-                break
-            try:
-                msg = await ws.receive()
-            except WebSocketDisconnect:
-                break
-            except RuntimeError as e:
-                if "Cannot call \"receive\"" in str(e):
-                    break
-                raise
-
-            if "text" in msg and msg["text"] is not None:
-                raw = (msg["text"] or "").strip()
-                cmd = raw.upper()
-
-                if cmd == "START":
-                    print("[MIC] Listening — waiting for speech...")
-                    streaming            = True
-                    pcm_buffer           = bytearray()
-                    vad_silent_chunks    = 0
-                    vad_speech_chunks    = 0
-                    vad_speech_detected  = False
-                    await ui_broadcast_partial("（Recording…）")
-                    await ws.send_text("OK:STARTED")
-
-                elif cmd == "STOP":
-                    streaming = False
-                    if AI_BACKEND == "gemini_live":
-                        print("[MIC] Stopped streaming")
-                        mic_streaming = False
-                        await ws.send_text("OK:STOPPED")
-                    else:
-                        print("[MIC] Transcribing...")
-                        buf = bytes(pcm_buffer) if pcm_buffer else b""
-                        pcm_buffer          = None
-                        vad_silent_chunks   = 0
-                        vad_speech_chunks   = 0
-                        vad_speech_detected = False
-                        await ws.send_text("OK:STOPPED")
-                        await _run_whisper_and_dispatch(buf)
-
-                elif raw.startswith("PROMPT:"):
-                    # Device-initiated prompt (bypasses ASR entirely)
-                    text = raw[len("PROMPT:"):].strip()
-                    if text:
-                        async with interrupt_lock:
-                            await start_ai_with_text_custom(text)
-                        await ws.send_text("OK:PROMPT_ACCEPTED")
-                    else:
-                        await ws.send_text("ERR:EMPTY_PROMPT")
-
-            elif "bytes" in msg and msg["bytes"] is not None:
-                chunk = msg["bytes"]
-
-                if AI_BACKEND == "gemini_live":
-                    # Gemini Live owns the mic entirely in this mode — it runs
-                    # its own server-side VAD/turn-detection on the raw stream,
-                    # so the local RMS-VAD/Whisper pipeline below must stay out
-                    # of the way (it would otherwise fire its own transcription
-                    # off the same audio and double-dispatch commands).
-                    if streaming and not is_playing_now():
-                        await gemini_live.send_audio(chunk)
-                    continue
-
-                if streaming and pcm_buffer is not None:
-                    # Mute the mic while the AI is speaking. Without this the
-                    # glasses' own TTS echoes back into the mic, gets VAD-segmented
-                    # and can launch a bogus turn — which then blocks the user's
-                    # next real question (the "ask twice" symptom). Drop the frame
-                    # and reset VAD so nothing accumulates during playback.
-                    if is_playing_now():
-                        pcm_buffer          = bytearray()
-                        vad_silent_chunks   = 0
-                        vad_speech_chunks   = 0
-                        vad_speech_detected = False
-                        continue
-                    pcm_buffer.extend(chunk)
-
-                n = len(chunk)
-                if n >= 2:
-                    s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
-                    s -= s.mean()  # strip DC offset from PDM mic before measuring energy
-                    rms = float(np.sqrt(np.mean(s ** 2)))
-                else:
-                    rms = 0.0
-
-                    # [VAD DEBUG] Log every chunk so we can read the real noise floor.
-                    # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
-                    if DEBUG_VAD:
-                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
-                        print(
-                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
-                            f"  → {label}"
-                            f"  speech_chunks={vad_speech_chunks}"
-                            f"  silent_chunks={vad_silent_chunks}"
-                            f"  detected={vad_speech_detected}",
-                            flush=True,
-                        )
-
-                if rms >= VAD_SILENCE_RMS:
-                    vad_silent_chunks  = 0
-                    vad_speech_chunks += 1
-                    if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
-                        vad_speech_detected = True
-                        print("[MIC] Speech detected", flush=True)
-                else:
-                    if vad_speech_detected:
-                        vad_silent_chunks += 1
-                        if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
-                            print("[MIC] Transcribing...", flush=True)
-                            buf = bytes(pcm_buffer)
-                            pcm_buffer          = bytearray()
-                            vad_silent_chunks   = 0
-                            vad_speech_chunks   = 0
-                            vad_speech_detected = False
-                            await ui_broadcast_partial("（Processing…）")
-                            await _run_whisper_and_dispatch(buf)
-                    else:
-                        vad_speech_chunks = 0
-
-    except Exception as e:
-        print(f"\n[WS ERROR] {e}")
-    finally:
-        streaming  = False
-        pcm_buffer = None
-        try:
-            if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
-                await ws.close(code=1000)
-        except Exception:
-            pass
-        if esp32_audio_ws is ws:
-            esp32_audio_ws = None
-        print("[DISCONNECTED] Mic (ESP32 audio)")
+# NOTE: /ws_audio (ESP32 mic ingestion + TTS-command text) has been merged
+# into /ws/multiplex below — see ws_multiplex(). This endpoint used to be a
+# dedicated connection for the real ESP32 firmware; that role no longer
+# exists here. dev_mic_client.py still targets /ws_audio directly with the
+# old unframed protocol and is NOT updated by this change (out of scope) —
+# it will fail to connect anything meaningful since nothing sets/reads
+# esp32_ws from this path anymore. Flagging this rather than silently
+# leaving it broken: if local mic testing without real hardware still
+# matters, dev_mic_client.py needs a follow-up update to speak the new
+# framed protocol against /ws/multiplex.
 
 def _apply_camera_rotation(bgr):
     """Correct physical camera mounting orientation. Single source of truth
@@ -1657,16 +1575,25 @@ def _process_camera_frame_blocking(data: bytes):
     return (None, None)
 
 
-# ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
-@app.websocket("/ws/camera")
-async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
-    if esp32_camera_ws is not None:
+# ---------- WebSocket: single multiplexed ESP32 entry point ----------
+# Replaces /ws/camera, /ws_audio, and /ws/thermal as the ESP32's connection
+# — one TLS session instead of three (four counting /ws for IMU) concurrent
+# ones. Every incoming binary message is parsed as a multiplex frame (see
+# parse_frame() near the top of the file) and dispatched by Type byte to
+# exactly the same per-type handling logic the four separate handlers used
+# to run; only the transport changed; the camera/nav setup, the mic VAD
+# state machine, the thermal colorize/broadcast, and the IMU JSON ingestion
+# are all byte-for-byte the same logic as before, just invoked from one
+# shared receive loop instead of four.
+@app.websocket("/ws/multiplex")
+async def ws_multiplex(ws: WebSocket):
+    global esp32_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    if esp32_ws is not None:
         await ws.close(code=1013)
         return
-    esp32_camera_ws = ws
+    esp32_ws = ws
     await ws.accept()
-    print("[CONNECTED] Camera (ESP32)")
+    print("[CONNECTED] ESP32 (multiplex)")
 
     # Initialize the blind-path navigator
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -1773,11 +1700,44 @@ async def ws_camera_esp(ws: WebSocket):
 
     gemini_pump_task = asyncio.create_task(_gemini_image_pump()) if AI_BACKEND == "gemini_live" else None
 
+    # ---- Mic/audio state (formerly ws_audio's connection-scoped locals) ----
+    streaming: bool = False
+    pcm_buffer: Optional[bytearray] = None
+    # VAD state (reset on every START / STOP / auto-trigger)
+    vad_silent_chunks: int   = 0      # consecutive silent 20ms chunks this utterance
+    vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
+    vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
+
+    # ---- Thermal state (formerly ws_thermal_esp's connection-scoped local) ----
+    thermal_frame_count = 0
+
     try:
         while True:
-            msg = await ws.receive()
-            if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
+            if WebSocketState and ws.client_state != WebSocketState.CONNECTED:
+                break
+            try:
+                msg = await ws.receive()
+            except WebSocketDisconnect:
+                break
+            except RuntimeError as e:
+                if "Cannot call \"receive\"" in str(e):
+                    break
+                raise
+
+            if "bytes" not in msg or msg["bytes"] is None:
+                if "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+                    break
+                continue
+
+            parsed = parse_frame(msg["bytes"])
+            if parsed is None:
+                print(f"[MUX] frame too short ({len(msg['bytes'])} bytes), dropping", flush=True)
+                continue
+            frame_type, seq, declared_len, ts_ms, payload = parsed
+
+            # ---- Type 0x01: camera JPEG frame (formerly ws_camera_esp) ----
+            if frame_type == FRAME_TYPE_CAMERA:
+                data = payload
                 frame_counter += 1
 
                 # Cheap per-frame bookkeeping stays in the receive loop so it
@@ -1802,12 +1762,180 @@ async def ws_camera_esp(ws: WebSocket):
                     gemini_frame_holder["data"] = data
                     gemini_frame_event.set()
 
-            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
-                break
+            # ---- Type 0x02: mic PCM frame (formerly ws_audio's binary branch) ----
+            elif frame_type == FRAME_TYPE_AUDIO:
+                chunk = payload
+
+                if AI_BACKEND == "gemini_live":
+                    # Gemini Live owns the mic entirely in this mode — it runs
+                    # its own server-side VAD/turn-detection on the raw stream,
+                    # so the local RMS-VAD/Whisper pipeline below must stay out
+                    # of the way (it would otherwise fire its own transcription
+                    # off the same audio and double-dispatch commands).
+                    if streaming and not is_playing_now():
+                        await gemini_live.send_audio(chunk)
+                    continue
+
+                if streaming and pcm_buffer is not None:
+                    # Mute the mic while the AI is speaking. Without this the
+                    # glasses' own TTS echoes back into the mic, gets VAD-segmented
+                    # and can launch a bogus turn — which then blocks the user's
+                    # next real question (the "ask twice" symptom). Drop the frame
+                    # and reset VAD so nothing accumulates during playback.
+                    if is_playing_now():
+                        pcm_buffer          = bytearray()
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
+                        continue
+                    pcm_buffer.extend(chunk)
+
+                n = len(chunk)
+                if n >= 2:
+                    s = np.frombuffer(chunk[: n & ~1], dtype=np.int16).astype(np.float32)
+                    s -= s.mean()  # strip DC offset from PDM mic before measuring energy
+                    rms = float(np.sqrt(np.mean(s ** 2)))
+                else:
+                    rms = 0.0
+
+                    # [VAD DEBUG] Log every chunk so we can read the real noise floor.
+                    # Set DEBUG_VAD = False once VAD_SILENCE_RMS is tuned.
+                    if DEBUG_VAD:
+                        label = "SPEECH" if rms >= VAD_SILENCE_RMS else "silent"
+                        print(
+                            f"[VAD DEBUG] rms={rms:6.0f}  thresh={VAD_SILENCE_RMS}"
+                            f"  → {label}"
+                            f"  speech_chunks={vad_speech_chunks}"
+                            f"  silent_chunks={vad_silent_chunks}"
+                            f"  detected={vad_speech_detected}",
+                            flush=True,
+                        )
+
+                if rms >= VAD_SILENCE_RMS:
+                    vad_silent_chunks  = 0
+                    vad_speech_chunks += 1
+                    if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                        vad_speech_detected = True
+                        print("[MIC] Speech detected", flush=True)
+                else:
+                    if vad_speech_detected:
+                        vad_silent_chunks += 1
+                        if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
+                            print("[MIC] Transcribing...", flush=True)
+                            buf = bytes(pcm_buffer)
+                            pcm_buffer          = bytearray()
+                            vad_silent_chunks   = 0
+                            vad_speech_chunks   = 0
+                            vad_speech_detected = False
+                            await ui_broadcast_partial("（Processing…）")
+                            await _run_whisper_and_dispatch(buf)
+                    else:
+                        vad_speech_chunks = 0
+
+            # ---- Type 0x03: thermal frame (formerly ws_thermal_esp) ----
+            elif frame_type == FRAME_TYPE_THERMAL:
+                data = payload
+                if len(data) == 3072:
+                    thermal_frame_count += 1
+                    if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
+                        print(f"[THERMAL] received {thermal_frame_count} frames, "
+                              f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
+
+                    frame = np.frombuffer(data, dtype="<f4").reshape(24, 32)
+                    colorized = _colorize_thermal(frame)
+                    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if ok and thermal_viewers:
+                        jpeg_bytes = enc.tobytes()
+                        stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
+                        dead = []
+                        for viewer_ws in list(thermal_viewers):
+                            try:
+                                await viewer_ws.send_bytes(jpeg_bytes)
+                                await viewer_ws.send_text(stats)
+                            except Exception:
+                                dead.append(viewer_ws)
+                        for d in dead:
+                            thermal_viewers.discard(d)
+                else:
+                    print(f"[THERMAL] unexpected payload size {len(data)} (want 3072), dropping", flush=True)
+
+            # ---- Type 0x04: IMU frame (formerly ws_imu's ESP32-ingestion branch) ----
+            elif frame_type == FRAME_TYPE_IMU:
+                try:
+                    d = json.loads(payload.decode("utf-8"))
+                    if 'ts' not in d and 'timestamp_ms' in d:
+                        d['ts'] = d.pop('timestamp_ms')
+                    process_imu_and_maybe_store(d)
+                    asyncio.create_task(imu_broadcast(json.dumps(d)))
+                except Exception:
+                    pass
+
+            # ---- Type 0x05: control text (formerly ws_audio's text branch) ----
+            elif frame_type == FRAME_TYPE_CONTROL:
+                try:
+                    raw = payload.decode("utf-8").strip()
+                except Exception:
+                    raw = ""
+                cmd = raw.upper()
+
+                if cmd == "START":
+                    print("[MIC] Listening — waiting for speech...")
+                    streaming            = True
+                    pcm_buffer           = bytearray()
+                    vad_silent_chunks    = 0
+                    vad_speech_chunks    = 0
+                    vad_speech_detected  = False
+                    await ui_broadcast_partial("（Recording…）")
+                    await send_control_to_esp32("OK:STARTED")
+
+                elif cmd == "STOP":
+                    streaming = False
+                    if AI_BACKEND == "gemini_live":
+                        print("[MIC] Stopped streaming")
+                        mic_streaming = False
+                        await send_control_to_esp32("OK:STOPPED")
+                    else:
+                        print("[MIC] Transcribing...")
+                        buf = bytes(pcm_buffer) if pcm_buffer else b""
+                        pcm_buffer          = None
+                        vad_silent_chunks   = 0
+                        vad_speech_chunks   = 0
+                        vad_speech_detected = False
+                        await send_control_to_esp32("OK:STOPPED")
+                        await _run_whisper_and_dispatch(buf)
+
+                elif raw.startswith("PROMPT:"):
+                    # Device-initiated prompt (bypasses ASR entirely)
+                    text = raw[len("PROMPT:"):].strip()
+                    if text:
+                        async with interrupt_lock:
+                            await start_ai_with_text_custom(text)
+                        await send_control_to_esp32("OK:PROMPT_ACCEPTED")
+                    else:
+                        await send_control_to_esp32("ERR:EMPTY_PROMPT")
+
+                elif raw in ("SNAP:BEGIN", "SNAP:END"):
+                    # Dead/orphaned markers the firmware still sends around a
+                    # SNAP:HQ snapshot request — never parsed server-side
+                    # before this rewrite either (the old /ws/camera loop had
+                    # no text branch at all); preserved as a harmless no-op
+                    # rather than silently changed.
+                    pass
+
+                else:
+                    # RESTART/TTS:START/TTS:END are server->ESP32-only in
+                    # practice (confirmed nothing sends them the other
+                    # direction) — logged rather than silently eaten so an
+                    # unexpected one is visible.
+                    print(f"[MUX] unrecognized control text from ESP32: {raw!r}", flush=True)
+
+            else:
+                print(f"[MUX] unexpected type=0x{frame_type:02x} (seq={seq}, {len(payload)} bytes), ignoring", flush=True)
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[CAMERA ERROR] {e}")
+        print(f"[MUX ERROR] {e}")
     finally:
         processor_task.cancel()
         try:
@@ -1825,8 +1953,11 @@ async def ws_camera_esp(ws: WebSocket):
                 await ws.close(code=1000)
         except Exception:
             pass
-        esp32_camera_ws = None
-        print("[DISCONNECTED] Camera (ESP32)")
+        streaming  = False
+        pcm_buffer = None
+        if esp32_ws is ws:
+            esp32_ws = None
+        print("[DISCONNECTED] ESP32 (multiplex)")
 
         # Clean up navigation state
         if blind_path_navigator:
@@ -1865,50 +1996,12 @@ def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
     colored = cv2.applyColorMap(normed, cv2.COLORMAP_INFERNO)
     return cv2.resize(colored, (320, 240), interpolation=cv2.INTER_CUBIC)
 
-# ---------- WebSocket: ESP32 thermal entry ("THRM" + 24x32 float32 binary) ----------
-@app.websocket("/ws/thermal")
-async def ws_thermal_esp(ws: WebSocket):
-    """Dedicated socket for thermal sensor frames — kept separate from the
-    camera socket so the two streams never interfere. Colorizes each frame
-    and broadcasts the JPEG + max/min temps to thermal_viewers ONLY — NOT
-    camera_viewers, which is the RGB camera_esp/viewer pair's frame set."""
-    await ws.accept()
-    print("[CONNECTED] Thermal (ESP32)", flush=True)
-    thermal_frame_count = 0
-    try:
-        while True:
-            msg = await ws.receive()
-            if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
-                if len(data) >= 4 and data[:4] == b"THRM" and len(data) - 4 == 3072:
-                    thermal_frame_count += 1
-                    if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
-                        print(f"[THERMAL] received {thermal_frame_count} frames, "
-                              f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
-
-                    frame = np.frombuffer(data[4:], dtype="<f4").reshape(24, 32)
-                    colorized = _colorize_thermal(frame)
-                    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                    if ok and thermal_viewers:
-                        jpeg_bytes = enc.tobytes()
-                        stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
-                        dead = []
-                        for viewer_ws in list(thermal_viewers):
-                            try:
-                                await viewer_ws.send_bytes(jpeg_bytes)
-                                await viewer_ws.send_text(stats)
-                            except Exception:
-                                dead.append(viewer_ws)
-                        for d in dead:
-                            thermal_viewers.discard(d)
-            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
-                break
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        print(f"[THERMAL ERROR] {e}", flush=True)
-    finally:
-        print("[DISCONNECTED] Thermal (ESP32)", flush=True)
+# NOTE: /ws/thermal (ESP32 thermal ingestion) has been merged into
+# /ws/multiplex above — see ws_multiplex()'s FRAME_TYPE_THERMAL branch,
+# which is the exact same colorize-and-broadcast-to-thermal_viewers logic
+# as this endpoint used to run, minus the old "THRM" magic-prefix check
+# (the frame's Type byte already identifies it, so the prefix was dropped
+# on the firmware side too — see compile.ino).
 
 # ---------- WebSocket: browser subscribes to thermal frames ----------
 @app.websocket("/ws/thermal_viewer")
@@ -1926,6 +2019,17 @@ async def ws_thermal_viewer(ws: WebSocket):
         print(f"[THERMAL-VIEWER] Removed. Total viewers: {len(thermal_viewers)}", flush=True)
 
 # ---------- WebSocket: browser subscribes to IMU data ----------
+# NOTE on scope: /ws used to be dual-purpose — both the ESP32's IMU
+# ingestion channel (any text message received was parsed as IMU JSON) and
+# the browser broadcast-out target (any connected client, ESP32 or
+# browser, landed in imu_ws_clients). The instructions for this rewrite
+# named /ws among the four ESP32-facing endpoints being replaced by
+# /ws/multiplex, but didn't call out that /ws is also a browser-facing
+# viewer endpoint the same way /ws/viewer and /ws/thermal_viewer are —
+# it's kept alive here for that half of its role (matching the spirit of
+# "keep browser-facing viewer endpoints unchanged"), with only the
+# ESP32-ingestion text branch removed, since the ESP32 now sends IMU data
+# as FRAME_TYPE_IMU frames over /ws/multiplex instead (see ws_multiplex()).
 @app.websocket("/ws")
 async def ws_imu(ws: WebSocket):
     await ws.accept()
@@ -1933,19 +2037,7 @@ async def ws_imu(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive()
-            if "text" in msg and msg["text"] is not None:
-                # Same parsing/processing as the old UDPProto.datagram_received
-                # path (see below) — this socket now doubles as the ESP32's
-                # ingestion channel, not just the browser-viewer broadcast-out.
-                try:
-                    d = json.loads(msg["text"])
-                    if 'ts' not in d and 'timestamp_ms' in d:
-                        d['ts'] = d.pop('timestamp_ms')
-                    process_imu_and_maybe_store(d)
-                    asyncio.create_task(imu_broadcast(json.dumps(d)))
-                except Exception:
-                    pass
-            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+            if "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
         pass
@@ -2251,7 +2343,7 @@ def get_last_frames():
     return last_frames
 
 def get_camera_ws():
-    return esp32_camera_ws
+    return esp32_ws
 
 if __name__ == "__main__":
     uvicorn.run(
