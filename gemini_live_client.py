@@ -185,6 +185,12 @@ class GeminiLiveClient:
                 if not self._shutting_down:
                     print("[Gemini Live] Response stream ended unexpectedly")
                     self.connected = False
+                    # The current turn (if any) never got a turn_complete/
+                    # interrupted from Gemini — treat it as interrupted so
+                    # callers (e.g. the ESP32 TTS state) don't get stuck
+                    # waiting on a signal that will never arrive.
+                    if self.on_interrupted:
+                        await self.on_interrupted()
                     await self._reconnect_with_backoff()
             except asyncio.CancelledError:
                 print("[Gemini Live] receive loop task cancelled")
@@ -194,6 +200,11 @@ class GeminiLiveClient:
                 self.connected = False
                 if self._shutting_down:
                     return
+                # Same reasoning as above: the turn in progress (if any) was
+                # abandoned mid-stream, so fire on_interrupted for cleanup
+                # before reconnecting.
+                if self.on_interrupted:
+                    await self.on_interrupted()
                 await self._reconnect_with_backoff()
                 # loop condition re-checks self.connected — if the reconnect
                 # above succeeded, we fall back into `while self.connected`

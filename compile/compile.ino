@@ -10,7 +10,6 @@
 #include "freertos/queue.h"
 struct WavFmt;
 #include <cstring>      // memcmp
-#include <WiFiUdp.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -20,17 +19,26 @@ using namespace websockets;
 // Flip to 0 and reflash to fully disable the thermal subsystem (no MLX90640
 // init, no wsThermal connection attempt, no task) without touching anything
 // else below, if it causes instability during testing.
-#define THERMAL_ENABLED 0
+#define THERMAL_ENABLED 1
+
+// ===== IMU WebSocket enable/disable switch =====
+// wsImu is a FOURTH concurrent TLS connection alongside wsCam/wsAud/wsThermal.
+// The one and only time thermal alone was tested tonight, it crashed the VM —
+// do NOT flip this to 1 at the same time as THERMAL_ENABLED without testing
+// that specific combination first, ideally against the throwaway
+// openaiglasses-thermal-test app rather than production.
+#define IMU_WS_ENABLED 1
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PromisingGuys";
-const char* WIFI_PASS   = "aloekanal2026";
+const char* WIFI_SSID   = "IanLeeiPhone";
+const char* WIFI_PASS   = "ianleeiphone1";
 const char* SERVER_HOST = "openaiglasses-for-navigation.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
 static const char* CAM_WS_PATH     = "/ws/camera";
 static const char* AUD_WS_PATH     = "/ws_audio";
 static const char* THERMAL_WS_PATH = "/ws/thermal";
+static const char* IMU_WS_PATH     = "/ws";
 
 // TLS CA for Fly.io: "ISRG Root X2", trusted directly rather than the true
 // self-signed root ("ISRG Root X1") one hop further up. Verified 2026-07-21
@@ -173,21 +181,17 @@ const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
 // ===== Speaker (I2S TX → MAX98357A) =====
-#define I2S_SPK_BCLK D1
-#define I2S_SPK_LRCK D2
-#define I2S_SPK_DIN  D3
+#define I2S_SPK_BCLK D7
+#define I2S_SPK_LRC D8
+#define I2S_SPK_DIN  D9
 const int TTS_RATE = 8000;
 
-// ===== IMU (MPU-6050 over I2C) / UDP =====
+// ===== IMU (MPU-6050 over I2C) =====
 
 // Default I2C pins on XIAO ESP32S3: SDA=D4(GPIO5), SCL=D5(GPIO6)
 // Change these if you wired the GY-521 to different pins.
-#define IMU_I2C_SDA   5   // D4
-#define IMU_I2C_SCL   6   // D5
-const char* UDP_HOST  = "192.168.12.143";
-const int   UDP_PORT  = 12345;
-
-WiFiUDP udp;
+#define IMU_I2C_SDA   D4   // D4
+#define IMU_I2C_SCL   D5   // D5
 
 // ===== WS / Queues / I2S =====
 WebsocketsClient wsCam;
@@ -218,6 +222,16 @@ volatile bool snapshot_in_progress = false; // Pause live capture during a high-
 WebsocketsClient wsThermal;
 volatile bool thermal_ws_ready = false;
 volatile bool thermal_ws_closed_pending_reconnect = false;
+#endif
+
+#if IMU_WS_ENABLED
+// Fourth socket, same pattern as wsCam/wsAud/wsThermal above (see
+// cam_ws_closed_pending_reconnect's comment for the use-after-free this
+// guard avoids) — kept fully behind IMU_WS_ENABLED so disabling the flag
+// leaves zero IMU-network activity, not just a dormant task.
+WebsocketsClient wsImu;
+volatile bool imu_ws_ready = false;
+volatile bool imu_ws_closed_pending_reconnect = false;
 #endif
 
 typedef camera_fb_t* fb_ptr_t;
@@ -463,7 +477,7 @@ void taskMicUpload(void*){
 // Speaker (I2S TX) + HTTP /stream.wav (chunked-safe)
 // ====================================================================
 void init_i2s_out(){
-  i2sOut.setPins(I2S_SPK_BCLK, I2S_SPK_LRCK, I2S_SPK_DIN);
+  i2sOut.setPins(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
   if (!i2sOut.begin(I2S_MODE_STD, TTS_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
     Serial.println("[I2S OUT] init failed");
     while(1){ delay(1000); }
@@ -997,7 +1011,7 @@ bool imu_read_once(float& tempC, float& ax, float& ay, float& az,
   return true;
 }
 
-// EMA smoothing on accel only; does not change the UDP field names.
+// EMA smoothing on accel only; does not change the wire field names.
 static const float EMA_ALPHA = 0.20f;
 bool  ema_inited = false;
 float ax_f=0, ay_f=0, az_f=0;
@@ -1030,11 +1044,11 @@ void taskImuLoop(void*){
       "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
       ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
 
-    if (n > 0) {
-      udp.beginPacket(UDP_HOST, UDP_PORT);
-      udp.write((const uint8_t*)buf, n);
-      udp.endPacket();
+#if IMU_WS_ENABLED
+    if (n > 0 && imu_ws_ready) {
+      wsImu.send(buf);
     }
+#endif
     vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
   }
 }
@@ -1093,9 +1107,44 @@ void taskThermalLoop(void* pv) {
 // ====================================================================
 // Setup / Loop
 // ====================================================================
+
+// Runs a single client's first connectSecure() attempt to completion
+// (success or failure) before returning, so setup()'s initial connection
+// sequence is genuinely one-at-a-time rather than four calls fired
+// back-to-back. connectSecure() is already synchronous internally (TCP +
+// TLS handshake + HTTP upgrade inline), so this doesn't change *that* —
+// what it adds is the explicit delay(100) below, giving the heap a moment
+// to settle between one TLS teardown/handshake and the next rather than
+// chaining four ~16KB+ contiguous mbedTLS allocations with zero gap.
+bool connectWsSequential(WebsocketsClient& client, const char* path, const char* objName, const char* tag) {
+  Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  unsigned long t0 = millis();
+  bool connected = client.connectSecure(SERVER_HOST, SERVER_PORT, path);
+  Serial.printf("[DEBUG] ws%s.connectSecure() (setup, first attempt) took %lu ms, result: %d\n", objName, millis() - t0, connected);
+  if (connected) Serial.printf("[WS-%s] connected\n", tag);
+  delay(100);
+  return connected;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  // Camera claims its memory first, on a clean/unfragmented heap — before
+  // WiFi.begin() brings up the WiFi stack's own internal-RAM allocations,
+  // and before any connectSecure() call claims a ~16KB+ contiguous mbedTLS
+  // buffer (see the connectWsSequential() comment below for why that
+  // matters). esp_camera_set_psram_mode(true) right after a successful
+  // init routes the camera's internal DMA buffer to PSRAM instead of
+  // internal RAM — confirmed via esp32-camera library source/object
+  // inspection that this is a separate allocation from fb_location
+  // (frame-buffer-only) and defaults to internal RAM (g_psram_dma_mode
+  // starts false) unless this call is made. This is what the earlier
+  // "DMA buffer malloc failed, largest free block 4.3KB, needed 16KB"
+  // crash was hitting.
+  if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
+  esp_err_t psram_dma_err = esp_camera_set_psram_mode(true);
+  Serial.printf("[CAM] esp_camera_set_psram_mode(true) result: 0x%x\n", psram_dma_err);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -1145,6 +1194,13 @@ void setup() {
   wsAud.setCACert(FLY_ROOT_CA);
 #if THERMAL_ENABLED
   wsThermal.setCACert(FLY_ROOT_CA);
+#endif
+#if IMU_WS_ENABLED
+  // NOTE: this call was missing when wsImu was first added — without it,
+  // wsImu.connectSecure() would fail on every attempt (setInsecure() does
+  // not work on this library/core combination; see the NOTE above this
+  // function). Fixed here.
+  wsImu.setCACert(FLY_ROOT_CA);
 #endif
   Serial.printf("[DEBUG] FLY_ROOT_CA length: %d bytes (sanity check the PROGMEM string is intact — not a parse/verify result, setCACert() has none)\n", strlen(FLY_ROOT_CA));
 
@@ -1330,49 +1386,60 @@ void setup() {
   });
 #endif
 
-  // Early first-connect attempt, before init_camera()/I2S/queue/task
-  // creation below fragment internal SRAM — gives mbedTLS's ~32KB+
-  // contiguous-allocation requirement (CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=
-  // 16384, symmetric in/out, INTERNAL_MEM_ALLOC only — confirmed in this
-  // core's sdkconfig, no PSRAM path available) first access to the
-  // freshest, least-fragmented heap. loop()'s existing retry logic still
-  // runs afterward as the fallback/reconnect path — if this succeeds,
-  // wsCam.available()/wsAud.available() will already be true there and it
-  // simply won't re-attempt.
+#if IMU_WS_ENABLED
+  // Same guard pattern as wsCam/wsAud/wsThermal above — see
+  // cam_ws_closed_pending_reconnect's comment for the use-after-free this
+  // avoids. No onMessage handler: the server (ws_imu in app_main.py)
+  // rebroadcasts IMU JSON to all connected clients including this one, but
+  // nothing on the firmware side needs to act on it.
+  wsImu.onEvent([](WebsocketsEvent ev, String){
+    if (ev == WebsocketsEvent::ConnectionOpened) {
+      imu_ws_ready = true;
+      Serial.println("[WS-IMU] open");
+    }
+    if (ev == WebsocketsEvent::ConnectionClosed) {
+      imu_ws_ready = false;
+      imu_ws_closed_pending_reconnect = true;
+      Serial.println("[WS-IMU] closed");
+    }
+  });
+#endif
+
+  // Initial connect sequence: each client's connectSecure() call runs to
+  // completion (success or failure), plus a short heap-settle delay, before
+  // the next one starts — see connectWsSequential()'s comment above. This
+  // replaces four back-to-back connectSecure() calls that had no gap
+  // between them.
+  //
+  // Note this now runs after camera init (moved to the very top of
+  // setup(), see the comment there) rather than before it — so the
+  // "freshest, least-fragmented heap" this block wants belongs to camera
+  // init first, then these four connects in turn. loop()'s existing retry
+  // logic still runs afterward as the fallback/reconnect path — if this
+  // succeeds, wsCam.available()/wsAud.available() will already be true
+  // there and it simply won't re-attempt.
   //
   // Blocking note: connectSecure() is synchronous (TCP + TLS handshake +
-  // HTTP upgrade inline) — if it hangs, setup() (and therefore
-  // init_camera()/etc. below) is delayed by however long that takes, up to
-  // the 30s TCP / 120s handshake timeouts. That tradeoff is inherent to
+  // HTTP upgrade inline) — if it hangs, setup() (and therefore I2S/queue/
+  // task creation below) is delayed by however long that takes, up to the
+  // 30s TCP / 120s handshake timeouts. That tradeoff is inherent to
   // attempting the connection this early; not otherwise mitigated here.
-  Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  unsigned long cam_connect_t0 = millis();
-  bool cam_connected = wsCam.connectSecure(SERVER_HOST, SERVER_PORT, CAM_WS_PATH);
-  Serial.printf("[DEBUG] wsCam.connectSecure() (setup, first attempt) took %lu ms, result: %d\n", millis() - cam_connect_t0, cam_connected);
-  if (cam_connected) Serial.println("[WS-CAM] connected");
+  connectWsSequential(wsCam, CAM_WS_PATH, "Cam", "CAM");
 
-  Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  unsigned long aud_connect_t0 = millis();
-  bool aud_connected = wsAud.connectSecure(SERVER_HOST, SERVER_PORT, AUD_WS_PATH);
-  Serial.printf("[DEBUG] wsAud.connectSecure() (setup, first attempt) took %lu ms, result: %d\n", millis() - aud_connect_t0, aud_connected);
+  bool aud_connected = connectWsSequential(wsAud, AUD_WS_PATH, "Aud", "AUD");
   if (aud_connected) {
-    Serial.println("[WS-AUD] connected");
     delay(50);
     run_audio_stream = true;
     wsAud.send("START");
   }
 
 #if THERMAL_ENABLED
-  Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  unsigned long thermal_connect_t0 = millis();
-  bool thermal_connected = wsThermal.connectSecure(SERVER_HOST, SERVER_PORT, THERMAL_WS_PATH);
-  Serial.printf("[DEBUG] wsThermal.connectSecure() (setup, first attempt) took %lu ms, result: %d\n", millis() - thermal_connect_t0, thermal_connected);
-  if (thermal_connected) Serial.println("[WS-THERMAL] connected");
+  connectWsSequential(wsThermal, THERMAL_WS_PATH, "Thermal", "THERMAL");
 #endif
 
-  if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
-
-  udp.begin(0);
+#if IMU_WS_ENABLED
+  connectWsSequential(wsImu, IMU_WS_PATH, "Imu", "IMU");
+#endif
 
   init_i2s_in();
   init_i2s_out();
@@ -1488,10 +1555,76 @@ void loop() {
   }
 #endif
 
+#if IMU_WS_ENABLED
+  // Same guard/cooldown pattern as wsThermal above (see
+  // cam_ws_closed_pending_reconnect's declaration comment) — never a
+  // blocking delay() on failure, so a down IMU socket never stalls
+  // wsCam.poll()/wsAud.poll()/wsThermal.poll() on the same loop() pass.
+  static unsigned long last_imu_retry = 0;
+  unsigned long now_imu = millis();
+  if ((imu_ws_closed_pending_reconnect || !wsImu.available()) && (now_imu - last_imu_retry >= 2000)) {
+    imu_ws_closed_pending_reconnect = false;
+    last_imu_retry = now_imu;
+    Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    unsigned long imu_connect_t0 = millis();
+    bool imu_connected = wsImu.connectSecure(SERVER_HOST, SERVER_PORT, IMU_WS_PATH);
+    Serial.printf("[DEBUG] wsImu.connectSecure() took %lu ms\n", millis() - imu_connect_t0);
+    if (imu_connected) {
+      Serial.println("[WS-IMU] connected");
+    } else {
+      Serial.println("[WS-IMU] retry in 2s...");
+    }
+  }
+#endif
+
+  // ---- Staggered keepalive pings ----
+  // ArduinoWebsockets has no built-in keepalive/ping timer. Believed cause
+  // of the ~30s disconnect cycle: the phone hotspot's cellular NAT gateway
+  // silently drops idle connections. One client gets pinged per 5s tick
+  // (full 4-client cycle every 20s) instead of bursting all four pings in
+  // the same loop() iteration.
+  //
+  // Gated on the *_ws_ready flags rather than calling client.available()
+  // directly — see cam_ws_closed_pending_reconnect's declaration comment
+  // above for the confirmed use-after-free crash (LoadProhibited, mbedTLS
+  // ssl_parse_record_header) from calling .available() on a client whose
+  // ConnectionClosed event hasn't been handled yet. The *_ws_ready flags
+  // are updated synchronously in each onEvent handler and cost nothing to
+  // read, so they're the safe way to know "is this client actually up"
+  // here too.
+  static unsigned long last_keepalive_tick = 0;
+  static uint8_t keepalive_slot = 0;
+  unsigned long now_keepalive = millis();
+  if (now_keepalive - last_keepalive_tick >= 5000) {
+    last_keepalive_tick = now_keepalive;
+    switch (keepalive_slot) {
+      case 0:
+        if (cam_ws_ready) wsCam.ping("");
+        break;
+      case 1:
+        if (aud_ws_ready) wsAud.ping("");
+        break;
+      case 2:
+#if THERMAL_ENABLED
+        if (thermal_ws_ready) wsThermal.ping("");
+#endif
+        break;
+      case 3:
+#if IMU_WS_ENABLED
+        if (imu_ws_ready) wsImu.ping("");
+#endif
+        break;
+    }
+    keepalive_slot = (keepalive_slot + 1) % 4;
+  }
+
   wsCam.poll();
   wsAud.poll();
 #if THERMAL_ENABLED
   wsThermal.poll();
+#endif
+#if IMU_WS_ENABLED
+  wsImu.poll();
 #endif
   delay(2);
 }

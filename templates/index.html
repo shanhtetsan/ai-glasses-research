@@ -110,7 +110,8 @@
     border-radius: 14px;
     background: var(--card);
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
     height: 100vh;
   }
 
@@ -198,7 +199,11 @@
   @media (max-width:1100px){
     .app{grid-template-columns:1fr; height:auto}
     .stage{height:50vh}
-    .chat{height:60vh}
+    /* overflow:hidden here pins mobile back to its existing behavior —
+       .chat-list scrolls internally and .settings-panel.open below caps
+       its own height/scroll — regardless of the desktop-only
+       overflow-y:auto added to the base .chat rule above. */
+    .chat{height:60vh; overflow:hidden}
 
     .mobile-only-ui{display:flex}
 
@@ -350,13 +355,6 @@
       <div class="mobile-only-ui" id="mobileFpsBadge">FPS: --</div>
     </div>
 
-    <!-- Browser TTS audio fallback: plays AI speech through this device's
-         own speaker via /stream.wav, independent of the ESP32 speaker path.
-         Hidden <audio>, no native controls — status badge lives in the
-         chat-head badges row (see below) so it's visible without overlapping
-         the camera overlay panels. -->
-    <audio id="ttsAudio" src="/stream.wav" preload="none" style="display:none"></audio>
-
     <!-- top-left: IMU float panel (horizontal) -->
     <div class="imu-float">
       <div class="imu-row">
@@ -381,7 +379,6 @@
         <span id="camStatus" class="badge">Camera: connecting…</span>
         <span id="asrStatus" class="badge">ASR: connecting…</span>
         <span id="fps" class="badge">FPS: --</span>
-        <span id="ttsAudioStatus" class="badge">🔇 tap anywhere for audio</span>
       </div>
       <div class="controls">
         <button class="ghost" id="btnClear">Clear Final</button>
@@ -683,97 +680,6 @@ window.sendCmd = async function(text, btn){
   });
 
   loadSettings();
-})();
-</script>
-
-<!-- browser TTS audio fallback: plays the same /stream.wav the ESP32 speaker
-     path is fed from, through this device's own speaker.
-
-     /stream.wav is deliberately PER-UTTERANCE, not a session-long
-     connection: _signal_stream_finished() (app_main.py) pushes a None
-     sentinel into the stream at the end of every AI turn, which makes
-     register_stream_route's generator (audio_stream.py) break and close
-     the HTTP response — by design, not a bug to work around server-side.
-     So a fresh connection has to be opened at the start of every turn.
-
-     Turn-boundary signal: reused from the existing /ws_ui PARTIAL:/FINAL:
-     protocol — the same one main.js already uses to drive the transcript
-     display. _on_output_transcription broadcasts PARTIAL:"[AI] ..." as
-     Gemini's spoken response streams in (once per turn, repeatedly during
-     it); _on_turn_complete broadcasts FINAL: for both the user and AI
-     text once the turn ends, right around when the server itself closes
-     the stream. No new server-side signal — this opens its own /ws_ui
-     WebSocket alongside main.js's (module-scoped, not reachable from
-     here) purely to observe the same broadcast messages. -->
-<script>
-(function(){
-  const audio = document.getElementById('ttsAudio');
-  const status = document.getElementById('ttsAudioStatus');
-  if (!audio || !status) return;
-
-  let unlocked = false;
-  let aiTurnOpen = false;
-
-  function setStatus(text){ status.textContent = text; }
-
-  // Always tear down before opening a fresh connection, whether the old
-  // one is still live or already closed server-side — this is what keeps
-  // turn N+1's open from racing/overlapping turn N's (requirement #4).
-  function closeStream(){
-    try { audio.pause(); } catch(e){}
-    try { audio.removeAttribute('src'); audio.load(); } catch(e){}
-  }
-
-  function openFreshStream(){
-    closeStream();
-    audio.src = '/stream.wav';
-    audio.load();
-    audio.play().then(()=>{
-      setStatus('🔊 audio playing');
-    }).catch(err=>{
-      setStatus('🔇 audio blocked (' + (err.message||err) + ')');
-    });
-  }
-
-  function unlockAndOpen(){
-    if (unlocked) return;
-    unlocked = true;
-    // Satisfies the browser's user-gesture requirement for autoplay. If a
-    // turn is already in progress (aiTurnOpen true), this doubles as
-    // opening that turn's actual connection; otherwise it's a harmless
-    // open-and-idle (register_stream_route just waits for real data).
-    openFreshStream();
-  }
-  document.addEventListener('click', unlockAndOpen, {once:true});
-  document.addEventListener('touchstart', unlockAndOpen, {once:true});
-  setStatus('🔇 tap anywhere to enable audio');
-
-  audio.addEventListener('error', ()=>{
-    if (unlocked) setStatus('🔇 audio stream error (will retry next turn)');
-  });
-
-  function connectTurnSignal(){
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws_ui`);
-    ws.onmessage = (ev)=>{
-      const s = ev.data || '';
-      if (s.startsWith('FINAL:')){
-        aiTurnOpen = false;
-        return;
-      }
-      if (!s.startsWith('PARTIAL:')) return;
-      const text = s.slice(8);
-      if (text.startsWith('[AI]') && !aiTurnOpen){
-        aiTurnOpen = true;
-        if (unlocked) openFreshStream();
-        // If not unlocked yet, the next user tap opens it late — inherent
-        // to autoplay policy, not something JS can route around.
-      }
-    };
-    ws.onclose = ()=> setTimeout(connectTurnSignal, 2000);
-    ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
-  }
-  connectTurnSignal();
 })();
 </script>
 

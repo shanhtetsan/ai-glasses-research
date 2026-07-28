@@ -265,14 +265,8 @@ def _mark_gemini_playing() -> None:
 async def _on_audio(pcm24k: bytes):
     """Gemini Live streams 24kHz PCM16 audio deltas.
 
-    Both downstream consumers — the ESP32 TTS websocket and
-    broadcast_pcm16_realtime (the browser's /stream.wav) — need 8kHz PCM:
-    audio_stream.STREAM_SR is 8000 and its WAV header is generated from that
-    constant, so /stream.wav's declared rate is 8kHz regardless of consumer.
-    A single 24k->8k resample is shared by both; previously this resampled a
-    second time to 16k for the browser path on the mistaken belief that
-    /stream.wav expected 16kHz, which fed 16kHz PCM into an 8kHz-labeled WAV
-    stream and made browser audio play back at roughly double speed.
+    The ESP32 TTS websocket needs 8kHz PCM: audio_stream.STREAM_SR is 8000,
+    so a single 24k->8k resample feeds it directly.
     """
     global _esp32_tts_started, _ratecv_state_8k
 
@@ -295,12 +289,6 @@ async def _on_audio(pcm24k: bytes):
                     await _ws.send_bytes(pcm8k[i:i + _TTS_CHUNK])
             except Exception as e:
                 print(f"[TTS-WS] send failed: {e}", flush=True)
-
-    if pcm8k:
-        # Browser /stream.wav — shares the same 8kHz PCM as the ESP32 send
-        # above (audio_stream.STREAM_SR is 8000; see this function's
-        # docstring for why a separate 16kHz resample was wrong here).
-        await broadcast_pcm16_realtime(pcm8k)
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
@@ -1944,7 +1932,21 @@ async def ws_imu(ws: WebSocket):
     imu_ws_clients.add(ws)
     try:
         while True:
-            await asyncio.sleep(60)
+            msg = await ws.receive()
+            if "text" in msg and msg["text"] is not None:
+                # Same parsing/processing as the old UDPProto.datagram_received
+                # path (see below) — this socket now doubles as the ESP32's
+                # ingestion channel, not just the browser-viewer broadcast-out.
+                try:
+                    d = json.loads(msg["text"])
+                    if 'ts' not in d and 'timestamp_ms' in d:
+                        d['ts'] = d.pop('timestamp_ms')
+                    process_imu_and_maybe_store(d)
+                    asyncio.create_task(imu_broadcast(json.dumps(d)))
+                except Exception:
+                    pass
+            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+                break
     except WebSocketDisconnect:
         pass
     finally:
