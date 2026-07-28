@@ -34,8 +34,8 @@ using namespace websockets;
 #define IMU_WS_ENABLED 0
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "IanLeeiPhone";
-const char* WIFI_PASS   = "ianleeiphone1";
+const char* WIFI_SSID   = "RashedAiPhone";
+const char* WIFI_PASS   = "RashedA206";
 const char* SERVER_HOST = "https://openaiglasses-thermal-test.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
@@ -1265,6 +1265,7 @@ bool connectWsSequential(WebsocketsClient& client, const char* path, const char*
 void setup() {
   Serial.begin(115200);
   delay(300);
+  wsMainMutex = xSemaphoreCreateRecursiveMutex();
 
   // Camera claims its memory first, on a clean/unfragmented heap — before
   // WiFi.begin() brings up the WiFi stack's own internal-RAM allocations,
