@@ -19,7 +19,7 @@ using namespace websockets;
 // Flip to 0 and reflash to fully disable the thermal subsystem (no MLX90640
 // init, no wsThermal connection attempt, no task) without touching anything
 // else below, if it causes instability during testing.
-#define THERMAL_ENABLED 1
+#define THERMAL_ENABLED 0
 
 // ===== IMU WebSocket enable/disable switch =====
 // wsImu is a FOURTH concurrent TLS connection alongside wsCam/wsAud/wsThermal.
@@ -27,11 +27,11 @@ using namespace websockets;
 // do NOT flip this to 1 at the same time as THERMAL_ENABLED without testing
 // that specific combination first, ideally against the throwaway
 // openaiglasses-thermal-test app rather than production.
-#define IMU_WS_ENABLED 1
+#define IMU_WS_ENABLED 0
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "IanLeeiPhone";
-const char* WIFI_PASS   = "ianleeiphone1";
+const char* WIFI_SSID   = "PromisingGuys";
+const char* WIFI_PASS   = "aloekanal2026";
 const char* SERVER_HOST = "openaiglasses-for-navigation.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
@@ -888,7 +888,7 @@ void taskTTSPlay(void*){
       size_t outPairs = 0;
       for (size_t i = 0; i < inSamp; ++i){
         int32_t s = (int32_t)inPtr[i];
-        s = (s * 19660) / 32768;
+        s = (s * 29491) / 32768;
         int32_t v32 = s << 16;
         stereo32Buf[outPairs*2 + 0] = v32;
         stereo32Buf[outPairs*2 + 1] = v32;
@@ -1134,17 +1134,19 @@ void setup() {
   // WiFi.begin() brings up the WiFi stack's own internal-RAM allocations,
   // and before any connectSecure() call claims a ~16KB+ contiguous mbedTLS
   // buffer (see the connectWsSequential() comment below for why that
-  // matters). esp_camera_set_psram_mode(true) right after a successful
-  // init routes the camera's internal DMA buffer to PSRAM instead of
-  // internal RAM — confirmed via esp32-camera library source/object
-  // inspection that this is a separate allocation from fb_location
-  // (frame-buffer-only) and defaults to internal RAM (g_psram_dma_mode
-  // starts false) unless this call is made. This is what the earlier
-  // "DMA buffer malloc failed, largest free block 4.3KB, needed 16KB"
-  // crash was hitting.
+  // matters). Camera stays in its default internal-RAM DMA mode (no
+  // esp_camera_set_psram_mode(true) call) — PSRAM-DMA mode was tried and
+  // reverted: the esp32-camera library's own frame-size guard
+  // (recv_size = width*height/5) is under-provisioned for this sensor/
+  // quality combo and floods "cam_hal: DMA overflow"/truncated JPEGs, a
+  // known-acknowledged issue in this library version with no app-level
+  // knob to raise it (the real fix is an ESP-IDF Kconfig value not
+  // reachable from Arduino sketch code). The TLS/heap contention that
+  // originally motivated PSRAM-DMA mode is instead being addressed via
+  // single-socket multiplexing (one connection instead of four) — if that
+  // works, PSRAM-DMA mode won't be needed, and stacking both would add
+  // risk to an already-large change.
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
-  esp_err_t psram_dma_err = esp_camera_set_psram_mode(true);
-  Serial.printf("[CAM] esp_camera_set_psram_mode(true) result: 0x%x\n", psram_dma_err);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);

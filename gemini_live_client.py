@@ -148,6 +148,14 @@ class GeminiLiveClient:
     async def receive_loop(self):
         while self.connected:
             try:
+                # session.receive() is documented/implemented (google-genai's
+                # AsyncSession.receive) to yield exactly one turn and then end
+                # the generator on its own right after turn_complete — that is
+                # normal per-turn completion, not a dropped connection. Track
+                # whether we saw it this iteration so the code after the
+                # `async for` can tell "Gemini finished normally" apart from
+                # "the stream died with no turn_complete ever received".
+                turn_complete_seen = False
                 async for response in self.session.receive():
                     server_content = response.server_content
 
@@ -172,16 +180,25 @@ class GeminiLiveClient:
                                 await self.on_output_transcription(text)
                         # MODEL FINISHED SPEAKING
                         if server_content.turn_complete:
+                            turn_complete_seen = True
                             if self.on_turn_complete:
                                 await self.on_turn_complete()
                         # USER BARGED IN — model's current response was cut off
                         if server_content.interrupted:
                             if self.on_interrupted:
                                 await self.on_interrupted()
-                # The `async for` above ended on its own (server closed the
-                # response stream without erroring) — if we're not shutting
-                # down deliberately, treat this the same as a dropped
-                # connection and try to reconnect rather than exiting silently.
+                # The `async for` above ended on its own (the generator
+                # returned rather than raising). If we already saw
+                # turn_complete this iteration, that's just the SDK ending
+                # the per-turn generator as designed — loop back and call
+                # session.receive() again on the same session for the next
+                # turn. No reconnect, no on_interrupted: the turn already
+                # completed successfully and firing either would be spurious.
+                if turn_complete_seen:
+                    continue
+                # No turn_complete ever arrived — the stream ended (or was
+                # never given one) mid-turn. That's a genuine dropped/aborted
+                # turn, so treat it as interrupted and reconnect.
                 if not self._shutting_down:
                     print("[Gemini Live] Response stream ended unexpectedly")
                     self.connected = False
