@@ -13,32 +13,47 @@ struct WavFmt;
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+#include "esp_heap_caps.h"  // MALLOC_CAP_SPIRAM for camThermalTxBuf
 using namespace websockets;
+
+// Strict hardware-integration mode: keep required sensor/audio paths and
+// disable runtime camera mutation and experimental networking.
+#define STABILITY_MODE 1
 
 // ===== Thermal enable/disable switch =====
 // Flip to 0 and reflash to fully disable the thermal subsystem (no MLX90640
-// init, no wsThermal connection attempt, no task) without touching anything
-// else below, if it causes instability during testing.
-#define THERMAL_ENABLED 0
+// init, no thermal frames sent, no task) without touching anything else
+// below, if it causes instability during testing. Camera keeps working on
+// the shared wsCamThermal socket either way — see the single-socket merge
+// comment near wsCamThermal's declaration below.
+#define THERMAL_ENABLED 1
 
-// ===== IMU WebSocket enable/disable switch =====
-// wsImu is a FOURTH concurrent TLS connection alongside wsCam/wsAud/wsThermal.
-// The one and only time thermal alone was tested tonight, it crashed the VM —
-// do NOT flip this to 1 at the same time as THERMAL_ENABLED without testing
-// that specific combination first, ideally against the throwaway
-// openaiglasses-thermal-test app rather than production.
-#define IMU_WS_ENABLED 0
+// IMU is always multiplexed on wsCamThermal; no third TLS client exists.
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "PromisingGuys";
-const char* WIFI_PASS   = "aloekanal2026";
-const char* SERVER_HOST = "openaiglasses-for-navigation.fly.dev";
+const char* WIFI_SSID   = "RashedAiPhone";
+const char* WIFI_PASS   = "RashedA206";
+const char* SERVER_HOST = "openaiglasses-thermal-test.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
-static const char* CAM_WS_PATH     = "/ws/camera";
+// ===== Stability configuration =====
+constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 10000;
+constexpr uint32_t HEARTBEAT_INTERVAL_MS = 15000;
+constexpr uint32_t SOCKET_STALE_TIMEOUT_MS = 45000;
+constexpr uint32_t CAMERA_MIN_FRAME_INTERVAL_MS = 250;  // <= 4 FPS
+constexpr uint32_t THERMAL_MIN_FRAME_INTERVAL_MS = 300; // <= 3.3 FPS
+constexpr uint32_t CAMERA_SEND_UNHEALTHY_MS = 2000;
+constexpr uint32_t MAX_RECONNECT_BACKOFF_MS = 30000;
+constexpr uint32_t CONNECTION_STABLE_RESET_MS = 30000;
+constexpr size_t CRITICAL_INTERNAL_BLOCK_BYTES = 16 * 1024;
+constexpr uint8_t CRITICAL_MEMORY_INTERVALS = 3;
+
+// Camera and thermal share one connection (see wsCamThermal below) instead
+// of separate /ws/camera and /ws/thermal sockets — merged to avoid the
+// DMA/heap contention crashes seen running two TLS sockets' worth of
+// camera+thermal traffic concurrently.
+static const char* CAM_THERMAL_WS_PATH = "/ws/camera_thermal";
 static const char* AUD_WS_PATH     = "/ws_audio";
-static const char* THERMAL_WS_PATH = "/ws/thermal";
-static const char* IMU_WS_PATH     = "/ws";
 
 // TLS CA for Fly.io: "ISRG Root X2", trusted directly rather than the true
 // self-signed root ("ISRG Root X1") one hop further up. Verified 2026-07-21
@@ -95,10 +110,18 @@ TT0mQ/r5XyA4MEAiabn7XJjvCERlF2dcn2wqJw+CreTkkQ2R
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "camera_pins.h"
 
-framesize_t g_frame_size = FRAMESIZE_VGA;
-#define JPEG_QUALITY  17
+framesize_t g_frame_size = STABILITY_MODE ? FRAMESIZE_QVGA : FRAMESIZE_VGA;
+// Raised from 25: creates memory/bandwidth headroom for thermal's added
+// traffic on the merged camera+thermal socket (see /ws/camera_thermal below).
+// Backed off from the originally-planned 32 to 30 after testing against real
+// recorded frames with the production YOLOE obstacle model: detection
+// confidence/count held flat down to ~10KB/frame (VGA) but started degrading
+// measurably below ~9KB, and 32 sits close enough to the upper edge of this
+// codebase's accepted quality range (SET:QUALITY clamps to 40 max) that it
+// risked landing in that degraded zone without hardware-level confirmation.
+#define JPEG_QUALITY  16
 #define FB_COUNT      2
-volatile int g_target_fps = 0;
+volatile int g_target_fps = 4;
 
 
 volatile unsigned long frame_captured_count = 0;
@@ -110,8 +133,9 @@ volatile unsigned long ws_send_fail_count = 0;
 // ===== Thermal (MLX90640) =====
 // Ported from feature/thermal-stability-fix as pure sensor driver code.
 // Transport is NOT ported from that branch (it used HTTP POST) — instead
-// frames are sent over wsThermal below, in the same wss:// pattern as
-// wsCam/wsAud, to match app_main.py's ws_thermal_esp contract exactly.
+// frames are sent over the shared wsCamThermal socket below (1-byte
+// MSG_TYPE_THERMAL prefix), matching app_main.py's merged /ws/camera_thermal
+// contract.
 #if THERMAL_ENABLED
 #include "MLX90640_API.h"
 #include "MLX90640_I2C_Driver.h"
@@ -124,7 +148,8 @@ volatile unsigned long ws_send_fail_count = 0;
 // Matched to THERMAL_READ_INTERVAL_MS below so the software read loop never
 // asks for frames faster than the sensor itself refreshes them.
 #define THERMAL_REFRESH_RATE_CODE 0x04
-#define THERMAL_READ_INTERVAL_MS 150  // ~6.7 Hz, within the 4-8 Hz target
+#define THERMAL_RESOLUTION_CODE 0x02  // fixed 18-bit ADC resolution
+#define THERMAL_READ_INTERVAL_MS THERMAL_MIN_FRAME_INTERVAL_MS
 
 // Guards the physical I2C bus, shared between the IMU (MPU-6050) and the
 // MLX90640 — both are plain Wire peripherals on the same pins, and without
@@ -136,14 +161,18 @@ SemaphoreHandle_t i2cMutex;
 
 #if THERMAL_ENABLED
 paramsMLX90640 mlx90640;
-static float thermalPixels[32 * 24];         // 768 floats = 3072 bytes; row-major (24 rows x 32 cols)
-static uint8_t thermalWireBuf[4 + sizeof(thermalPixels)];  // "THRM" + raw <f4 payload, sent as one binary WS frame
+constexpr size_t THERMAL_PIXEL_COUNT = 32 * 24;
+constexpr size_t THERMAL_PIXEL_BYTES = THERMAL_PIXEL_COUNT * sizeof(float);
+static float* thermalPixels = nullptr; // PSRAM, allocated and validated in setup()
 bool thermalReady = false;
 
 bool initThermal() {
   Serial.println("[THERMAL] Initializing...");
 
-  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) return false;
+  if (!xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(500))) {
+    Serial.println("[THERMAL] I2C mutex timeout during init");
+    return false;
+  }
 
   Wire.beginTransmission(THERMAL_ADDR);
   if (Wire.endTransmission() != 0) {
@@ -163,9 +192,17 @@ bool initThermal() {
     return false;
   }
 
-  MLX90640_SetRefreshRate(THERMAL_ADDR, THERMAL_REFRESH_RATE_CODE);
+  int refreshStatus = MLX90640_SetRefreshRate(THERMAL_ADDR, THERMAL_REFRESH_RATE_CODE);
+  int resolutionStatus = MLX90640_SetResolution(THERMAL_ADDR, THERMAL_RESOLUTION_CODE);
+  int modeStatus = MLX90640_SetChessMode(THERMAL_ADDR);
 
   xSemaphoreGive(i2cMutex);
+
+  if (refreshStatus != 0 || resolutionStatus != 0 || modeStatus != 0) {
+    Serial.printf("[THERMAL] fixed configuration failed refresh=%d resolution=%d mode=%d\n",
+                  refreshStatus, resolutionStatus, modeStatus);
+    return false;
+  }
 
   Serial.println("[THERMAL] Ready");
   return true;
@@ -194,13 +231,23 @@ const int TTS_RATE = 8000;
 #define IMU_I2C_SCL   D5   // D5
 
 // ===== WS / Queues / I2S =====
-WebsocketsClient wsCam;
+// Camera and thermal share this one socket (merged from formerly-separate
+// wsCam/wsThermal) — see CAM_THERMAL_WS_PATH above. Every message sent on it
+// starts with a 1-byte type prefix so the server can dispatch without a
+// second socket: MSG_TYPE_CAM for a JPEG frame, MSG_TYPE_THERMAL for a raw
+// float32 thermal block.
+#define MSG_TYPE_CAM      0x01
+#define MSG_TYPE_THERMAL  0x02
+#define MSG_TYPE_IMU      0x03
+#define MSG_TYPE_STATUS   0x04
+
+WebsocketsClient wsCamThermal;
 WebsocketsClient wsAud;
-volatile bool cam_ws_ready = false;
+volatile bool cam_thermal_ws_ready = false;
 volatile bool aud_ws_ready = false;
-// Set when ConnectionClosed fires for wsCam; cleared the moment loop() acts
-// on it. See the guard in loop() — crash evidence (symbolicated backtrace,
-// tonight's flash test) showed wsCam.available() itself crashing
+// Set when ConnectionClosed fires for wsCamThermal; cleared the moment loop()
+// acts on it. See the guard in loop() — crash evidence (symbolicated
+// backtrace, tonight's flash test) showed wsCam.available() itself crashing
 // (LoadProhibited, mbedTLS ssl_parse_record_header) when called right after
 // a close, because NetworkClientSecure::write()'s own internal error path
 // already tore down (freed) the mbedTLS session without going through
@@ -210,29 +257,22 @@ volatile bool aud_ws_ready = false;
 // fresh connectSecure(), which constructs a brand-new underlying client
 // object (upgradeToSecuredConnection() unconditionally `new`s one) rather
 // than touching the stale one.
-volatile bool cam_ws_closed_pending_reconnect = false;
+volatile bool cam_thermal_ws_closed_pending_reconnect = false;
 volatile bool aud_ws_closed_pending_reconnect = false;
 volatile bool snapshot_in_progress = false; // Pause live capture during a high-res snapshot
 
-#if THERMAL_ENABLED
-// Third socket, same pattern as wsCam/wsAud above (see cam_ws_closed_pending_reconnect's
-// comment for the use-after-free this guard avoids) — kept fully behind
-// THERMAL_ENABLED so disabling the flag leaves zero thermal-related network
-// activity, not just a dormant task.
-WebsocketsClient wsThermal;
-volatile bool thermal_ws_ready = false;
-volatile bool thermal_ws_closed_pending_reconnect = false;
-#endif
+// taskCamSend is the sole wsCamThermal owner. The thermal and camera tasks
+// only produce into bounded queues; callbacks execute synchronously from
+// taskCamSend's poll(), so no cross-core WebSocket access is possible.
+// Scratch buffer for building "1-byte type prefix + payload" messages before
+// handing them to sendBinary(), which needs one contiguous buffer per WS
+// frame. Sized to comfortably cover both a regular VGA preview JPEG
+// (typically well under 50KB at JPEG_QUALITY=30) and a SNAP:HQ high-res
+// (SXGA) capture, which can run well over 100KB. Allocated from PSRAM in
+// setup() — trivial relative to the several MB available there.
+#define CAM_TX_BUF_MAX (250 * 1024)
+static uint8_t* camThermalTxBuf = nullptr;
 
-#if IMU_WS_ENABLED
-// Fourth socket, same pattern as wsCam/wsAud/wsThermal above (see
-// cam_ws_closed_pending_reconnect's comment for the use-after-free this
-// guard avoids) — kept fully behind IMU_WS_ENABLED so disabling the flag
-// leaves zero IMU-network activity, not just a dormant task.
-WebsocketsClient wsImu;
-volatile bool imu_ws_ready = false;
-volatile bool imu_ws_closed_pending_reconnect = false;
-#endif
 
 typedef camera_fb_t* fb_ptr_t;
 QueueHandle_t qFrames;
@@ -246,11 +286,64 @@ QueueHandle_t qAudio;
 #define TTS_QUEUE_DEPTH 16
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
+#if THERMAL_ENABLED
+typedef struct { uint8_t data[1 + THERMAL_PIXEL_BYTES]; } ThermalChunk;
+QueueHandle_t qThermal;
+#endif
+typedef struct __attribute__((packed)) {
+  uint32_t sequence;
+  uint32_t uptimeMs;
+  float accelX;  // m/s^2
+  float accelY;
+  float accelZ;
+  float gyroX;   // degrees/second
+  float gyroY;
+  float gyroZ;
+} ImuPacket;
+static_assert(sizeof(ImuPacket) == 32, "IMU wire packet must remain 32 bytes");
+typedef struct __attribute__((packed)) {
+  uint32_t uptimeMs;
+  uint32_t freeHeap;
+  uint32_t largestInternal;
+  uint32_t freePsram;
+} StatusPacket;
+static_assert(sizeof(StatusPacket) == 16, "status wire packet must remain 16 bytes");
+QueueHandle_t qImu;
 volatile bool tts_playing = false;
 
 I2SClass i2sIn;   // PDM RX (Mic)
 I2SClass i2sOut;  // STD TX (Speaker)
 volatile bool run_audio_stream = false;
+
+TaskHandle_t camCaptureTaskHandle = nullptr;
+TaskHandle_t camNetworkTaskHandle = nullptr;
+TaskHandle_t micCaptureTaskHandle = nullptr;
+TaskHandle_t audioNetworkTaskHandle = nullptr;
+TaskHandle_t thermalTaskHandle = nullptr;
+TaskHandle_t ttsPlaybackTaskHandle = nullptr;
+TaskHandle_t imuTaskHandle = nullptr;
+
+volatile uint32_t camReconnectAttempts = 0;
+volatile uint32_t audReconnectAttempts = 0;
+volatile uint32_t lastCameraSendMs = 0;
+volatile uint32_t lastMicSendMs = 0;
+volatile uint32_t lastThermalSendMs = 0;
+volatile uint32_t lastSpeakerPacketMs = 0;
+volatile uint32_t camLastTrafficMs = 0;
+volatile uint32_t audLastTrafficMs = 0;
+volatile uint32_t micDroppedChunks = 0;
+volatile uint32_t ttsDroppedChunks = 0;
+volatile uint32_t thermalDroppedFrames = 0;
+volatile uint32_t thermalSentFrames = 0;
+volatile uint32_t imuSentPackets = 0;
+volatile uint32_t imuDroppedPackets = 0;
+volatile uint32_t micCapturedChunks = 0;
+volatile uint32_t micSentChunks = 0;
+volatile uint32_t speakerQueuedChunks = 0;
+volatile uint32_t speakerPlayedChunks = 0;
+volatile bool audioStartPending = false;
+volatile bool controlledRestartRequested = false;
+volatile bool setupComplete = false;
 
 // ====================================================================
 // Camera
@@ -311,7 +404,6 @@ bool init_camera() {
 inline void enqueue_frame(camera_fb_t* fb) {
   if (!fb) return;
   if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
-
     fb_ptr_t drop = nullptr;
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
       if (drop) {
@@ -319,7 +411,13 @@ inline void enqueue_frame(camera_fb_t* fb) {
         frame_dropped_count++;  
       }
     }
-    xQueueSend(qFrames, &fb, 0);
+    if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
+      // Ownership never becomes ambiguous: if the newest frame cannot be
+      // queued after evicting the old one, return it here exactly once.
+      esp_camera_fb_return(fb);
+      frame_dropped_count++;
+      Serial.println("[CAM] latest-frame enqueue failed; returned new framebuffer");
+    }
   }
 }
 
@@ -329,8 +427,8 @@ void taskCamCapture(void*) {
   
   for(;;){
     if (snapshot_in_progress) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-    
-    if (cam_ws_ready) {
+
+    if (cam_thermal_ws_ready) {
       camera_fb_t* fb = esp_camera_fb_get();
       if (fb) {
         frame_captured_count++;
@@ -361,86 +459,194 @@ void taskCamCapture(void*) {
   }
 }
 
+static uint32_t reconnectDelayMs(uint32_t attempt) {
+  uint32_t shift = min(attempt, (uint32_t)5);
+  uint32_t base = min(1000UL << shift, MAX_RECONNECT_BACKOFF_MS);
+  return min(base + (uint32_t)random(0, 251), MAX_RECONNECT_BACKOFF_MS);
+}
+
+static void closeCamSocket(const char* reason) {
+  Serial.printf("[WS-CAM] closing reason=%s\n", reason);
+  cam_thermal_ws_ready = false;
+  wsCamThermal.close();
+  cam_thermal_ws_closed_pending_reconnect = true;
+}
+
+// Sole owner of wsCamThermal: connect, poll, ping, close, camera sends,
+// thermal sends, and callback-driven SNAP sends all execute on this task.
 void taskCamSend(void*) {
-  static TickType_t lastTick = 0;
-  unsigned long last_log = 0;
-  unsigned long send_timeout_count = 0;
-  unsigned long last_sent_time = 0;
-  
-  for(;;){
-    fb_ptr_t fb = nullptr;
-    if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
-      if (fb && cam_ws_ready) {
-        // Frame-rate throttle: if target FPS is set, pace sends accordingly; extra frames discarded by qFrames
-        if (g_target_fps > 0) {
-          const int period_ms = 1000 / g_target_fps;
-          TickType_t now = xTaskGetTickCount();
-          int elapsed = (now - lastTick) * portTICK_PERIOD_MS;
-          if (elapsed < period_ms) vTaskDelay(pdMS_TO_TICKS(period_ms - elapsed));
-          lastTick = xTaskGetTickCount();
-        }
-        
-        unsigned long send_start = millis();
-        bool ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
-        unsigned long send_time = millis() - send_start;
-        
-        if (ok) {
-          frame_sent_count++;
-          last_sent_time = millis();
-          
+  uint32_t nextReconnectMs = 0;
+  uint32_t connectedSinceMs = 0;
+  uint32_t nextPingMs = 0;
+  uint32_t lastStatusMs = 0;
+  uint32_t lastCamAttemptMs = 0;
+#if THERMAL_ENABLED
+  static ThermalChunk thermal;
+#endif
+  ImuPacket imuPacket;
+  uint8_t imuWire[1 + sizeof(ImuPacket)];
+  uint8_t statusWire[1 + sizeof(StatusPacket)];
 
-          if (send_time > 100) {
-            Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
-          }
-        } else {
-          ws_send_fail_count++;
-          Serial.println("[CAM-SEND] ERROR: WebSocket send failed, closing...");
-          esp_camera_fb_return(fb);
-          wsCam.close(); 
-          cam_ws_ready = false;
-          continue;
-        }
-        
-        esp_camera_fb_return(fb);
-        
-        // Print send stats every 5s
-        unsigned long now = millis();
-        if (now - last_log > 5000) {
-          unsigned long gap = now - last_sent_time;
-          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
-                        frame_sent_count, frame_dropped_count, ws_send_fail_count, gap);
-          last_log = now;
-        }
-        
-      } else if (fb) { 
-        esp_camera_fb_return(fb); 
-      }
-    } else {
-
-      unsigned long now = millis();
-      if (cam_ws_ready && last_sent_time > 0 && (now - last_sent_time) > 3000) {
-        Serial.printf("[CAM-SEND] WARNING: No frame sent for %lu ms\n", now - last_sent_time);
-        send_timeout_count++;
-      }
+  for (;;) {
+    if (!setupComplete) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+    if (controlledRestartRequested) {
+      if (cam_thermal_ws_ready) closeCamSocket("controlled-restart");
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
+    uint32_t now = millis();
+    if (!cam_thermal_ws_ready) {
+      fb_ptr_t stale = nullptr;
+      while (xQueueReceive(qFrames, &stale, 0) == pdPASS)
+        if (stale) { esp_camera_fb_return(stale); frame_dropped_count++; }
+#if THERMAL_ENABLED
+      xQueueReset(qThermal);
+#endif
+      if (cam_thermal_ws_closed_pending_reconnect) {
+        cam_thermal_ws_closed_pending_reconnect = false;
+        camReconnectAttempts++;
+        nextReconnectMs = now + reconnectDelayMs(camReconnectAttempts - 1);
+      }
+      // Audio reconnect and uplink are intentionally allowed to recover first.
+      if (aud_ws_ready && (int32_t)(now - nextReconnectMs) >= 0) {
+        Serial.printf("[WS-CAM] reconnect attempt=%lu heap=%u max=%u\n",
+                      (unsigned long)(camReconnectAttempts + 1),
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        uint32_t started = millis();
+        bool ok = wsCamThermal.connectSecure(SERVER_HOST, SERVER_PORT, CAM_THERMAL_WS_PATH);
+        if (ok) {
+          connectedSinceMs = millis();
+          camLastTrafficMs = connectedSinceMs;
+          nextPingMs = connectedSinceMs + HEARTBEAT_INTERVAL_MS + 4000;
+          Serial.printf("[WS-CAM] connected in %lu ms\n", millis() - started);
+        } else {
+          camReconnectAttempts++;
+          uint32_t waitMs = reconnectDelayMs(camReconnectAttempts - 1);
+          nextReconnectMs = millis() + waitMs;
+          Serial.printf("[WS-CAM] reconnect failed; retry_ms=%lu\n", (unsigned long)waitMs);
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    wsCamThermal.poll();
+    now = millis();
+    if (connectedSinceMs && now - connectedSinceMs >= CONNECTION_STABLE_RESET_MS)
+      camReconnectAttempts = 0;
+    if ((int32_t)(now - nextPingMs) >= 0) {
+      if (!wsCamThermal.ping("")) { closeCamSocket("heartbeat-send-failed"); continue; }
+      nextPingMs = now + HEARTBEAT_INTERVAL_MS;
+    }
+    if (camLastTrafficMs && now - camLastTrafficMs >= SOCKET_STALE_TIMEOUT_MS) {
+      closeCamSocket("stale");
+      continue;
+    }
+    if (now - lastStatusMs >= HEALTH_LOG_INTERVAL_MS) {
+      StatusPacket status = {
+        now,
+        ESP.getFreeHeap(),
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        ESP.getFreePsram(),
+      };
+      statusWire[0] = MSG_TYPE_STATUS;
+      memcpy(statusWire + 1, &status, sizeof(status));
+      uint32_t statusStarted = millis();
+      bool statusOk = wsCamThermal.sendBinary((const char*)statusWire, sizeof(statusWire));
+      uint32_t statusElapsed = millis() - statusStarted;
+      if (!statusOk || statusElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        closeCamSocket(statusOk ? "status-send-unhealthy" : "status-send-failed");
+        continue;
+      }
+      lastStatusMs = now;
+      camLastTrafficMs = millis();
+    }
+
+#if THERMAL_ENABLED
+    // Audio remains higher priority; thermal goes before the larger camera frame.
+    if (xQueueReceive(qThermal, &thermal, 0) == pdPASS) {
+      uint32_t thermalStarted = millis();
+      bool ok = wsCamThermal.sendBinary((const char*)thermal.data, sizeof(thermal.data));
+      uint32_t thermalElapsed = millis() - thermalStarted;
+      if (!ok || thermalElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        thermalDroppedFrames++;
+        closeCamSocket(ok ? "thermal-send-unhealthy" : "thermal-send-failed");
+        continue;
+      }
+      lastThermalSendMs = camLastTrafficMs = millis();
+      thermalSentFrames++;
+    }
+#endif
+
+    if (xQueueReceive(qImu, &imuPacket, 0) == pdPASS) {
+      imuWire[0] = MSG_TYPE_IMU;
+      memcpy(imuWire + 1, &imuPacket, sizeof(imuPacket));
+      uint32_t started = millis();
+      bool ok = wsCamThermal.sendBinary((const char*)imuWire, sizeof(imuWire));
+      uint32_t elapsed = millis() - started;
+      if (!ok || elapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        imuDroppedPackets++;
+        closeCamSocket(ok ? "imu-send-unhealthy" : "imu-send-failed");
+        continue;
+      }
+      imuSentPackets++;
+      camLastTrafficMs = millis();
+    }
+
+    fb_ptr_t fb = nullptr;
+    if (now - lastCamAttemptMs >= CAMERA_MIN_FRAME_INTERVAL_MS &&
+        xQueueReceive(qFrames, &fb, 0) == pdPASS) {
+      lastCamAttemptMs = now;
+      bool ok = false;
+      uint32_t sendStarted = millis();
+      if (fb && fb->len + 1 <= CAM_TX_BUF_MAX) {
+        camThermalTxBuf[0] = MSG_TYPE_CAM;
+        memcpy(camThermalTxBuf + 1, fb->buf, fb->len);
+        size_t wireLen = fb->len + 1;
+        esp_camera_fb_return(fb);
+        fb = nullptr; // TLS may block, but the camera driver no longer owns this wait.
+        ok = wsCamThermal.sendBinary((const char*)camThermalTxBuf, wireLen);
+      } else if (fb) {
+        Serial.printf("[CAM] frame too large bytes=%u; dropping\n", fb->len);
+      }
+      uint32_t elapsed = millis() - sendStarted;
+      if (fb) esp_camera_fb_return(fb);
+      if (ok) {
+        frame_sent_count++;
+        lastCameraSendMs = camLastTrafficMs = millis();
+      } else {
+        ws_send_fail_count++;
+      }
+      // ArduinoWebsockets 0.5.4 exposes no socket/write-timeout setter.
+      // This detects a blocked TLS write only after it returns; it cannot
+      // interrupt the call. The owner closes and drops the stale frame then.
+      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        Serial.printf("[CAM] unhealthy send elapsed_ms=%lu; reconnecting\n", elapsed);
+        closeCamSocket("camera-send-unhealthy");
+        continue;
+      }
+      if (!ok) { closeCamSocket("camera-send-failed"); continue; }
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 // ====================================================================
 // Mic (PDM RX)
 // ====================================================================
-void init_i2s_in(){
+bool init_i2s_in(){
   i2sIn.setPinsPdmRx(I2S_MIC_CLOCK_PIN, I2S_MIC_DATA_PIN);
   if (!i2sIn.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println("[I2S IN] init failed");
-    while(1) { delay(1000); }
+    return false;
   }
   Serial.println("[I2S IN] PDM RX @16kHz 16bit MONO ready");
+  return true;
 }
 
 void taskMicCapture(void*){
   const int samples_per_chunk = BYTES_PER_CHUNK / 2; // int16
   for(;;){
-    if (run_audio_stream && aud_ws_ready) {
+    if (run_audio_stream) {
       AudioChunk ch; ch.n = BYTES_PER_CHUNK;
       int16_t* out = reinterpret_cast<int16_t*>(ch.data);
       int i = 0;
@@ -449,10 +655,13 @@ void taskMicCapture(void*){
         if (v == -1) { delay(1); continue; }
         out[i++] = (int16_t)v;
       }
+      micCapturedChunks++;
       if (xQueueSend(qAudio, &ch, 0) != pdPASS){
         AudioChunk dump;
-        xQueueReceive(qAudio, &dump, 0);
-        xQueueSend(qAudio, &ch, 0);
+        if (xQueueReceive(qAudio, &dump, 0) == pdPASS) micDroppedChunks++;
+        if (xQueueSend(qAudio, &ch, 0) != pdPASS) micDroppedChunks++;
+        if ((micDroppedChunks % 50) == 1)
+          Serial.printf("[MIC] queue full; dropped_oldest total=%lu\n", micDroppedChunks);
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(5));
@@ -461,28 +670,105 @@ void taskMicCapture(void*){
 }
 
 void taskMicUpload(void*){
+  uint32_t nextReconnectMs = 0;
+  uint32_t connectedSinceMs = 0;
+  uint32_t lastPingMs = 0;
   for(;;){
-    if (run_audio_stream && aud_ws_ready){
-      AudioChunk ch;
-      if (xQueueReceive(qAudio, &ch, pdMS_TO_TICKS(100)) == pdPASS){
-        wsAud.sendBinary((const char*)ch.data, ch.n);
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(10));
+    if (!setupComplete) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+    if (controlledRestartRequested) {
+      if (aud_ws_ready) { aud_ws_ready = false; wsAud.close(); }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
+    uint32_t now = millis();
+    if (!aud_ws_ready) {
+      if (aud_ws_closed_pending_reconnect) {
+        aud_ws_closed_pending_reconnect = false;
+        audReconnectAttempts++;
+        nextReconnectMs = now + reconnectDelayMs(audReconnectAttempts - 1);
+      }
+      if ((int32_t)(now - nextReconnectMs) >= 0) {
+        Serial.printf("[WS-AUD] reconnect attempt=%lu heap=%u max=%u\n",
+                      (unsigned long)(audReconnectAttempts + 1),
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        uint32_t started = millis();
+        bool ok = wsAud.connectSecure(SERVER_HOST, SERVER_PORT, AUD_WS_PATH);
+        if (ok) {
+          connectedSinceMs = millis();
+          audLastTrafficMs = connectedSinceMs;
+          lastPingMs = connectedSinceMs;
+          audioStartPending = true;
+          Serial.printf("[WS-AUD] connected in %lu ms\n", millis() - started);
+        } else {
+          audReconnectAttempts++;
+          uint32_t waitMs = reconnectDelayMs(audReconnectAttempts - 1);
+          nextReconnectMs = millis() + waitMs;
+          Serial.printf("[WS-AUD] reconnect failed; retry_ms=%lu\n", (unsigned long)waitMs);
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    wsAud.poll();
+    now = millis();
+    if (connectedSinceMs && now - connectedSinceMs >= CONNECTION_STABLE_RESET_MS)
+      audReconnectAttempts = 0;
+    if (audioStartPending) {
+      audioStartPending = false;
+      uint32_t startStarted = millis();
+      bool startOk = wsAud.send("START");
+      uint32_t startElapsed = millis() - startStarted;
+      if (!startOk || startElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        Serial.println("[WS-AUD] START send failed");
+        aud_ws_ready = false;
+        wsAud.close();
+        continue;
+      }
+      run_audio_stream = true;
+      audLastTrafficMs = millis();
+    }
+    if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS) {
+      if (!wsAud.ping("")) {
+        Serial.println("[WS-AUD] heartbeat send failed; reconnecting");
+        aud_ws_ready = false; wsAud.close(); continue;
+      }
+      lastPingMs = now;
+    }
+    if (audLastTrafficMs && now - audLastTrafficMs >= SOCKET_STALE_TIMEOUT_MS) {
+      Serial.println("[WS-AUD] stale; reconnecting");
+      aud_ws_ready = false; wsAud.close(); continue;
+    }
+    if (run_audio_stream && !tts_playing) {
+      AudioChunk ch;
+      if (xQueueReceive(qAudio, &ch, 0) == pdPASS) {
+        uint32_t audioStarted = millis();
+        bool audioOk = wsAud.sendBinary((const char*)ch.data, ch.n);
+        uint32_t audioElapsed = millis() - audioStarted;
+        if (!audioOk || audioElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+          Serial.printf("[MIC] upload failed bytes=%u; reconnecting\n", (unsigned)ch.n);
+          micDroppedChunks++;
+          aud_ws_ready = false; wsAud.close(); continue;
+        }
+        lastMicSendMs = audLastTrafficMs = millis();
+        micSentChunks++;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 // ====================================================================
 // Speaker (I2S TX) + HTTP /stream.wav (chunked-safe)
 // ====================================================================
-void init_i2s_out(){
+bool init_i2s_out(){
   i2sOut.setPins(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
   if (!i2sOut.begin(I2S_MODE_STD, TTS_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
     Serial.println("[I2S OUT] init failed");
-    while(1){ delay(1000); }
+    return false;
   }
-  Serial.println("[I2S OUT] STD TX @16kHz 32bit STEREO ready");
+  Serial.printf("[I2S OUT] STD TX @%dHz 32bit STEREO ready\n", TTS_RATE);
+  return true;
 }
 
 struct WavFmt {
@@ -631,7 +917,7 @@ static volatile bool http_play_running = false;
 void taskHttpPlay(void*){
   http_play_running = true;
   // Not asked for directly, but required by the same SERVER_PORT=443 change:
-  // this is a plain HTTP GET of /stream.wav, unrelated to wsCam/wsAud/
+  // this is a plain HTTP GET of /stream.wav, unrelated to wsCamThermal/wsAud/
   // ArduinoWebsockets — a bare WiFiClient can't complete a TLS handshake, so
   // without this it would silently fail to connect every time the server
   // only serves 443 (Fly.io doesn't listen on plain HTTP at all).
@@ -852,8 +1138,15 @@ void taskHttpPlay(void*){
 
 void startStreamWav(){
   if (taskHttpPlayHandle) return;
-  xTaskCreatePinnedToCore(taskHttpPlay, "http_wav", 8192, nullptr, 2, &taskHttpPlayHandle, 0);
-  Serial.println("[AUDIO] http_wav task started");
+  BaseType_t result = xTaskCreatePinnedToCore(
+      taskHttpPlay, "http_wav", 8192, nullptr, 2, &taskHttpPlayHandle, 0);
+  if (result != pdPASS || !taskHttpPlayHandle) {
+    Serial.printf("[FATAL] component=HTTP-AUDIO task create result=%ld handle=%p heap=%u max=%u\n",
+                  (long)result, taskHttpPlayHandle, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    delay(500);
+    esp_restart();
+  }
+  Serial.printf("[AUDIO] http_wav task started result=%ld\n", (long)result);
 }
 void stopStreamWav(){
   if (!taskHttpPlayHandle) return;
@@ -874,13 +1167,15 @@ void taskTTSPlay(void*){
     TTSChunk ch;
     if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS){
       if (ch.n == 0) {                     // TTS:END sentinel from server
+        Serial.println("[TTS] playback complete");
         tts_playing = false;
         run_audio_stream = true;           // playback truly finished — un-mute the mic
         first_chunk_pending = true;        // next session should log its first chunk again
         continue;
       }
+      speakerPlayedChunks++;
       if (first_chunk_pending) {
-        Serial.printf("[TTS-PLAY] chunk n=%u, i2s write starting\n", ch.n);
+        Serial.printf("[TTS] playback start bytes=%u\n", ch.n);
         first_chunk_pending = false;
       }
       size_t inSamp  = ch.n / 2;
@@ -898,7 +1193,10 @@ void taskTTSPlay(void*){
           size_t off = 0;
           while (off < bytes){
             size_t wrote = i2sOut.write((uint8_t*)stereo32Buf + off, bytes - off);
-            if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1)); else off += wrote;
+            if (wrote == 0) {
+              Serial.println("[TTS] I2S write failure wrote=0");
+              vTaskDelay(pdMS_TO_TICKS(1));
+            } else off += wrote;
           }
           outPairs = 0;
         }
@@ -908,7 +1206,10 @@ void taskTTSPlay(void*){
         size_t off = 0;
         while (off < bytes){
           size_t wrote = i2sOut.write((uint8_t*)stereo32Buf + off, bytes - off);
-          if (wrote == 0) vTaskDelay(pdMS_TO_TICKS(1)); else off += wrote;
+          if (wrote == 0) {
+            Serial.println("[TTS] I2S write failure wrote=0");
+            vTaskDelay(pdMS_TO_TICKS(1));
+          } else off += wrote;
         }
       }
     }
@@ -945,7 +1246,10 @@ void initI2cBus() {
 }
 
 static void mpu_write(uint8_t reg, uint8_t val) {
-  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) return;
+  if (!xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50))) {
+    Serial.println("[IMU] I2C mutex timeout write");
+    return;
+  }
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.write(val);
@@ -954,7 +1258,10 @@ static void mpu_write(uint8_t reg, uint8_t val) {
 }
 
 static uint8_t mpu_read1(uint8_t reg) {
-  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) return 0xFF;
+  if (!xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50))) {
+    Serial.println("[IMU] I2C mutex timeout read1");
+    return 0xFF;
+  }
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.endTransmission(false);  // repeated-START keeps bus active for the read
@@ -965,7 +1272,11 @@ static uint8_t mpu_read1(uint8_t reg) {
 }
 
 static void mpu_read14(uint8_t* dst) {
-  if (!xSemaphoreTake(i2cMutex, portMAX_DELAY)) { memset(dst, 0, 14); return; }
+  if (!xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50))) {
+    Serial.println("[IMU] I2C mutex timeout read14");
+    memset(dst, 0, 14);
+    return;
+  }
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(MPU_REG_ACCEL_OUT);
   Wire.endTransmission(false);  // repeated-START — do not release bus
@@ -1017,6 +1328,7 @@ bool  ema_inited = false;
 float ax_f=0, ay_f=0, az_f=0;
 
 void taskImuLoop(void*){
+  uint32_t sequence = 0;
   for(;;){
     static bool inited = false;
     if (!inited){
@@ -1036,32 +1348,28 @@ void taskImuLoop(void*){
       az_f = EMA_ALPHA*az + (1-EMA_ALPHA)*az_f;
     }
 
-    char buf[256];
-    unsigned long ts = millis();
-    int n = snprintf(buf, sizeof(buf),
-      "{\"ts\":%lu,\"temp_c\":%.2f,"
-      "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-      "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
-      ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
-
-#if IMU_WS_ENABLED
-    if (n > 0 && imu_ws_ready) {
-      wsImu.send(buf);
-    }
-#endif
-    vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
+    ImuPacket packet = {
+      ++sequence, millis(), ax_f, ay_f, az_f, gx, gy, gz
+    };
+    if (xQueueOverwrite(qImu, &packet) != pdPASS) imuDroppedPackets++;
+    vTaskDelay(pdMS_TO_TICKS(100)); // Fixed 10 Hz stability cadence.
   }
 }
 
 #if THERMAL_ENABLED
 // ====================================================================
-// Thermal (MLX90640) — sensor read + wsThermal send
+// Thermal (MLX90640) — sensor read + wsCamThermal send
 // ====================================================================
 // Read cadence/refresh rate ported from thermal-stability-fix's
 // taskThermalLoop() (init sequence, MLX90640_GetFrameData/GetTa/CalculateTo
 // calls), but re-throttled to THERMAL_READ_INTERVAL_MS (~6.7 Hz, was 3000ms
-// there) and re-wired to send over wsThermal instead of an HTTP POST.
+// there) and re-wired to send over the shared wsCamThermal socket (1-byte
+// MSG_TYPE_THERMAL prefix, mutex-protected — see wsCamThermalMutex's
+// declaration comment for why: this task runs pinned to core 0 while
+// taskCamSend runs pinned to core 1, both writing the same socket) instead
+// of an HTTP POST.
 void taskThermalLoop(void* pv) {
+  uint32_t consecutiveReadFailures = 0;
   for (;;) {
     if (!thermalReady) {
       thermalReady = initThermal();
@@ -1074,6 +1382,9 @@ void taskThermalLoop(void* pv) {
       xSemaphoreGive(i2cMutex);
 
       if (status < 0) {
+        consecutiveReadFailures++;
+        Serial.printf("[THERMAL] frame read failed status=%d consecutive=%lu\n",
+                      status, (unsigned long)consecutiveReadFailures);
         thermalReady = false;
         vTaskDelay(pdMS_TO_TICKS(1000));
         continue;
@@ -1087,19 +1398,18 @@ void taskThermalLoop(void* pv) {
     float Ta = MLX90640_GetTa(frame, &mlx90640);
     float tr = Ta - THERMAL_TA_SHIFT;
     MLX90640_CalculateTo(frame, &mlx90640, THERMAL_EMISSIVITY, tr, thermalPixels);
+    consecutiveReadFailures = 0;
 
-    if (thermal_ws_ready) {
-      memcpy(thermalWireBuf, "THRM", 4);
-      memcpy(thermalWireBuf + 4, thermalPixels, sizeof(thermalPixels));
-      bool ok = wsThermal.sendBinary((const char*)thermalWireBuf, sizeof(thermalWireBuf));
-      if (!ok) {
-        Serial.println("[THERMAL-SEND] ERROR: WebSocket send failed, closing...");
-        wsThermal.close();
-        thermal_ws_ready = false;
-      }
+    static ThermalChunk chunk;
+    chunk.data[0] = MSG_TYPE_THERMAL;
+    memcpy(chunk.data + 1, thermalPixels, THERMAL_PIXEL_BYTES);
+    if (xQueueOverwrite(qThermal, &chunk) != pdPASS) {
+      thermalDroppedFrames++;
+      Serial.printf("[THERMAL] latest-frame queue failed dropped=%lu\n",
+                    (unsigned long)thermalDroppedFrames);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(THERMAL_READ_INTERVAL_MS));
+    vTaskDelay(pdMS_TO_TICKS(THERMAL_MIN_FRAME_INTERVAL_MS));
   }
 }
 #endif  // THERMAL_ENABLED
@@ -1108,22 +1418,18 @@ void taskThermalLoop(void* pv) {
 // Setup / Loop
 // ====================================================================
 
-// Runs a single client's first connectSecure() attempt to completion
-// (success or failure) before returning, so setup()'s initial connection
-// sequence is genuinely one-at-a-time rather than four calls fired
-// back-to-back. connectSecure() is already synchronous internally (TCP +
-// TLS handshake + HTTP upgrade inline), so this doesn't change *that* —
-// what it adds is the explicit delay(100) below, giving the heap a moment
-// to settle between one TLS teardown/handshake and the next rather than
-// chaining four ~16KB+ contiguous mbedTLS allocations with zero gap.
-bool connectWsSequential(WebsocketsClient& client, const char* path, const char* objName, const char* tag) {
-  Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  unsigned long t0 = millis();
-  bool connected = client.connectSecure(SERVER_HOST, SERVER_PORT, path);
-  Serial.printf("[DEBUG] ws%s.connectSecure() (setup, first attempt) took %lu ms, result: %d\n", objName, millis() - t0, connected);
-  if (connected) Serial.printf("[WS-%s] connected\n", tag);
-  delay(100);
-  return connected;
+QueueHandle_t createPsramQueue(UBaseType_t depth, UBaseType_t itemSize, const char* name) {
+  uint8_t* storage = (uint8_t*)heap_caps_calloc(depth, itemSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  StaticQueue_t* control = (StaticQueue_t*)heap_caps_calloc(
+      1, sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!storage || !control) {
+    Serial.printf("[FATAL] queue backing allocation failed name=%s storage=%p control=%p\n",
+                  name, storage, control);
+    return nullptr;
+  }
+  QueueHandle_t q = xQueueCreateStatic(depth, itemSize, storage, control);
+  if (!q) Serial.printf("[FATAL] xQueueCreateStatic failed name=%s\n", name);
+  return q;
 }
 
 void setup() {
@@ -1192,24 +1498,15 @@ void setup() {
   // connectSecure() itself, so a malformed cert can only ever show up there
   // — which is exactly what the [DEBUG] timing/status prints around
   // connectSecure() below are already positioned to catch, not here.
-  wsCam.setCACert(FLY_ROOT_CA);
+  wsCamThermal.setCACert(FLY_ROOT_CA);
   wsAud.setCACert(FLY_ROOT_CA);
-#if THERMAL_ENABLED
-  wsThermal.setCACert(FLY_ROOT_CA);
-#endif
-#if IMU_WS_ENABLED
-  // NOTE: this call was missing when wsImu was first added — without it,
-  // wsImu.connectSecure() would fail on every attempt (setInsecure() does
-  // not work on this library/core combination; see the NOTE above this
-  // function). Fixed here.
-  wsImu.setCACert(FLY_ROOT_CA);
-#endif
   Serial.printf("[DEBUG] FLY_ROOT_CA length: %d bytes (sanity check the PROGMEM string is intact — not a parse/verify result, setCACert() has none)\n", strlen(FLY_ROOT_CA));
 
-  wsCam.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened)  { 
-      cam_ws_ready = true;  
-      Serial.println("[WS-CAM] open");
+  wsCamThermal.onEvent([](WebsocketsEvent ev, String){
+    if (ev == WebsocketsEvent::ConnectionOpened)  {
+      cam_thermal_ws_ready = true;
+      camLastTrafficMs = millis();
+      Serial.println("[WS-CAM-THERMAL] open");
       // Reset statistics
       frame_sent_count = 0;
       frame_dropped_count = 0;
@@ -1217,14 +1514,23 @@ void setup() {
       last_stats_time = millis();
     }
     if (ev == WebsocketsEvent::ConnectionClosed)  {
-      cam_ws_ready = false;
-      cam_ws_closed_pending_reconnect = true;
-      Serial.printf("[WS-CAM] closed (sent=%lu, dropped=%lu, fail=%lu)\n",
+      cam_thermal_ws_ready = false;
+      cam_thermal_ws_closed_pending_reconnect = true;
+      Serial.printf("[WS-CAM-THERMAL] closed (sent=%lu, dropped=%lu, fail=%lu)\n",
                     frame_sent_count, frame_dropped_count, ws_send_fail_count);
     }
+    if (ev == WebsocketsEvent::GotPing || ev == WebsocketsEvent::GotPong)
+      camLastTrafficMs = millis();
   });
 
-  wsCam.onMessage([](WebsocketsMessage msg){
+  wsCamThermal.onMessage([](WebsocketsMessage msg){
+    camLastTrafficMs = millis();
+#if STABILITY_MODE
+    if (msg.isText()) {
+      Serial.println("[CAM] runtime command ignored in STABILITY_MODE");
+    }
+    return;
+#else
     if (msg.isText()){
       String cmd = msg.data(); cmd.trim();
       if (cmd.startsWith("SET:FRAMESIZE=")) {
@@ -1293,9 +1599,16 @@ void setup() {
         vTaskDelay(pdMS_TO_TICKS(500));
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb && fb->format == PIXFORMAT_JPEG) {
-          wsCam.send("SNAP:BEGIN");
-          bool ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
-          wsCam.send("SNAP:END");
+          bool ok = false;
+          if (fb->len + 1 > CAM_TX_BUF_MAX) {
+            Serial.printf("[CAM] SNAP too large for tx buffer (%u bytes)\n", fb->len);
+          } else {
+            wsCamThermal.send("SNAP:BEGIN");
+            camThermalTxBuf[0] = MSG_TYPE_CAM;
+            memcpy(camThermalTxBuf + 1, fb->buf, fb->len);
+            ok = wsCamThermal.sendBinary((const char*)camThermalTxBuf, fb->len + 1);
+            wsCamThermal.send("SNAP:END");
+          }
           if (!ok) { Serial.println("[CAM] SNAP send failed"); }
           esp_camera_fb_return(fb);
         } else {
@@ -1309,24 +1622,33 @@ void setup() {
         snapshot_in_progress = false;
       }
     }
+#endif
   });
 
   wsAud.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened)  { aud_ws_ready = true;  Serial.println("[WS-AUD] open"); }
+    if (ev == WebsocketsEvent::ConnectionOpened)  {
+      aud_ws_ready = true;
+      audLastTrafficMs = millis();
+      Serial.println("[WS-AUD] open");
+    }
     if (ev == WebsocketsEvent::ConnectionClosed)  {
       aud_ws_ready = false;
       aud_ws_closed_pending_reconnect = true;
       Serial.println("[WS-AUD] closed");
       stopStreamWav();
     }
+    if (ev == WebsocketsEvent::GotPing || ev == WebsocketsEvent::GotPong)
+      audLastTrafficMs = millis();
   });
 
   wsAud.onMessage([](WebsocketsMessage msg){
+    audLastTrafficMs = millis();
     if (msg.isText()){
       String s = msg.data(); s.trim();
       if (s == "RESTART"){
-        run_audio_stream = false; xQueueReset(qAudio); delay(50);
-        wsAud.send("START"); run_audio_stream = true;
+        run_audio_stream = false;
+        xQueueReset(qAudio);
+        audioStartPending = true; // owner task sends START after callback returns
       } else if (s == "TTS:START") {
         run_audio_stream = false;   // mute mic during playback: no echo, no wsAud contention
         xQueueReset(qAudio);        // drop any mic frames already captured
@@ -1344,11 +1666,13 @@ void setup() {
           // Ensure the end-sentinel actually lands. If qTTS is briefly full the
           // sentinel could be dropped, leaving tts_playing stuck true and the mic
           // muted forever. Retry, then hard-recover if it still won't queue.
-          int tries = 0;
-          while (xQueueSend(qTTS, &sentinel, pdMS_TO_TICKS(20)) != pdPASS && tries < 10) {
-            tries++;
-          }
-          if (tries >= 10) {
+          if (xQueueSend(qTTS, &sentinel, 0) != pdPASS) {
+            TTSChunk dropped;
+            xQueueReceive(qTTS, &dropped, 0);
+            if (xQueueSend(qTTS, &sentinel, 0) != pdPASS) {
+              Serial.println("[TTS] end sentinel queue failure; forcing recovery");
+              ttsDroppedChunks++;
+            }
             tts_playing = false;      // fallback: force idle so the mic recovers
             run_audio_stream = true;
           }
@@ -1361,272 +1685,238 @@ void setup() {
         if (!warned) { Serial.println("[TTS] qTTS is NULL, dropping TTS audio"); warned = true; }
         return;
       }
-      TTSChunk ch = {};
+      static TTSChunk ch;
+      memset(&ch, 0, sizeof(ch));
       size_t n = min((size_t)msg.length(), sizeof(ch.data));
       ch.n = (uint16_t)n;
       memcpy(ch.data, msg.rawData().c_str(), n);  // rawData() is std::string — safe for null bytes in PCM
       bool queued_ok = xQueueSend(qTTS, &ch, 0) == pdPASS;  // non-blocking; drop if queue full
-      Serial.printf("[TTS] binary frame: %u bytes, tts_playing=%d, queued=%d\n", (unsigned)n, tts_playing, queued_ok);
+      lastSpeakerPacketMs = millis();
+      if (queued_ok) {
+        speakerQueuedChunks++;
+        if ((speakerQueuedChunks % 25) == 1)
+          Serial.printf("[TTS] queued=%lu depth=%u\n",
+                        (unsigned long)speakerQueuedChunks,
+                        (unsigned)uxQueueMessagesWaiting(qTTS));
+      } else {
+        ttsDroppedChunks++;
+        Serial.printf("[TTS] queue overflow dropped=%lu depth=%u\n",
+                      (unsigned long)ttsDroppedChunks,
+                      (unsigned)uxQueueMessagesWaiting(qTTS));
+      }
     }
   });
 
-#if THERMAL_ENABLED
-  // Same guard pattern as wsCam/wsAud above — see cam_ws_closed_pending_reconnect's
-  // comment for the use-after-free this avoids. No onMessage handler: the
-  // server (ws_thermal_esp in app_main.py) never sends anything back on
-  // this socket, it only relays frames to browser viewers.
-  wsThermal.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened) {
-      thermal_ws_ready = true;
-      Serial.println("[WS-THERMAL] open");
-    }
-    if (ev == WebsocketsEvent::ConnectionClosed) {
-      thermal_ws_ready = false;
-      thermal_ws_closed_pending_reconnect = true;
-      Serial.println("[WS-THERMAL] closed");
-    }
-  });
-#endif
+// Thermal has no separate onEvent registration — it shares wsCamThermal's
+// connection lifecycle (open/close) with the camera, handled by the single
+// wsCamThermal.onEvent() above. It also has no onMessage handler: the server
+// (dispatched by MSG_TYPE from the merged /ws/camera_thermal handler) never
+// sends anything back for thermal frames specifically, only camera SET:*
+// commands, which wsCamThermal.onMessage() above already handles.
 
-#if IMU_WS_ENABLED
-  // Same guard pattern as wsCam/wsAud/wsThermal above — see
-  // cam_ws_closed_pending_reconnect's comment for the use-after-free this
-  // avoids. No onMessage handler: the server (ws_imu in app_main.py)
-  // rebroadcasts IMU JSON to all connected clients including this one, but
-  // nothing on the firmware side needs to act on it.
-  wsImu.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened) {
-      imu_ws_ready = true;
-      Serial.println("[WS-IMU] open");
-    }
-    if (ev == WebsocketsEvent::ConnectionClosed) {
-      imu_ws_ready = false;
-      imu_ws_closed_pending_reconnect = true;
-      Serial.println("[WS-IMU] closed");
-    }
-  });
-#endif
+  // Network owner tasks below perform all initial connections and reconnects.
+  // Starting audio first preserves heap and service priority; camera waits
+  // until the audio socket is ready before attempting its TLS handshake.
 
-  // Initial connect sequence: each client's connectSecure() call runs to
-  // completion (success or failure), plus a short heap-settle delay, before
-  // the next one starts — see connectWsSequential()'s comment above. This
-  // replaces four back-to-back connectSecure() calls that had no gap
-  // between them.
-  //
-  // Note this now runs after camera init (moved to the very top of
-  // setup(), see the comment there) rather than before it — so the
-  // "freshest, least-fragmented heap" this block wants belongs to camera
-  // init first, then these four connects in turn. loop()'s existing retry
-  // logic still runs afterward as the fallback/reconnect path — if this
-  // succeeds, wsCam.available()/wsAud.available() will already be true
-  // there and it simply won't re-attempt.
-  //
-  // Blocking note: connectSecure() is synchronous (TCP + TLS handshake +
-  // HTTP upgrade inline) — if it hangs, setup() (and therefore I2S/queue/
-  // task creation below) is delayed by however long that takes, up to the
-  // 30s TCP / 120s handshake timeouts. That tradeoff is inherent to
-  // attempting the connection this early; not otherwise mitigated here.
-  connectWsSequential(wsCam, CAM_WS_PATH, "Cam", "CAM");
-
-  bool aud_connected = connectWsSequential(wsAud, AUD_WS_PATH, "Aud", "AUD");
-  if (aud_connected) {
-    delay(50);
-    run_audio_stream = true;
-    wsAud.send("START");
+  if (!init_i2s_in() || !init_i2s_out()) {
+    Serial.printf("[FATAL] I2S initialization failed heap=%u max=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    delay(1500);
+    esp_restart();
   }
 
+  // Live video should retain only the newest frame. Keeping three camera
+  // framebuffer pointers allows stale frames to occupy scarce resources while
+  // the TLS sender is blocked, so use a single-slot latest-frame queue.
+  qFrames = xQueueCreate(1, sizeof(fb_ptr_t));
+  qImu    = xQueueCreate(1, sizeof(ImuPacket));
+  qAudio  = createPsramQueue(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk), "audio");
+  qTTS    = createPsramQueue(TTS_QUEUE_DEPTH, sizeof(TTSChunk), "tts");
 #if THERMAL_ENABLED
-  connectWsSequential(wsThermal, THERMAL_WS_PATH, "Thermal", "THERMAL");
+  qThermal = createPsramQueue(1, sizeof(ThermalChunk), "thermal");
 #endif
 
-#if IMU_WS_ENABLED
-  connectWsSequential(wsImu, IMU_WS_PATH, "Imu", "IMU");
+  if (!qFrames || !qImu || !qAudio || !qTTS
+#if THERMAL_ENABLED
+      || !qThermal
 #endif
-
-  init_i2s_in();
-  init_i2s_out();
-
-  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 3 buffers to reduce frame drops
-  qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
-  qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
-  if (!qTTS) {
-    Serial.println("[FATAL] qTTS allocation failed - insufficient heap, retrying...");
-    delay(200);
-    qTTS = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
-    if (!qTTS) {
-      Serial.println("[FATAL] qTTS allocation failed twice - insufficient heap, reboot...");
-      delay(1500);
-      esp_restart();
-    }
+  ) {
+    Serial.printf("[FATAL] Queue creation failed qFrames=%p qImu=%p qAudio=%p qTTS=%p"
+#if THERMAL_ENABLED
+                  " qThermal=%p"
+#endif
+                  "\n", qFrames, qImu, qAudio, qTTS
+#if THERMAL_ENABLED
+                  , qThermal
+#endif
+    );
+    Serial.printf("[FATAL] heap=%u max=%u internalLargest=%u psram=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  ESP.getFreePsram());
+    delay(1500);
+    esp_restart();
   }
 
   i2cMutex = xSemaphoreCreateMutex();
-  initI2cBus();  // bring up the shared I2C bus once, before the IMU/thermal tasks start
+  if (!i2cMutex) {
+    Serial.println("[FATAL] i2cMutex creation failed, rebooting...");
+    delay(1500);
+    esp_restart();
+  }
+  initI2cBus();  // bring up the shared I2C bus once, before IMU/thermal tasks
 
-  xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
-  xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(taskImuLoop,    "imu_loop",  4096, NULL, 2, NULL, 0);
+  camThermalTxBuf = (uint8_t*)heap_caps_malloc(CAM_TX_BUF_MAX, MALLOC_CAP_SPIRAM);
+  if (!camThermalTxBuf) {
+    Serial.println("[FATAL] camThermalTxBuf PSRAM allocation failed, rebooting...");
+    delay(1500);
+    esp_restart();
+  }
 #if THERMAL_ENABLED
-  xTaskCreatePinnedToCore(taskThermalLoop, "thermal",  8192, NULL, 1, NULL, 0);
+  thermalPixels = (float*)heap_caps_malloc(THERMAL_PIXEL_BYTES, MALLOC_CAP_SPIRAM);
+  if (!thermalPixels) {
+    Serial.printf("[FATAL] thermal pixel PSRAM allocation failed bytes=%u heap=%u psram=%u\n",
+                  (unsigned)THERMAL_PIXEL_BYTES, ESP.getFreeHeap(), ESP.getFreePsram());
+    delay(1500);
+    esp_restart();
+  }
 #endif
-  xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
+
+  Serial.printf("[HEAP] before task creation: free=%u max_alloc=%u internal_largest=%u\n",
+                ESP.getFreeHeap(),
+                ESP.getMaxAllocHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+  // Reduced stacks preserve contiguous internal SRAM for WiFi/mbedTLS while
+  // remaining conservative for the work performed by each task.
+  BaseType_t cam_cap_task_ok = xTaskCreatePinnedToCore(
+      taskCamCapture, "cam_cap", 6144, NULL, 4, &camCaptureTaskHandle, 1);
+  BaseType_t cam_send_task_ok = xTaskCreatePinnedToCore(
+      taskCamSend, "cam_net", 6144, NULL, 3, &camNetworkTaskHandle, 1);
+  BaseType_t mic_cap_task_ok = xTaskCreatePinnedToCore(
+      taskMicCapture, "mic_cap", 3072, NULL, 4, &micCaptureTaskHandle, 0);
+  BaseType_t mic_upload_task_ok = xTaskCreatePinnedToCore(
+      taskMicUpload, "aud_net", 4096, NULL, 5, &audioNetworkTaskHandle, 1);
+
+  // IMU is required and produces latest-only packets for the sensor owner.
+  BaseType_t imu_task_ok = xTaskCreatePinnedToCore(
+      taskImuLoop, "imu_loop", 3072, NULL, 2, &imuTaskHandle, 0);
+
+  BaseType_t thermal_task_ok = pdPASS;
+#if THERMAL_ENABLED
+  Serial.printf("[HEAP] before thermal task: free=%u max_alloc=%u internal_largest=%u\n",
+                ESP.getFreeHeap(),
+                ESP.getMaxAllocHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  thermal_task_ok = xTaskCreatePinnedToCore(
+      taskThermalLoop, "thermal", 4096, NULL, 2, &thermalTaskHandle, 0);
+#endif
+
+  BaseType_t tts_task_ok = xTaskCreatePinnedToCore(
+      taskTTSPlay, "tts_play", 4096, NULL, 3, &ttsPlaybackTaskHandle, 0);
+
+  Serial.printf("[TASKS] camCap=%d camSend=%d micCap=%d micUpload=%d imu=%d thermal=%d tts=%d\n",
+                cam_cap_task_ok,
+                cam_send_task_ok,
+                mic_cap_task_ok,
+                mic_upload_task_ok,
+                imu_task_ok,
+                thermal_task_ok,
+                tts_task_ok);
+
+  Serial.printf("[HEAP] after task creation: free=%u max_alloc=%u internal_largest=%u\n",
+                ESP.getFreeHeap(),
+                ESP.getMaxAllocHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+  bool essential_task_failed =
+      cam_cap_task_ok != pdPASS ||
+      cam_send_task_ok != pdPASS ||
+      mic_cap_task_ok != pdPASS ||
+      mic_upload_task_ok != pdPASS ||
+      tts_task_ok != pdPASS;
+
+#if THERMAL_ENABLED
+  essential_task_failed = essential_task_failed || thermal_task_ok != pdPASS;
+#endif
+  essential_task_failed = essential_task_failed || imu_task_ok != pdPASS;
+
+  if (essential_task_failed) {
+    Serial.println("[FATAL] One or more essential tasks failed to start; rebooting...");
+    delay(2000);
+    esp_restart();
+  }
+  setupComplete = true;
+  Serial.println("[TASKS] all essential tasks pdPASS; network owners released");
 }
 
+
 void loop() {
-  // Guard: skip calling the real wsCam.available() when we know the client
-  // was just closed — see the flag's declaration comment near cam_ws_ready
-  // for the crash this avoids (confirmed via a symbolicated backtrace: this
-  // exact available() call reading a freed mbedTLS session, right after a
-  // ConnectionClosed event). Short-circuit (||) means wsCam.available() is
-  // never invoked at all on this pass when the flag is set — we go straight
-  // to a fresh connectSecure() instead, which constructs a new underlying
-  // client object rather than touching the stale one.
-  if (cam_ws_closed_pending_reconnect || !wsCam.available()) {
-    cam_ws_closed_pending_reconnect = false;
-    Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    unsigned long cam_connect_t0 = millis();
-    bool cam_connected = wsCam.connectSecure(SERVER_HOST, SERVER_PORT, CAM_WS_PATH);
-    Serial.printf("[DEBUG] wsCam.connectSecure() took %lu ms\n", millis() - cam_connect_t0);
-    // NOTE: WebsocketsClient (ArduinoWebsockets 0.5.4) keeps its underlying
-    // TCP/TLS client in a private std::shared_ptr<network::TcpClient> with
-    // no accessor anywhere in the public API (checked src/tiny_websockets/
-    // client.hpp in full) — there is no way to reach the WiFiClientSecure
-    // instance through wsCam to call its lastError(char*, size_t). That
-    // method genuinely exists on WiFiClientSecure/NetworkClientSecure
-    // itself (checked the installed esp32 core 3.3.10 source), it's just
-    // unreachable from here.
-    if (cam_connected) {
-      Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
+  static uint32_t lastHealthMs = 0;
+  static uint8_t criticalMemoryCount = 0;
+  uint32_t now = millis();
+  if (now - lastHealthMs < HEALTH_LOG_INTERVAL_MS) {
+    delay(20);
+    return;
   }
+  lastHealthMs = now;
 
-  // Non-blocking reconnect: wsCam.poll()/wsAud.poll() below must run every
-  // iteration no matter what state the audio socket is in. delay(2000) on
-  // every failed attempt (the old code) stole 2s of every loop() pass for as
-  // long as /ws_audio stayed disconnected, stalling wsCam.poll() right along
-  // with it — that block is exactly the kind of mic dropout/instability this
-  // is meant to fix. A millis() cooldown skips the attempt entirely when it's
-  // not due yet, so a failed audio connection now costs nothing extra on the
-  // other ~999 iterations out of every 1000.
-  // Same guard as wsCam above (see cam_ws_closed_pending_reconnect's
-  // declaration comment) — short-circuits wsAud.available() when we know
-  // the client was just closed, mirrored exactly except the pre-existing
-  // 2s rate-limit gate is kept as-is (unrelated to this fix, not touched).
-  static unsigned long last_aud_retry = 0;
-  unsigned long now_aud = millis();
-  if ((aud_ws_closed_pending_reconnect || !wsAud.available()) && (now_aud - last_aud_retry >= 2000)) {
-    aud_ws_closed_pending_reconnect = false;
-    last_aud_retry = now_aud;
-    Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    unsigned long aud_connect_t0 = millis();
-    bool aud_connected = wsAud.connectSecure(SERVER_HOST, SERVER_PORT, AUD_WS_PATH);
-    Serial.printf("[DEBUG] wsAud.connectSecure() took %lu ms\n", millis() - aud_connect_t0);
-    // Same lastError() limitation as wsCam above — see the NOTE there.
-    if (aud_connected) {
-      Serial.println("[WS-AUD] connected");
-      delay(50);
-      run_audio_stream = true;
-      wsAud.send("START");
-    } else {
-      Serial.println("[WS-AUD] retry in 2s...");
-    }
-  }
-
+  size_t internalLargest =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  UBaseType_t camQ = qFrames ? uxQueueMessagesWaiting(qFrames) : 0;
+  UBaseType_t micQ = qAudio ? uxQueueMessagesWaiting(qAudio) : 0;
+  UBaseType_t ttsQ = qTTS ? uxQueueMessagesWaiting(qTTS) : 0;
+  UBaseType_t imuQ = qImu ? uxQueueMessagesWaiting(qImu) : 0;
 #if THERMAL_ENABLED
-  // Same guard as wsCam/wsAud above (see cam_ws_closed_pending_reconnect's
-  // declaration comment) — short-circuits wsThermal.available() when we know
-  // the client was just closed. Cooldown-gated like wsAud (not a blocking
-  // delay() on failure like wsCam) so a down thermal socket never stalls
-  // wsCam.poll()/wsAud.poll() on the same loop() pass.
-  static unsigned long last_thermal_retry = 0;
-  unsigned long now_thermal = millis();
-  if ((thermal_ws_closed_pending_reconnect || !wsThermal.available()) && (now_thermal - last_thermal_retry >= 2000)) {
-    thermal_ws_closed_pending_reconnect = false;
-    last_thermal_retry = now_thermal;
-    Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    unsigned long thermal_connect_t0 = millis();
-    bool thermal_connected = wsThermal.connectSecure(SERVER_HOST, SERVER_PORT, THERMAL_WS_PATH);
-    Serial.printf("[DEBUG] wsThermal.connectSecure() took %lu ms\n", millis() - thermal_connect_t0);
-    if (thermal_connected) {
-      Serial.println("[WS-THERMAL] connected");
-    } else {
-      Serial.println("[WS-THERMAL] retry in 2s...");
-    }
-  }
+  UBaseType_t thermalQ = qThermal ? uxQueueMessagesWaiting(qThermal) : 0;
+#else
+  UBaseType_t thermalQ = 0;
 #endif
+  UBaseType_t swCamCap = camCaptureTaskHandle ? uxTaskGetStackHighWaterMark(camCaptureTaskHandle) : 0;
+  UBaseType_t swCamNet = camNetworkTaskHandle ? uxTaskGetStackHighWaterMark(camNetworkTaskHandle) : 0;
+  UBaseType_t swMicCap = micCaptureTaskHandle ? uxTaskGetStackHighWaterMark(micCaptureTaskHandle) : 0;
+  UBaseType_t swAudNet = audioNetworkTaskHandle ? uxTaskGetStackHighWaterMark(audioNetworkTaskHandle) : 0;
+  UBaseType_t swThermal = thermalTaskHandle ? uxTaskGetStackHighWaterMark(thermalTaskHandle) : 0;
+  UBaseType_t swTts = ttsPlaybackTaskHandle ? uxTaskGetStackHighWaterMark(ttsPlaybackTaskHandle) : 0;
+  UBaseType_t swImu = imuTaskHandle ? uxTaskGetStackHighWaterMark(imuTaskHandle) : 0;
+  UBaseType_t swHttp = taskHttpPlayHandle ? uxTaskGetStackHighWaterMark(taskHttpPlayHandle) : 0;
 
-#if IMU_WS_ENABLED
-  // Same guard/cooldown pattern as wsThermal above (see
-  // cam_ws_closed_pending_reconnect's declaration comment) — never a
-  // blocking delay() on failure, so a down IMU socket never stalls
-  // wsCam.poll()/wsAud.poll()/wsThermal.poll() on the same loop() pass.
-  static unsigned long last_imu_retry = 0;
-  unsigned long now_imu = millis();
-  if ((imu_ws_closed_pending_reconnect || !wsImu.available()) && (now_imu - last_imu_retry >= 2000)) {
-    imu_ws_closed_pending_reconnect = false;
-    last_imu_retry = now_imu;
-    Serial.printf("[DEBUG] WiFi status: %d, Free heap: %d, Max alloc heap: %d\n", WiFi.status(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    unsigned long imu_connect_t0 = millis();
-    bool imu_connected = wsImu.connectSecure(SERVER_HOST, SERVER_PORT, IMU_WS_PATH);
-    Serial.printf("[DEBUG] wsImu.connectSecure() took %lu ms\n", millis() - imu_connect_t0);
-    if (imu_connected) {
-      Serial.println("[WS-IMU] connected");
-    } else {
-      Serial.println("[WS-IMU] retry in 2s...");
-    }
-  }
-#endif
+  Serial.printf(
+      "[HEALTH] uptime=%lu heap=%u minHeap=%u maxAlloc=%u internalLargest=%u psram=%u "
+      "camQ=%u thermalQ=%u imuQ=%u micQ=%u ttsQ=%u wsCam=%d wsAud=%d "
+      "cam=%lu/%lu/%lu thermal=%lu/%lu imu=%lu/%lu mic=%lu/%lu/%lu "
+      "speaker=%lu/%lu/%lu reconnect=%lu/%lu "
+      "ageCam=%lu ageThermal=%lu ageMic=%lu ageSpeaker=%lu activityCam=%lu activityAud=%lu "
+      "stackCamCap=%u stackCamNet=%u stackMicCap=%u stackAudNet=%u "
+      "stackThermal=%u stackTts=%u stackImu=%u stackHttp=%u\n",
+      (unsigned long)now, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+      ESP.getMaxAllocHeap(), internalLargest, ESP.getFreePsram(),
+      (unsigned)camQ, (unsigned)thermalQ, (unsigned)imuQ, (unsigned)micQ, (unsigned)ttsQ,
+      cam_thermal_ws_ready, aud_ws_ready,
+      frame_captured_count, frame_sent_count, frame_dropped_count,
+      (unsigned long)thermalSentFrames, (unsigned long)thermalDroppedFrames,
+      (unsigned long)imuSentPackets, (unsigned long)imuDroppedPackets,
+      (unsigned long)micCapturedChunks, (unsigned long)micSentChunks,
+      (unsigned long)micDroppedChunks,
+      (unsigned long)speakerQueuedChunks, (unsigned long)speakerPlayedChunks,
+      (unsigned long)ttsDroppedChunks,
+      (unsigned long)camReconnectAttempts, (unsigned long)audReconnectAttempts,
+      lastCameraSendMs ? (unsigned long)(now - lastCameraSendMs) : 0UL,
+      lastThermalSendMs ? (unsigned long)(now - lastThermalSendMs) : 0UL,
+      lastMicSendMs ? (unsigned long)(now - lastMicSendMs) : 0UL,
+      lastSpeakerPacketMs ? (unsigned long)(now - lastSpeakerPacketMs) : 0UL,
+      camLastTrafficMs ? (unsigned long)(now - camLastTrafficMs) : 0UL,
+      audLastTrafficMs ? (unsigned long)(now - audLastTrafficMs) : 0UL,
+      (unsigned)swCamCap, (unsigned)swCamNet, (unsigned)swMicCap, (unsigned)swAudNet,
+      (unsigned)swThermal, (unsigned)swTts, (unsigned)swImu, (unsigned)swHttp);
 
-  // ---- Staggered keepalive pings ----
-  // ArduinoWebsockets has no built-in keepalive/ping timer. Believed cause
-  // of the ~30s disconnect cycle: the phone hotspot's cellular NAT gateway
-  // silently drops idle connections. One client gets pinged per 5s tick
-  // (full 4-client cycle every 20s) instead of bursting all four pings in
-  // the same loop() iteration.
-  //
-  // Gated on the *_ws_ready flags rather than calling client.available()
-  // directly — see cam_ws_closed_pending_reconnect's declaration comment
-  // above for the confirmed use-after-free crash (LoadProhibited, mbedTLS
-  // ssl_parse_record_header) from calling .available() on a client whose
-  // ConnectionClosed event hasn't been handled yet. The *_ws_ready flags
-  // are updated synchronously in each onEvent handler and cost nothing to
-  // read, so they're the safe way to know "is this client actually up"
-  // here too.
-  static unsigned long last_keepalive_tick = 0;
-  static uint8_t keepalive_slot = 0;
-  unsigned long now_keepalive = millis();
-  if (now_keepalive - last_keepalive_tick >= 5000) {
-    last_keepalive_tick = now_keepalive;
-    switch (keepalive_slot) {
-      case 0:
-        if (cam_ws_ready) wsCam.ping("");
-        break;
-      case 1:
-        if (aud_ws_ready) wsAud.ping("");
-        break;
-      case 2:
-#if THERMAL_ENABLED
-        if (thermal_ws_ready) wsThermal.ping("");
-#endif
-        break;
-      case 3:
-#if IMU_WS_ENABLED
-        if (imu_ws_ready) wsImu.ping("");
-#endif
-        break;
-    }
-    keepalive_slot = (keepalive_slot + 1) % 4;
+  if (internalLargest < CRITICAL_INTERNAL_BLOCK_BYTES) criticalMemoryCount++;
+  else criticalMemoryCount = 0;
+  if (criticalMemoryCount >= CRITICAL_MEMORY_INTERVALS) {
+    Serial.printf("[FATAL] persistent critical internal heap largest=%u intervals=%u; controlled restart\n",
+                  internalLargest, criticalMemoryCount);
+    controlledRestartRequested = true;
+    delay(300);
+    esp_restart();
   }
-
-  wsCam.poll();
-  wsAud.poll();
-#if THERMAL_ENABLED
-  wsThermal.poll();
-#endif
-#if IMU_WS_ENABLED
-  wsImu.poll();
-#endif
-  delay(2);
 }

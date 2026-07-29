@@ -478,6 +478,31 @@
         <button id="btnApplySettings">Apply</button>
       </div>
     </div>
+    <section id="stabilityControls" style="border:1px solid #2a3446;border-radius:10px;padding:10px;margin:8px 0">
+      <strong>Stability Controls</strong>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">
+        <label>Thermal palette
+          <select id="thermalPalette">
+            <option>inferno</option><option>jet</option><option>hot</option>
+            <option>magma</option><option>turbo</option><option>bone</option>
+          </select>
+        </label>
+        <label>Interpolation
+          <select id="thermalInterpolation"><option>cubic</option><option>nearest</option></select>
+        </label>
+        <label><input id="thermalAuto" type="checkbox" checked> Auto range</label>
+        <label><input id="thermalHotspot" type="checkbox" checked> Hotspot</label>
+        <label><input id="thermalLabels" type="checkbox" checked> Temperature labels</label>
+        <label>Min °C <input id="thermalMinInput" type="number" value="15" step="0.5"></label>
+        <label>Max °C <input id="thermalMaxInput" type="number" value="40" step="0.5"></label>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+        <button id="applyThermal">Apply thermal display</button>
+        <button id="toggleRecording">Stop recording</button>
+        <span id="recordingState">Recording: checking…</span>
+      </div>
+      <pre id="stabilityHealth" style="font-size:10px;white-space:pre-wrap;max-height:130px;overflow:auto"></pre>
+    </section>
     <details class="dev-controls" id="devControls" open>
       <summary>Dev Controls <small>click instead of speaking</small></summary>
       <div class="dev-row"><span class="dev-label">Object Detection</span>
@@ -559,6 +584,46 @@ window.sendCmd = async function(text, btn){
     if (btn) btn.disabled = false;
   }
 };
+</script>
+
+<script>
+(function(){
+  const q = id => document.getElementById(id);
+  let recordingActive = true;
+  async function refreshHealth(){
+    try{
+      const h = await (await fetch('/api/health')).json();
+      q('stabilityHealth').textContent = JSON.stringify(h, null, 2);
+      if(h.stability_mode){
+        q('devControls').style.display = 'none';
+        q('btnSettings').style.display = 'none';
+        q('settingsPanel').style.display = 'none';
+      }
+      recordingActive = !!h.recording.recording_active;
+      q('recordingState').textContent = 'Recording: ' + (recordingActive ? 'active' : 'stopped');
+      q('toggleRecording').textContent = recordingActive ? 'Stop recording' : 'Start recording';
+    }catch(e){ q('stabilityHealth').textContent = 'Health unavailable: '+e; }
+  }
+  q('applyThermal').onclick = async ()=>{
+    await fetch('/api/thermal-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      palette:q('thermalPalette').value, interpolation:q('thermalInterpolation').value,
+      auto_range:q('thermalAuto').checked, hotspot:q('thermalHotspot').checked,
+      labels:q('thermalLabels').checked,
+      min_c:Number(q('thermalMinInput').value), max_c:Number(q('thermalMaxInput').value)
+    })});
+  };
+  q('toggleRecording').onclick = async ()=>{
+    await fetch('/api/recording',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!recordingActive})});
+    refreshHealth();
+  };
+  fetch('/api/thermal-display').then(r=>r.json()).then(c=>{
+    q('thermalPalette').value=c.palette; q('thermalInterpolation').value=c.interpolation;
+    q('thermalAuto').checked=c.auto_range; q('thermalHotspot').checked=c.hotspot;
+    q('thermalLabels').checked=c.labels;
+    q('thermalMinInput').value=c.min_c; q('thermalMaxInput').value=c.max_c;
+  });
+  refreshHealth(); setInterval(refreshHealth, 5000);
+})();
 </script>
 
 <!-- settings panel logic -->

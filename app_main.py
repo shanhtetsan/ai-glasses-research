@@ -1,10 +1,21 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, tempfile, wave
+import os, sys, time, json, asyncio, base64, tempfile, wave
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
 import re
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+STABILITY_MODE = env_bool("STABILITY_MODE", True)
+
 # Add after other imports:
 
 # extract_english_label (item-search voice command) needs the `openai`
@@ -12,10 +23,13 @@ import re
 # cloud/gemini_live-only deploy (see requirements-cloud.txt) — degrade to
 # item-search-disabled rather than crash the whole server on import (see
 # the extract_english_label is None guard at its one call site).
-try:
-    from qwen_extractor import extract_english_label
-except ImportError as e:
-    print(f"[ITEM_SEARCH] openai not installed, item-search label extraction disabled: {e}")
+if not STABILITY_MODE:
+    try:
+        from qwen_extractor import extract_english_label
+    except ImportError as e:
+        print(f"[ITEM_SEARCH] openai not installed, item-search label extraction disabled: {e}")
+        extract_english_label = None
+else:
     extract_english_label = None
 
 # Blind-path/cross-street navigation + obstacle detection need torch and
@@ -29,6 +43,8 @@ except ImportError as e:
 # pattern as yolomedia below. load_navigation_models() already tolerates
 # these being None.
 try:
+    if STABILITY_MODE:
+        raise ImportError("disabled by STABILITY_MODE")
     from navigation_master import NavigationMaster, OrchestratorResult
     # New: import blind-path navigator
     from workflow_blindpath import BlindPathNavigator
@@ -55,12 +71,28 @@ from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
 import numpy as np
-import general_detector  # prompt-free YOLOE general object detection (lazy-loaded)
+try:
+    import audioop
+except ModuleNotFoundError:
+    class _AudioopCompat:
+        @staticmethod
+        def ratecv(fragment, width, channels, inrate, outrate, state):
+            if width != 2 or channels != 1 or inrate % outrate:
+                raise RuntimeError("audioop fallback supports mono PCM16 integer downsampling only")
+            samples = np.frombuffer(fragment, dtype="<i2")
+            return samples[::inrate // outrate].astype("<i2", copy=False).tobytes(), None
+    audioop = _AudioopCompat()
+if not STABILITY_MODE:
+    import general_detector  # prompt-free YOLOE general object detection (lazy-loaded)
+else:
+    general_detector = None
 import bridge_io
 import threading
 # import yolomedia  # must be in the same directory as app_main.py, filename is yolomedia.py
 
 try:
+    if STABILITY_MODE:
+        raise RuntimeError("disabled by STABILITY_MODE")
     import yolomedia
 except Exception:
     yolomedia = None
@@ -128,6 +160,8 @@ _WHISPER_CFG = load_whisper_config()
 # ASR path — gemini_live doesn't use this at all) already early-returns on
 # `_whisper_model is None`, so no other call site needs touching.
 try:
+    if STABILITY_MODE and AI_BACKEND == "gemini_live":
+        raise ImportError("local Whisper disabled by STABILITY_MODE")
     import whisper as _whisper_lib
     print(f"[...] Loading Whisper model {_WHISPER_CFG.model!r} (lang={_WHISPER_CFG.language or 'auto'})...")
     _whisper_model = _whisper_lib.load_model(_WHISPER_CFG.model)
@@ -376,7 +410,10 @@ async def _on_turn_complete():
         pass
     _output_text_buf.clear()
 
-    if user_text:
+    if user_text and is_explicit_vision_request(user_text):
+        await request_gemini_vision(f"voice:{user_text[:80]}")
+
+    if user_text and not STABILITY_MODE:
         async with interrupt_lock:
             # gemini_live already spoke the reply live over audio; this call
             # is only for side effects (nav start/stop, item search, etc.)
@@ -444,7 +481,7 @@ async def run_backend_turn(user_text: str):
         return
 
     content_list = []
-    if last_frames:
+    if last_frames and (not STABILITY_MODE or is_explicit_vision_request(user_text)):
         try:
             _, jpeg_bytes = last_frames[-1]
             img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -491,6 +528,11 @@ async def run_backend_turn(user_text: str):
 import sync_recorder
 import signal
 import atexit
+from stability_runtime import (
+    MSG_TYPE_CAM, MSG_TYPE_THERMAL, MSG_TYPE_IMU, MSG_TYPE_STATUS,
+    LatestFrameStore, RecordingPipeline, VisionController,
+    parse_sensor_message,
+)
 
 # ---- IMU UDP ----
 UDP_IP   = "0.0.0.0"
@@ -505,13 +547,87 @@ ui_clients: Dict[int, WebSocket] = {}
 current_partial: str = ""
 recent_finals: List[str] = []
 RECENT_MAX = 50
-last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
+# Legacy chat backends read this cache; strict mode must retain only the
+# newest JPEG, matching latest_rgb's single-value contract.
+last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 10)
+latest_rgb = LatestFrameStore()
+latest_thermal: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0}
+latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
+latest_device_status: Dict[str, Any] = {"timestamp": 0.0, "data": None}
+thermal_display_config: Dict[str, Any] = {
+    "palette": "inferno",
+    "auto_range": True,
+    "min_c": 15.0,
+    "max_c": 40.0,
+    "hotspot": True,
+    "labels": True,
+    "interpolation": "cubic",
+}
+VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
+VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
 camera_viewers: Set[WebSocket] = set()
 thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+
+# Bounded ingest hand-offs keep ESP32 receive loops independent of Gemini,
+# OpenCV, and slow browser viewers. Drop-oldest preserves real-time behavior.
+ESP_AUDIO_INGEST_QUEUE_MAX = 12
+ESP_THERMAL_INGEST_QUEUE_MAX = 1
+backend_metrics = {
+    "camera_sensor_connects": 0,
+    "camera_sensor_disconnects": 0,
+    "audio_connects": 0,
+    "audio_disconnects": 0,
+    "invalid_sensor_packets": 0,
+    "last_audio_activity": 0.0,
+}
+
+recording_pipeline = RecordingPipeline(
+    sync_recorder.record_frame,
+    maxsize=2,
+    on_failure=sync_recorder.stop_recording,
+)
+recording_audio_pipeline = RecordingPipeline(
+    lambda pcm: sync_recorder.record_audio(pcm, text="[Gemini audio]"),
+    maxsize=8,
+    on_failure=sync_recorder.stop_recording,
+)
+vision_controller = VisionController(
+    latest_rgb,
+    gemini_live.send_image,
+    max_age_sec=VISION_FRAME_MAX_AGE_SEC,
+    min_interval_sec=VISION_MIN_INTERVAL_SEC,
+)
+
+
+def _device_id(ws: WebSocket) -> str:
+    client = getattr(ws, "client", None)
+    return f"{client.host}:{client.port}" if client else "unknown"
+
+
+_VISION_PHRASES = (
+    "what is in front", "what's in front", "describe this scene",
+    "describe the scene", "read this sign", "what am i holding",
+    "is there a chair", "look at this", "what do you see",
+)
+
+
+def is_explicit_vision_request(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return any(phrase in normalized for phrase in _VISION_PHRASES)
+
+
+async def request_gemini_vision(reason: str) -> dict:
+    result = await vision_controller.request(reason)
+    print(
+        f"[VISION] trigger={reason!r} ok={result.get('ok')} "
+        f"result={result.get('error', 'submitted')}",
+        flush=True,
+    )
+    return result
 
 # Global variables for blind-path navigation
 blind_path_navigator = None
@@ -611,12 +727,15 @@ def load_navigation_models():
         traceback.print_exc()
 
 # Load models at program startup
-if DEBUG: print("[NAVIGATION] Loading navigation models...")
-load_navigation_models()
-if DEBUG: print(f"[NAVIGATION] Model loading complete - yolo_seg_model: {yolo_seg_model is not None}")
+if not STABILITY_MODE:
+    if DEBUG: print("[NAVIGATION] Loading navigation models...")
+    load_navigation_models()
+    if DEBUG: print(f"[NAVIGATION] Model loading complete - yolo_seg_model: {yolo_seg_model is not None}")
+else:
+    print("[STABILITY] Navigation, YOLO, item search, and traffic-light processing bypassed")
 
-# Start synchronous recording
-sync_recorder.start_recording()
+# Recording starts in the FastAPI startup hook so importing the module for
+# tests does not create empty files.
 
 # Register exit handler to ensure recordings are saved on Ctrl+C
 def cleanup_on_exit():
@@ -644,22 +763,21 @@ if DEBUG: print("[RECORDER] Exit handler registered")
 
 
 
-# Pre-load the traffic-light detection model (prevents stutter when entering WAIT_TRAFFIC_LIGHT state)
-try:
-    import trafficlight_detection
-    if DEBUG: print("[TRAFFIC_LIGHT] Pre-loading traffic-light detection model...")
-    if trafficlight_detection.init_model():
-        if DEBUG: print("[TRAFFIC_LIGHT] Traffic-light detection model pre-loaded successfully")
-        try:
-            test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-            _ = trafficlight_detection.process_single_frame(test_img)
-            if DEBUG: print("[TRAFFIC_LIGHT] Model warmup complete")
-        except Exception as e:
-            print(f"[TRAFFIC_LIGHT] Model warmup failed: {e}")
-    else:
-        if DEBUG: print("[TRAFFIC_LIGHT] Traffic-light detection model pre-load failed")
-except Exception as e:
-    print(f"[TRAFFIC_LIGHT] Traffic-light model pre-load error: {e}")
+# Pre-load only outside strict stabilization mode.
+if not STABILITY_MODE:
+    try:
+        import trafficlight_detection
+        if DEBUG: print("[TRAFFIC_LIGHT] Pre-loading traffic-light detection model...")
+        if trafficlight_detection.init_model():
+            if DEBUG: print("[TRAFFIC_LIGHT] Traffic-light detection model pre-loaded successfully")
+            try:
+                test_img = np.zeros((640, 640, 3), dtype=np.uint8)
+                _ = trafficlight_detection.process_single_frame(test_img)
+                if DEBUG: print("[TRAFFIC_LIGHT] Model warmup complete")
+            except Exception as e:
+                print(f"[TRAFFIC_LIGHT] Model warmup failed: {e}")
+    except Exception as e:
+        print(f"[TRAFFIC_LIGHT] Traffic-light model pre-load error: {e}")
 
 # ============== Key: system-level "hard reset" master switch =================
 interrupt_lock = asyncio.Lock()
@@ -1063,7 +1181,7 @@ async def start_ai_with_text(user_text: str):
 
         # Assemble (image + text) content
         content_list = []
-        if last_frames:
+        if last_frames and (not STABILITY_MODE or is_explicit_vision_request(user_text)):
             try:
                 _, jpeg_bytes = last_frames[-1]
                 img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -1181,9 +1299,142 @@ def root():
     with open(os.path.join("templates", "index.html"), "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
-@app.get("/api/health", response_class=PlainTextResponse)
+@app.get("/api/health")
 def health():
-    return "OK"
+    import resource
+    now = time.monotonic()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform != "darwin":
+        rss *= 1024
+    rgb = latest_rgb.snapshot()
+    return JSONResponse({
+        "ok": True,
+        "stability_mode": STABILITY_MODE,
+        "process_rss_bytes": int(rss),
+        "sockets": {
+            "camera_sensor": int(esp32_camera_ws is not None),
+            "audio": int(esp32_audio_ws is not None),
+        },
+        "viewers": {"rgb": len(camera_viewers), "thermal": len(thermal_viewers), "imu": len(imu_ws_clients)},
+        "latest_age_sec": {
+            "rgb": None if rgb.data is None else max(0.0, now - rgb.timestamp),
+            "thermal": None if not latest_thermal["timestamp"] else max(0.0, now - latest_thermal["timestamp"]),
+            "imu": None if not latest_imu["timestamp"] else max(0.0, now - latest_imu["timestamp"]),
+        },
+        "latest_sequences": {
+            "rgb": rgb.sequence,
+            "thermal": latest_thermal["sequence"],
+            "imu": latest_imu["sequence"],
+        },
+        "device_status": latest_device_status,
+        "recording": {
+            **recording_pipeline.health(),
+            "audio": recording_audio_pipeline.health(),
+        },
+        "vision": dict(vision_controller.metrics),
+        "audio": {"last_activity": backend_metrics["last_audio_activity"]},
+        "connections": dict(backend_metrics),
+    })
+
+
+class RecordingCommand(BaseModel):
+    active: bool
+
+
+@app.get("/api/recording")
+def recording_status():
+    return JSONResponse({
+        **recording_pipeline.health(),
+        "audio": recording_audio_pipeline.health(),
+    })
+
+
+@app.post("/api/recording")
+async def recording_control(command: RecordingCommand):
+    if command.active:
+        recorder = sync_recorder.get_recorder()
+        started = recorder.is_recording or await asyncio.to_thread(sync_recorder.start_recording)
+        if not started:
+            return JSONResponse({"error": "recorder_start_failed"}, status_code=500)
+        recording_pipeline.start()
+        recording_audio_pipeline.start()
+    else:
+        await recording_pipeline.stop()
+        await recording_audio_pipeline.stop()
+        await asyncio.to_thread(sync_recorder.stop_recording)
+    return JSONResponse({
+        **recording_pipeline.health(),
+        "audio": recording_audio_pipeline.health(),
+    })
+
+
+class VisionRequest(BaseModel):
+    reason: str = "authenticated-test"
+
+
+@app.post("/api/vision")
+async def vision_request(request: Request, payload: VisionRequest):
+    expected = os.getenv("STABILITY_TEST_TOKEN", "")
+    supplied = request.headers.get("x-stability-token", "")
+    if not expected or supplied != expected:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    result = await request_gemini_vision(f"api:{payload.reason[:80]}")
+    return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+class ThermalDisplaySettings(BaseModel):
+    palette: Optional[str] = None
+    auto_range: Optional[bool] = None
+    min_c: Optional[float] = None
+    max_c: Optional[float] = None
+    hotspot: Optional[bool] = None
+    labels: Optional[bool] = None
+    interpolation: Optional[str] = None
+
+
+@app.get("/api/thermal-display")
+def get_thermal_display():
+    return JSONResponse(dict(thermal_display_config))
+
+
+@app.post("/api/thermal-display")
+def update_thermal_display(settings: ThermalDisplaySettings):
+    values = settings.model_dump(exclude_none=True) if hasattr(settings, "model_dump") else settings.dict(exclude_none=True)
+    if "palette" in values and values["palette"] not in {"inferno", "jet", "hot", "magma", "turbo", "bone"}:
+        return JSONResponse({"error": "invalid palette"}, status_code=400)
+    if "interpolation" in values and values["interpolation"] not in {"nearest", "cubic"}:
+        return JSONResponse({"error": "invalid interpolation"}, status_code=400)
+    next_min = float(values.get("min_c", thermal_display_config["min_c"]))
+    next_max = float(values.get("max_c", thermal_display_config["max_c"]))
+    if next_min >= next_max:
+        return JSONResponse({"error": "min_c must be less than max_c"}, status_code=400)
+    thermal_display_config.update(values)
+    return JSONResponse(dict(thermal_display_config))
+
+
+@app.get("/api/imu-validation")
+def imu_validation(mode: str = "stationary"):
+    allowed = {"stationary", "tilt_forward", "tilt_backward", "tilt_left", "tilt_right", "rotate"}
+    if mode not in allowed:
+        return JSONResponse({"error": "invalid mode", "allowed": sorted(allowed)}, status_code=400)
+    age = None
+    if latest_imu["timestamp"]:
+        age = time.monotonic() - latest_imu["timestamp"]
+    return JSONResponse({
+        "mode": mode,
+        "stale": age is None or age > 1.5,
+        "age_sec": age,
+        "sequence": latest_imu["sequence"],
+        "sample": latest_imu["data"],
+        "expected": {
+            "stationary": "acceleration magnitude near 9.81 m/s^2; gyro near 0 deg/s",
+            "tilt_forward": "one horizontal acceleration axis changes sign/magnitude consistently",
+            "tilt_backward": "same axis as forward changes in the opposite direction",
+            "tilt_left": "the other horizontal acceleration axis changes consistently",
+            "tilt_right": "same axis as left changes in the opposite direction",
+            "rotate": "at least one gyro axis shows a clear non-zero deg/s response",
+        }[mode],
+    })
 
 
 @app.post("/api/restart")
@@ -1219,6 +1470,13 @@ async def run_command(payload: CommandPayload):
     text = (payload.text or "").strip()
     if not text:
         return JSONResponse({"error": "empty command"}, status_code=400)
+    if STABILITY_MODE:
+        if is_explicit_vision_request(text):
+            return JSONResponse(await request_gemini_vision(f"test-command:{text[:80]}"))
+        return JSONResponse(
+            {"error": "experimental commands disabled in STABILITY_MODE"},
+            status_code=403,
+        )
     async with interrupt_lock:
         await start_ai_with_text_custom(text)
     return JSONResponse({"ran": text})
@@ -1276,6 +1534,14 @@ class CameraCommand(BaseModel):
 
 @app.post("/api/camera")
 async def camera_command(cmd: CameraCommand):
+    if STABILITY_MODE:
+        return JSONResponse(
+            {
+                "error": "camera hardware settings are fixed in STABILITY_MODE",
+                "active": {"framesize": "QVGA", "quality": 16, "fps": 4, "fb_count": 2},
+            },
+            status_code=409,
+        )
     if esp32_camera_ws is None:
         return JSONResponse({"error": "ESP32 camera not connected"}, status_code=503)
     sent = []
@@ -1413,7 +1679,43 @@ async def ws_audio(ws: WebSocket):
             pass
     esp32_audio_ws = ws
     await ws.accept()
-    print("[CONNECTED] Mic (ESP32 audio)")
+    device_id = _device_id(ws)
+    connected_at = time.monotonic()
+    backend_metrics["audio_connects"] += 1
+    print(f"[WS-INGEST] device={device_id} socket=audio event=connect", flush=True)
+
+    audio_ingest_q: asyncio.Queue[bytes] = asyncio.Queue(
+        maxsize=ESP_AUDIO_INGEST_QUEUE_MAX
+    )
+    audio_dropped = 0
+
+    async def _gemini_audio_worker():
+        while True:
+            chunk = await audio_ingest_q.get()
+            started = time.monotonic()
+            try:
+                await gemini_live.send_audio(chunk)
+            except Exception as exc:
+                print(
+                    f"[WS-INGEST] device={device_id} socket=audio "
+                    f"event=process_error error={type(exc).__name__}",
+                    flush=True,
+                )
+            finally:
+                latency_ms = (time.monotonic() - started) * 1000
+                if latency_ms >= 250:
+                    print(
+                        f"[WS-INGEST] device={device_id} socket=audio "
+                        f"event=processed bytes={len(chunk)} "
+                        f"queue={audio_ingest_q.qsize()} latency_ms={latency_ms:.1f}",
+                        flush=True,
+                    )
+
+    audio_worker_task = (
+        asyncio.create_task(_gemini_audio_worker())
+        if AI_BACKEND == "gemini_live"
+        else None
+    )
 
     streaming: bool = False
     pcm_buffer: Optional[bytearray] = None
@@ -1477,6 +1779,7 @@ async def ws_audio(ws: WebSocket):
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
+                backend_metrics["last_audio_activity"] = time.monotonic()
 
                 if AI_BACKEND == "gemini_live":
                     # Gemini Live owns the mic entirely in this mode — it runs
@@ -1485,7 +1788,23 @@ async def ws_audio(ws: WebSocket):
                     # of the way (it would otherwise fire its own transcription
                     # off the same audio and double-dispatch commands).
                     if streaming and not is_playing_now():
-                        await gemini_live.send_audio(chunk)
+                        if audio_ingest_q.full():
+                            try:
+                                audio_ingest_q.get_nowait()
+                                audio_dropped += 1
+                            except asyncio.QueueEmpty:
+                                pass
+                        try:
+                            audio_ingest_q.put_nowait(chunk)
+                        except asyncio.QueueFull:
+                            audio_dropped += 1
+                        if audio_dropped and audio_dropped % 50 == 1:
+                            print(
+                                f"[WS-INGEST] device={device_id} socket=audio "
+                                f"event=drop_oldest bytes={len(chunk)} "
+                                f"queue={audio_ingest_q.qsize()} dropped={audio_dropped}",
+                                flush=True,
+                            )
                     continue
 
                 if streaming and pcm_buffer is not None:
@@ -1549,6 +1868,12 @@ async def ws_audio(ws: WebSocket):
     finally:
         streaming  = False
         pcm_buffer = None
+        if audio_worker_task is not None:
+            audio_worker_task.cancel()
+            try:
+                await audio_worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
@@ -1556,7 +1881,13 @@ async def ws_audio(ws: WebSocket):
             pass
         if esp32_audio_ws is ws:
             esp32_audio_ws = None
-        print("[DISCONNECTED] Mic (ESP32 audio)")
+        backend_metrics["audio_disconnects"] += 1
+        print(
+            f"[WS-INGEST] device={device_id} socket=audio event=disconnect "
+            f"reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
+            f"dropped={audio_dropped}",
+            flush=True,
+        )
 
 def _apply_camera_rotation(bgr):
     """Correct physical camera mounting orientation. Single source of truth
@@ -1597,6 +1928,8 @@ def _process_camera_frame_blocking(data: bytes):
     websocket or async I/O. Returns (out_jpeg_bytes | None, guidance_text | None);
     the caller broadcasts the JPEG and speaks the guidance from the event loop.
     """
+    if STABILITY_MODE:
+        return data, None
     try:
         arr = np.frombuffer(data, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1657,9 +1990,93 @@ def _process_camera_frame_blocking(data: bytes):
     return (None, None)
 
 
+# 1-byte type prefix used on the merged /ws/camera_thermal socket (see
+# ws_camera_thermal_esp below) — must match MSG_TYPE_CAM/MSG_TYPE_THERMAL in
+# compile.ino exactly.
+async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, frame_event: asyncio.Event,
+                                gemini_frame_holder: dict, gemini_frame_event: asyncio.Event,
+                                gemini_pump_task) -> int:
+    """Per-frame camera ingest: latest-frame cache, nav/recording processor
+    hand-off, Gemini Live pump hand-off. Shared verbatim by /ws/camera
+    (ws_camera_esp) and the merged /ws/camera_thermal (ws_camera_thermal_esp)
+    so both stay on identical processing logic."""
+    frame_counter += 1
+    latest_rgb.update(data)
+    recording_pipeline.enqueue_latest(data)
+
+    # Cheap per-frame bookkeeping stays here; recording runs in the worker.
+    try:
+        last_frames.append((time.time(), data))
+    except Exception:
+        pass
+    if not STABILITY_MODE:
+        bridge_io.push_raw_jpeg(data)
+
+    # Hand the newest frame to the processor. If an older unprocessed
+    # frame is still sitting here, it's overwritten (dropped).
+    holder["data"] = data
+    frame_event.set()
+
+    if gemini_pump_task is not None:
+        gemini_frame_holder["data"] = data
+        gemini_frame_event.set()
+
+    return frame_counter
+
+
+async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
+    """Per-frame thermal ingest: parse the 24x32 float32 grid, colorize,
+    broadcast to thermal_viewers. Shared verbatim by /ws/thermal
+    (ws_thermal_esp) and the merged /ws/camera_thermal
+    (ws_camera_thermal_esp) so both stay on identical processing logic.
+    `data` must already have any transport-specific prefix stripped — exactly
+    3072 bytes (24*32 float32)."""
+    if len(data) != 3072:
+        return thermal_frame_count
+    thermal_frame_count += 1
+    if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
+        print(f"[THERMAL] received {thermal_frame_count} frames, "
+              f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
+
+    frame = np.frombuffer(data, dtype="<f4").reshape(24, 32)
+    colorized = _colorize_thermal(frame)
+    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if ok and thermal_viewers:
+        jpeg_bytes = enc.tobytes()
+        stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
+        dead = []
+        for viewer_ws in list(thermal_viewers):
+            try:
+                await viewer_ws.send_bytes(jpeg_bytes)
+                await viewer_ws.send_text(stats)
+            except Exception:
+                dead.append(viewer_ws)
+        for d in dead:
+            thermal_viewers.discard(d)
+    return thermal_frame_count
+
+
+def _prepare_thermal_frame_blocking(data: bytes):
+    """CPU-only thermal parse/colorize/JPEG encode for executor workers."""
+    if len(data) != 3072:
+        return None, None
+    frame = np.frombuffer(data, dtype="<f4").reshape(24, 32)
+    if not np.isfinite(frame).all():
+        return None, None
+    colorized = _colorize_thermal(frame)
+    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        return None, None
+    stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
+    return enc.tobytes(), stats
+
+
 # ---------- WebSocket: ESP32 camera entry (JPEG binary) ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
+    if STABILITY_MODE:
+        await ws.close(code=1008, reason="legacy camera endpoint disabled in STABILITY_MODE")
+        return
     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
@@ -1734,7 +2151,7 @@ async def ws_camera_esp(ws: WebSocket):
                 dead = []
                 for viewer_ws in list(camera_viewers):
                     try:
-                        await viewer_ws.send_bytes(out_jpeg)
+                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
                     except Exception:
                         dead.append(viewer_ws)
                 for d in dead:
@@ -1771,37 +2188,20 @@ async def ws_camera_esp(ws: WebSocket):
                 if DEBUG:
                     print(f"[Gemini Live] send_image failed: {e}")
 
-    gemini_pump_task = asyncio.create_task(_gemini_image_pump()) if AI_BACKEND == "gemini_live" else None
+    gemini_pump_task = (
+        asyncio.create_task(_gemini_image_pump())
+        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
+        else None
+    )
 
     try:
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
-                frame_counter += 1
-
-                # Cheap per-frame bookkeeping stays in the receive loop so it
-                # sees every frame (recording, latest-frame cache, yolomedia feed).
-                try:
-                    sync_recorder.record_frame(data)
-                except Exception as e:
-                    if frame_counter % 100 == 0:  # avoid log spam
-                        print(f"[RECORDER] Failed to record frame: {e}")
-                try:
-                    last_frames.append((time.time(), data))
-                except Exception:
-                    pass
-                bridge_io.push_raw_jpeg(data)
-
-                # Hand the newest frame to the processor. If an older unprocessed
-                # frame is still sitting here, it's overwritten (dropped).
-                holder["data"] = data
-                frame_event.set()
-
-                if gemini_pump_task is not None:
-                    gemini_frame_holder["data"] = data
-                    gemini_frame_event.set()
-
+                frame_counter = await _handle_camera_frame(
+                    msg["bytes"], frame_counter, holder, frame_event,
+                    gemini_frame_holder, gemini_frame_event, gemini_pump_task
+                )
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -1837,6 +2237,270 @@ async def ws_camera_esp(ws: WebSocket):
             orchestrator.reset()
             if DEBUG: print("[NAV MASTER] Master reset")
 
+# ---------- WebSocket: ESP32 camera+thermal entry (merged connection) ----------
+# One physical connection carrying both camera JPEG and thermal frames,
+# multiplexed with a 1-byte MSG_TYPE_CAM/MSG_TYPE_THERMAL prefix (see
+# compile.ino's wsCamThermal) instead of the separate /ws/camera + /ws/thermal
+# sockets above — merged to avoid the DMA/heap contention crashes seen
+# running two TLS sockets' worth of camera+thermal traffic concurrently.
+# /ws/camera and /ws/thermal are left in place (unused by current firmware)
+# for rollback rather than deleted.
+#
+# Setup/teardown here is identical to ws_camera_esp (same navigator init,
+# same processor_task/gemini_pump_task pipeline, same esp32_camera_ws
+# mutual-exclusion global) plus a thermal_frame_count counter borrowed from
+# ws_thermal_esp — only the receive loop differs, dispatching by MSG_TYPE
+# instead of assuming every binary message is a camera frame.
+@app.websocket("/ws/camera_thermal")
+async def ws_camera_thermal_esp(ws: WebSocket):
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    if esp32_camera_ws is not None:
+        await ws.close(code=1013)
+        return
+    esp32_camera_ws = ws
+    await ws.accept()
+    device_id = _device_id(ws)
+    connected_at = time.monotonic()
+    backend_metrics["camera_sensor_connects"] += 1
+    print(f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect", flush=True)
+
+    # Initialize the blind-path navigator
+    if blind_path_navigator is None and yolo_seg_model is not None:
+        blind_path_navigator = BlindPathNavigator(yolo_seg_model, obstacle_detector)
+        if DEBUG: print("[NAVIGATION] Blind-path navigator initialized")
+    else:
+        if blind_path_navigator is None and yolo_seg_model is None:
+            print("[NAVIGATION] Warning: YOLO model not loaded, cannot initialize navigator")
+
+    # Initialize the street-crossing navigator
+    if cross_street_navigator is None:
+        if yolo_seg_model:
+            cross_street_navigator = CrossStreetNavigator(
+                seg_model=yolo_seg_model,
+                coco_model=None,  # traffic-light detection disabled
+                obs_model=None    # obstacle detection also disabled for now (faster)
+            )
+            if DEBUG: print("[CROSS_STREET] Street-crossing navigator initialized")
+        else:
+            print("[CROSS_STREET] Error: segmentation model missing, cannot initialize street-crossing navigator")
+
+    if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
+        orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
+        if DEBUG: print("[NAV MASTER] Master state machine initialized")
+    loop = asyncio.get_running_loop()
+    frame_counter = 0
+    thermal_frame_count = 0
+    thermal_dropped = 0
+    thermal_ingest_q: asyncio.Queue[tuple[bytes, float]] = asyncio.Queue(
+        maxsize=ESP_THERMAL_INGEST_QUEUE_MAX
+    )
+
+    async def _thermal_processor():
+        nonlocal thermal_frame_count
+        while True:
+            payload, received_at = await thermal_ingest_q.get()
+            jpeg_bytes, stats = await asyncio.get_running_loop().run_in_executor(
+                None, _prepare_thermal_frame_blocking, payload
+            )
+            if jpeg_bytes is None:
+                continue
+            thermal_frame_count += 1
+            dead = []
+            for viewer_ws in list(thermal_viewers):
+                try:
+                    await asyncio.wait_for(viewer_ws.send_bytes(jpeg_bytes), timeout=0.25)
+                    await asyncio.wait_for(viewer_ws.send_text(stats), timeout=0.25)
+                except Exception:
+                    dead.append(viewer_ws)
+            for viewer_ws in dead:
+                thermal_viewers.discard(viewer_ws)
+            latency_ms = (time.monotonic() - received_at) * 1000
+            if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
+                print(
+                    f"[WS-INGEST] device={device_id} socket=camera_thermal "
+                    f"type=thermal bytes={len(payload)} queue={thermal_ingest_q.qsize()} "
+                    f"latency_ms={latency_ms:.1f}",
+                    flush=True,
+                )
+
+    thermal_processor_task = asyncio.create_task(_thermal_processor())
+    imu_event = asyncio.Event()
+
+    async def _imu_pump():
+        while True:
+            await imu_event.wait()
+            imu_event.clear()
+            sample = latest_imu["data"]
+            if sample is not None:
+                await imu_broadcast(json.dumps(sample))
+
+    imu_pump_task = asyncio.create_task(_imu_pump())
+
+    # ---- Drop-to-latest pipeline (identical to ws_camera_esp) ------------
+    holder = {"data": None}
+    frame_event = asyncio.Event()
+
+    async def _processor():
+        while True:
+            await frame_event.wait()
+            frame_event.clear()
+            data = holder["data"]
+            if data is None:
+                continue
+            try:
+                out_jpeg, guidance = await loop.run_in_executor(
+                    None, _process_camera_frame_blocking, data
+                )
+            except Exception as e:
+                out_jpeg, guidance = None, None
+                if DEBUG:
+                    print(f"[NAV MASTER] processor error: {e}")
+
+            if guidance:
+                try:
+                    if AI_BACKEND != "gemini_live":
+                        play_voice_text(guidance)
+                    await ui_broadcast_final(f"[NAV] {guidance}")
+                except Exception:
+                    pass
+
+            if out_jpeg and camera_viewers:
+                dead = []
+                for viewer_ws in list(camera_viewers):
+                    try:
+                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
+                    except Exception:
+                        dead.append(viewer_ws)
+                for d in dead:
+                    camera_viewers.discard(d)
+
+    processor_task = asyncio.create_task(_processor())
+
+    # ---- Gemini Live video feed (identical to ws_camera_esp) -------------
+    gemini_frame_holder = {"data": None}
+    gemini_frame_event = asyncio.Event()
+
+    async def _gemini_image_pump():
+        while True:
+            await gemini_frame_event.wait()
+            gemini_frame_event.clear()
+            data = gemini_frame_holder["data"]
+            if data is None:
+                continue
+            try:
+                if CAMERA_ROTATION_DEG != 0:
+                    data = await loop.run_in_executor(None, _rotate_jpeg_bytes, data)
+                await gemini_live.send_image(data)
+            except Exception as e:
+                if DEBUG:
+                    print(f"[Gemini Live] send_image failed: {e}")
+
+    gemini_pump_task = (
+        asyncio.create_task(_gemini_image_pump())
+        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
+        else None
+    )
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                data = msg["bytes"]
+                try:
+                    msg_type, payload = parse_sensor_message(data)
+                except ValueError as exc:
+                    backend_metrics["invalid_sensor_packets"] += 1
+                    if backend_metrics["invalid_sensor_packets"] % 25 == 1:
+                        print(f"[WS-INGEST] invalid sensor packet reason={exc}", flush=True)
+                    continue
+                if msg_type == MSG_TYPE_CAM:
+                    frame_counter = await _handle_camera_frame(
+                        payload, frame_counter, holder, frame_event,
+                        gemini_frame_holder, gemini_frame_event, gemini_pump_task
+                    )
+                    if frame_counter == 1 or frame_counter % 100 == 0:
+                        print(
+                            f"[WS-INGEST] device={device_id} socket=camera_thermal "
+                            f"type=camera bytes={len(payload)} queue=latest count={frame_counter}",
+                            flush=True,
+                        )
+                elif msg_type == MSG_TYPE_THERMAL:
+                    latest_thermal["timestamp"] = time.monotonic()
+                    latest_thermal["sequence"] += 1
+                    if thermal_ingest_q.full():
+                        try:
+                            thermal_ingest_q.get_nowait()
+                            thermal_dropped += 1
+                        except asyncio.QueueEmpty:
+                            pass
+                    try:
+                        thermal_ingest_q.put_nowait((payload, time.monotonic()))
+                    except asyncio.QueueFull:
+                        thermal_dropped += 1
+                elif msg_type == MSG_TYPE_IMU:
+                    imu_data = payload
+                    imu_data["ts"] = imu_data["uptime_ms"]
+                    latest_imu.update({
+                        "timestamp": time.monotonic(),
+                        "sequence": imu_data["sequence"],
+                        "data": imu_data,
+                    })
+                    process_imu_and_maybe_store(imu_data)
+                    imu_event.set()
+                elif msg_type == MSG_TYPE_STATUS:
+                    latest_device_status.update({"timestamp": time.monotonic(), "data": payload})
+            elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[CAMERA-THERMAL ERROR] {e}")
+    finally:
+        imu_pump_task.cancel()
+        try:
+            await imu_pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        thermal_processor_task.cancel()
+        try:
+            await thermal_processor_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        processor_task.cancel()
+        try:
+            await processor_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if gemini_pump_task is not None:
+            gemini_pump_task.cancel()
+            try:
+                await gemini_pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
+                await ws.close(code=1000)
+        except Exception:
+            pass
+        esp32_camera_ws = None
+        backend_metrics["camera_sensor_disconnects"] += 1
+        print(
+            f"[WS-INGEST] device={device_id} socket=camera_thermal event=disconnect "
+            f"reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
+            f"camera_frames={frame_counter} thermal_frames={thermal_frame_count} "
+            f"thermal_dropped={thermal_dropped}",
+            flush=True,
+        )
+
+        # Clean up navigation state
+        if blind_path_navigator:
+            blind_path_navigator.reset()
+        if cross_street_navigator:
+            cross_street_navigator.reset()
+        if orchestrator:
+            orchestrator.reset()
+            if DEBUG: print("[NAV MASTER] Master reset")
+
 # ---------- WebSocket: browser subscribes to camera frames ----------
 @app.websocket("/ws/viewer")
 async def ws_viewer(ws: WebSocket):
@@ -1857,13 +2521,33 @@ async def ws_viewer(ws: WebSocket):
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
 def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
-    """Normalize + INFERNO-colorize a 24x32 float32 °C frame, resized to 320x240 BGR."""
-    lo, hi = np.percentile(frame, [5, 95])
+    """Render the latest thermal grid without changing MLX90640 acquisition."""
+    cfg = dict(thermal_display_config)
+    if cfg["auto_range"]:
+        lo, hi = np.percentile(frame, [5, 95])
+    else:
+        lo, hi = float(cfg["min_c"]), float(cfg["max_c"])
     if hi <= lo:
-        hi = lo + 1e-6
+      hi = lo + 1e-6
     normed = np.clip((frame - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-    colored = cv2.applyColorMap(normed, cv2.COLORMAP_INFERNO)
-    return cv2.resize(colored, (320, 240), interpolation=cv2.INTER_CUBIC)
+    palette = {
+        "inferno": cv2.COLORMAP_INFERNO,
+        "jet": cv2.COLORMAP_JET,
+        "hot": cv2.COLORMAP_HOT,
+        "magma": cv2.COLORMAP_MAGMA,
+        "turbo": cv2.COLORMAP_TURBO,
+        "bone": cv2.COLORMAP_BONE,
+    }.get(cfg["palette"], cv2.COLORMAP_INFERNO)
+    colored = cv2.applyColorMap(normed, palette)
+    interpolation = cv2.INTER_NEAREST if cfg["interpolation"] == "nearest" else cv2.INTER_CUBIC
+    rendered = cv2.resize(colored, (320, 240), interpolation=interpolation)
+    if cfg["hotspot"]:
+        row, col = np.unravel_index(int(np.argmax(frame)), frame.shape)
+        cv2.circle(rendered, (int((col + 0.5) * 10), int((row + 0.5) * 10)), 7, (255, 255, 255), 2)
+    if cfg["labels"]:
+        cv2.putText(rendered, f"{float(frame.min()):.1f}C - {float(frame.max()):.1f}C",
+                    (6, 232), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return rendered
 
 # ---------- WebSocket: ESP32 thermal entry ("THRM" + 24x32 float32 binary) ----------
 @app.websocket("/ws/thermal")
@@ -1872,6 +2556,9 @@ async def ws_thermal_esp(ws: WebSocket):
     camera socket so the two streams never interfere. Colorizes each frame
     and broadcasts the JPEG + max/min temps to thermal_viewers ONLY — NOT
     camera_viewers, which is the RGB camera_esp/viewer pair's frame set."""
+    if STABILITY_MODE:
+        await ws.close(code=1008, reason="legacy thermal endpoint disabled in STABILITY_MODE")
+        return
     await ws.accept()
     print("[CONNECTED] Thermal (ESP32)", flush=True)
     thermal_frame_count = 0
@@ -1881,26 +2568,7 @@ async def ws_thermal_esp(ws: WebSocket):
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 if len(data) >= 4 and data[:4] == b"THRM" and len(data) - 4 == 3072:
-                    thermal_frame_count += 1
-                    if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
-                        print(f"[THERMAL] received {thermal_frame_count} frames, "
-                              f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
-
-                    frame = np.frombuffer(data[4:], dtype="<f4").reshape(24, 32)
-                    colorized = _colorize_thermal(frame)
-                    ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                    if ok and thermal_viewers:
-                        jpeg_bytes = enc.tobytes()
-                        stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
-                        dead = []
-                        for viewer_ws in list(thermal_viewers):
-                            try:
-                                await viewer_ws.send_bytes(jpeg_bytes)
-                                await viewer_ws.send_text(stats)
-                            except Exception:
-                                dead.append(viewer_ws)
-                        for d in dead:
-                            thermal_viewers.discard(d)
+                    thermal_frame_count = await _handle_thermal_frame(data[4:], thermal_frame_count)
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -1957,7 +2625,7 @@ async def imu_broadcast(msg: str):
     dead = []
     for ws in list(imu_ws_clients):
         try:
-            await ws.send_text(msg)
+            await asyncio.wait_for(ws.send_text(msg), timeout=0.25)
         except Exception:
             dead.append(ws)
     for ws in dead:
@@ -2155,7 +2823,7 @@ async def on_startup_register_bridge_sender():
                 dead = []
                 for ws in list(camera_viewers):
                     try:
-                        await ws.send_bytes(jpeg_bytes)
+                        await asyncio.wait_for(ws.send_bytes(jpeg_bytes), timeout=0.25)
                     except Exception as e:
                         dead.append(ws)
                 for ws in dead:
@@ -2174,9 +2842,22 @@ async def on_startup_register_bridge_sender():
 
     bridge_io.set_sender(_sender)
 
+
+@app.on_event("startup")
+async def startup_stability_workers():
+    if await asyncio.to_thread(sync_recorder.start_recording):
+        recording_pipeline.start()
+        recording_audio_pipeline.start()
+        audio_stream.recording_enqueue_callback = recording_audio_pipeline.enqueue_latest
+    else:
+        print("[RECORDER] Startup recording failed; ingestion remains active")
+
 @app.on_event("startup")
 async def on_startup_init_audio():
     """Initialize the audio system at startup."""
+    if STABILITY_MODE:
+        print("[STABILITY] Local host audio output disabled; ESP32 speaker remains active")
+        return
     # Initialize in a background thread to avoid blocking startup
     def _init():
         try:
@@ -2220,6 +2901,9 @@ async def startup_gemini():
 
 @app.on_event("startup")
 async def on_startup():
+    if STABILITY_MODE:
+        print("[STABILITY] UDP IMU ingest disabled; using multiplexed sensor WebSocket")
+        return
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
     print("[OK] Server running on port 8081")
@@ -2228,6 +2912,8 @@ async def on_startup():
 async def on_shutdown():
     """Clean up resources when the application shuts down."""
     print("[SHUTDOWN] Starting resource cleanup...")
+    await recording_pipeline.stop()
+    await recording_audio_pipeline.stop()
     
     # Stop YOLO media processing
     stop_yolomedia()

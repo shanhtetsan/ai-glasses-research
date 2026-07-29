@@ -7,6 +7,10 @@ app = 'openaiglasses-for-navigation'
 primary_region = 'ewr'
 
 [build]
+
+[env]
+  STABILITY_MODE = "true"
+
 [http_service]
   internal_port = 8081
   force_https = true

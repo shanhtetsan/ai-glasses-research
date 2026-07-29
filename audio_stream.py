@@ -14,6 +14,7 @@ BYTES_PER_20MS_16K = STREAM_SR * STREAM_SW * 20 // 1000  # 320B (8kHz)
 
 # ===== AI playback task master switch =====
 current_ai_task: Optional[asyncio.Task] = None
+recording_enqueue_callback = None
 
 async def cancel_current_ai():
     """Cancel the current LLM audio task and wait for it to exit."""
@@ -79,11 +80,11 @@ async def hard_reset_audio(reason: str = ""):
 async def broadcast_pcm16_realtime(pcm16: bytes):
     """Send pcm16 at 20 ms pacing to all active connections; drop the tail when the queue is full to stay real-time."""
     # Record audio as a whole before distributing to avoid fragmentation
-    try:
-        import sync_recorder
-        sync_recorder.record_audio(pcm16, text="[Omni chat]")
-    except Exception:
-        pass  # Silent failure — does not affect playback
+    if recording_enqueue_callback is not None:
+        try:
+            recording_enqueue_callback(pcm16)
+        except Exception:
+            pass
     
     loop = asyncio.get_event_loop()
     next_tick = loop.time()

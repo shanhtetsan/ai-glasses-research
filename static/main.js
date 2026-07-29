@@ -549,28 +549,28 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
         <div><div style="color:#9fb0c3;font-size:10px;">Roll</div>
-             <div id="panel-roll"  style="color:#ff6b6b;font-size:16px;font-weight:bold;">0.0°</div></div>
+             <div id="panel-roll"  style="color:#ff6b6b;font-size:16px;font-weight:bold;">--</div></div>
         <div><div style="color:#9fb0c3;font-size:10px;">Pitch</div>
-             <div id="panel-pitch" style="color:#4ecdc4;font-size:16px;font-weight:bold;">0.0°</div></div>
+             <div id="panel-pitch" style="color:#4ecdc4;font-size:16px;font-weight:bold;">--</div></div>
       </div>
       <div style="margin-bottom:12px;">
         <div style="color:#9fb0c3;font-size:10px;">Yaw</div>
-        <div id="panel-yaw" style="color:#45b7d1;font-size:16px;font-weight:bold;">0.0°</div>
+        <div id="panel-yaw" style="color:#45b7d1;font-size:16px;font-weight:bold;">--</div>
       </div>
       <div style="border-top:1px solid #2a3446;padding-top:8px;margin-top:8px;">
         <div style="color:#9fb0c3;font-size:10px;margin-bottom:6px;">Angular velocity (°/s)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">
-          <div><div style="color:#ff9999;font-size:9px;">gX</div><div id="panel-gx" style="color:#ff9999;font-size:11px;">0.0</div></div>
-          <div><div style="color:#99ff99;font-size:9px;">gY</div><div id="panel-gy" style="color:#99ff99;font-size:11px;">0.0</div></div>
-          <div><div style="color:#9999ff;font-size:9px;">gZ</div><div id="panel-gz" style="color:#9999ff;font-size:11px;">0.0</div></div>
+          <div><div style="color:#ff9999;font-size:9px;">gX</div><div id="panel-gx" style="color:#ff9999;font-size:11px;">--</div></div>
+          <div><div style="color:#99ff99;font-size:9px;">gY</div><div id="panel-gy" style="color:#99ff99;font-size:11px;">--</div></div>
+          <div><div style="color:#9999ff;font-size:9px;">gZ</div><div id="panel-gz" style="color:#9999ff;font-size:11px;">--</div></div>
         </div>
       </div>
       <div style="border-top:1px solid #2a3446;padding-top:8px;">
         <div style="color:#9fb0c3;font-size:10px;margin-bottom:6px;">Acceleration (m/s²)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
-          <div><div style="color:#ff9999;font-size:9px;">aX</div><div id="panel-ax" style="color:#ff9999;font-size:11px;">0.00</div></div>
-          <div><div style="color:#99ff99;font-size:9px;">aY</div><div id="panel-ay" style="color:#99ff99;font-size:11px;">0.00</div></div>
-          <div><div style="color:#9999ff;font-size:9px;">aZ</div><div id="panel-az" style="color:#9999ff;font-size:11px;">0.00</div></div>
+          <div><div style="color:#ff9999;font-size:9px;">aX</div><div id="panel-ax" style="color:#ff9999;font-size:11px;">--</div></div>
+          <div><div style="color:#99ff99;font-size:9px;">aY</div><div id="panel-ay" style="color:#99ff99;font-size:11px;">--</div></div>
+          <div><div style="color:#9999ff;font-size:9px;">aZ</div><div id="panel-az" style="color:#9999ff;font-size:11px;">--</div></div>
         </div>
       </div>
     `;
@@ -750,6 +750,7 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   let lastGy = {x:0,y:0,z:0};
 
   const imu_ws_state = document.getElementById('imu_ws_state');
+  let lastImuWall = 0;
   function setImuBadge(ok, text){
     imu_ws_state.textContent = text;
     imu_ws_state.className = 'badge ' + (ok? 'ok' : 'err');
@@ -763,6 +764,8 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   ws.onmessage = (ev)=>{
     try{
       const d = JSON.parse(ev.data);
+      lastImuWall = performance.now();
+      setImuBadge(true, `live seq ${d.sequence ?? '?'}`);
       const t = (typeof d.ts==='number') ? d.ts : performance.now();
       let dt = (!lastTS || (t-lastTS)<=0 || (t-lastTS)>300) ? 0.02 : (t-lastTS)/1000;
       lastTS = t;
@@ -851,6 +854,14 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
       updateDataPanel(R, P, Y, wx, wy, wz, ax, ay, az);
     } catch(e){}
   };
+  setInterval(()=>{
+    if(!lastImuWall || performance.now()-lastImuWall > 1500){
+      setImuBadge(false, 'stale — no IMU packets');
+      ['roll','pitch','yaw','gx','gy','gz','ax','ay','az'].forEach(name=>{
+        const el=document.getElementById('panel-'+name); if(el) el.textContent='--';
+      });
+    }
+  }, 500);
 
   window.addEventListener('resize', resize);
   resize();
