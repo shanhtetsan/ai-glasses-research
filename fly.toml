@@ -1,15 +1,14 @@
-# fly.toml app configuration file generated for openaiglasses-for-navigation on 2026-07-21T16:36:22-04:00
+# fly.toml app configuration file generated for ai-glasses-for-research on 2026-07-29T15:23:17-04:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'openaiglasses-for-navigation'
+app = 'ai-glasses-for-research'
 primary_region = 'ewr'
 
 [build]
-
 [env]
-  STABILITY_MODE = "true"
+  STABILITY_MODE = 'true'
 
 [http_service]
   internal_port = 8081
@@ -21,6 +20,5 @@ primary_region = 'ewr'
 
 [[vm]]
   memory = '1gb'
-  cpu_kind = 'shared'
   cpus = 2
   memory_mb = 1024

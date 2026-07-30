@@ -7,6 +7,7 @@ import math
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -41,6 +42,76 @@ class LatestFrameStore:
     def snapshot(self) -> LatestFrame:
         with self._lock:
             return self._value
+
+
+@dataclass(frozen=True)
+class SynchronizedFramePair:
+    rgb: LatestFrame
+    thermal: LatestFrame
+    delta_sec: float
+
+
+class RgbThermalSynchronizer:
+    """Keep short RGB/thermal histories and expose the closest valid pair.
+
+    Timestamps are backend receipt times. This is intentionally bounded and
+    dependency-free so it remains safe in stability mode. Firmware capture
+    timestamps can replace receipt timestamps later without changing callers.
+    """
+
+    def __init__(self, history_size: int = 4, max_delta_sec: float = 0.25) -> None:
+        if history_size < 1:
+            raise ValueError("history_size must be at least 1")
+        if max_delta_sec <= 0:
+            raise ValueError("max_delta_sec must be positive")
+        self.history_size = history_size
+        self.max_delta_sec = max_delta_sec
+        self._lock = threading.Lock()
+        self._rgb: deque[LatestFrame] = deque(maxlen=history_size)
+        self._thermal: deque[LatestFrame] = deque(maxlen=history_size)
+        self._rgb_sequence = 0
+        self._thermal_sequence = 0
+
+    def add_rgb(self, data: bytes, timestamp: Optional[float] = None) -> LatestFrame:
+        now = time.monotonic() if timestamp is None else timestamp
+        with self._lock:
+            self._rgb_sequence += 1
+            frame = LatestFrame(bytes(data), now, self._rgb_sequence)
+            self._rgb.append(frame)
+            return frame
+
+    def add_thermal(self, data: bytes, timestamp: Optional[float] = None) -> LatestFrame:
+        now = time.monotonic() if timestamp is None else timestamp
+        with self._lock:
+            self._thermal_sequence += 1
+            frame = LatestFrame(bytes(data), now, self._thermal_sequence)
+            self._thermal.append(frame)
+            return frame
+
+    def snapshot(self, max_delta_sec: Optional[float] = None) -> SynchronizedFramePair | None:
+        threshold = self.max_delta_sec if max_delta_sec is None else max_delta_sec
+        with self._lock:
+            if not self._rgb or not self._thermal:
+                return None
+            best_rgb: LatestFrame | None = None
+            best_thermal: LatestFrame | None = None
+            best_delta = float("inf")
+            for rgb in self._rgb:
+                for thermal in self._thermal:
+                    delta = abs(rgb.timestamp - thermal.timestamp)
+                    if delta < best_delta:
+                        best_rgb, best_thermal, best_delta = rgb, thermal, delta
+            if best_rgb is None or best_thermal is None or best_delta > threshold:
+                return None
+            return SynchronizedFramePair(best_rgb, best_thermal, best_delta)
+
+    def health(self) -> dict:
+        with self._lock:
+            return {
+                "rgb_history_depth": len(self._rgb),
+                "thermal_history_depth": len(self._thermal),
+                "max_pair_delta_ms": self.max_delta_sec * 1000.0,
+            }
 
 
 def parse_sensor_message(data: bytes):

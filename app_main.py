@@ -262,6 +262,13 @@ _input_text_buf: List[str] = []   # what the user said this turn (from input_aud
 _output_text_buf: List[str] = []  # what Gemini said this turn (from output_audio_transcription)
 _esp32_tts_started: bool = False  # whether we've sent TTS:START to the ESP32 for the current turn
 _TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware side
+_TTS_END = object()
+_TTS_ABORT = object()
+_tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
+_tts_sender_task: Optional[asyncio.Task] = None
+_vision_submitted_for_turn: bool = False
+_thermal_submitted_for_turn: bool = False
+_TTS_TARGET_LEAD_SEC = 0.75       # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
 # so consecutive chunks resample smoothly instead of clicking at boundaries.
@@ -296,13 +303,83 @@ def _mark_gemini_playing() -> None:
     audio_stream.current_ai_task = task
 
 
+def _clear_tts_send_queue() -> None:
+    while True:
+        try:
+            _tts_send_queue.get_nowait()
+            _tts_send_queue.task_done()
+        except asyncio.QueueEmpty:
+            return
+
+
+async def _paced_tts_sender() -> None:
+    """Sole owner of paced Gemini Live TTS writes to the ESP32 websocket.
+
+    Paces against a virtual playback clock rather than sleeping one chunk's
+    duration per send: the clock accumulates the real duration of everything
+    written, so time spent inside send_bytes() cannot make the stream drift
+    slower than realtime and starve the firmware's I2S writer. At most
+    _TTS_TARGET_LEAD_SEC of audio is ever in flight, keeping qTTS well under
+    TTS_QUEUE_DEPTH while still holding a cushion against WiFi jitter.
+    """
+    global _esp32_tts_started
+    owner_ws: Optional[WebSocket] = None
+    playback_clock = 0.0
+
+    while True:
+        item = await _tts_send_queue.get()
+        try:
+            if item is _TTS_END or item is _TTS_ABORT:
+                if (_esp32_tts_started and owner_ws and
+                        owner_ws.client_state == WebSocketState.CONNECTED):
+                    try:
+                        await owner_ws.send_text("TTS:END")
+                    except Exception:
+                        pass
+                _esp32_tts_started = False
+                owner_ws = None
+                playback_clock = 0.0
+                continue
+
+            chunk = item
+            ws = esp32_audio_ws
+            if not ws or ws.client_state != WebSocketState.CONNECTED:
+                _esp32_tts_started = False
+                owner_ws = None
+                playback_clock = 0.0
+                continue
+
+            if owner_ws is not ws or not _esp32_tts_started:
+                await ws.send_text("TTS:START")
+                owner_ws = ws
+                _esp32_tts_started = True
+                playback_clock = time.monotonic()
+
+            now = time.monotonic()
+            if playback_clock < now:
+                playback_clock = now
+            lead = playback_clock - now
+            if lead > _TTS_TARGET_LEAD_SEC:
+                await asyncio.sleep(lead - _TTS_TARGET_LEAD_SEC)
+            await ws.send_bytes(chunk)
+            playback_clock += len(chunk) / (audio_stream.STREAM_SR * 2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _esp32_tts_started = False
+            owner_ws = None
+            playback_clock = 0.0
+            print(f"[TTS-WS] paced send failed: {e}", flush=True)
+        finally:
+            _tts_send_queue.task_done()
+
 async def _on_audio(pcm24k: bytes):
     """Gemini Live streams 24kHz PCM16 audio deltas.
 
     The ESP32 TTS websocket needs 8kHz PCM: audio_stream.STREAM_SR is 8000,
     so a single 24k->8k resample feeds it directly.
     """
-    global _esp32_tts_started, _ratecv_state_8k
+    global _ratecv_state_8k
 
     _mark_gemini_playing()
 
@@ -313,19 +390,12 @@ async def _on_audio(pcm24k: bytes):
         return
 
     if pcm8k:
-        _ws = esp32_audio_ws
-        if _ws and _ws.client_state == WebSocketState.CONNECTED:
-            try:
-                if not _esp32_tts_started:
-                    await _ws.send_text("TTS:START")
-                    _esp32_tts_started = True
-                for i in range(0, len(pcm8k), _TTS_CHUNK):
-                    await _ws.send_bytes(pcm8k[i:i + _TTS_CHUNK])
-            except Exception as e:
-                print(f"[TTS-WS] send failed: {e}", flush=True)
+        for i in range(0, len(pcm8k), _TTS_CHUNK):
+            _tts_send_queue.put_nowait(bytes(pcm8k[i:i + _TTS_CHUNK]))
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
     if not text:
         return
     _input_text_buf.append(text)
@@ -337,6 +407,34 @@ async def _on_input_transcription(text: str):
     except Exception:
         pass
     combined = "".join(_input_text_buf)
+    wants_vision = is_explicit_vision_request(combined)
+    wants_thermal = is_thermal_request(combined)
+    if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
+        frame = latest_rgb.snapshot()
+        if frame.data is not None:
+            data = frame.data
+            if CAMERA_ROTATION_DEG != 0:
+                data = await asyncio.to_thread(_rotate_jpeg_bytes, data)
+            _vision_submitted_for_turn = await gemini_live.send_image(data)
+            print(
+                f"[VISION] pre-response latest_rgb sequence={frame.sequence} "
+                f"submitted={_vision_submitted_for_turn}",
+                flush=True,
+            )
+    # Thermal goes as structured text, never as the colorized heatmap.
+    if wants_thermal and not _thermal_submitted_for_turn:
+        facts = build_thermal_facts()
+        if facts is None:
+            print("[THERMAL] no recent thermal frame; facts not submitted", flush=True)
+        else:
+            _thermal_submitted_for_turn = await gemini_live.send_text(
+                "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":"))
+            )
+            print(
+                f"[THERMAL] facts submitted ahead={facts['directly_ahead_mean_c']}C "
+                f"max={facts['scene_max_c']}C submitted={_thermal_submitted_for_turn}",
+                flush=True,
+            )
     if _has_hotword(combined):
         async with interrupt_lock:
             print(f"[HOTWORD] '{combined}' -> full reset", flush=True)
@@ -369,18 +467,15 @@ async def _on_turn_complete():
     consider gating `streaming` in ws_audio so mic audio isn't forwarded to
     Gemini at all while in a restrictive navigation state.
     """
-    global _esp32_tts_started, omni_conversation_active, omni_previous_nav_state
-    global _ratecv_state_8k
+    global omni_conversation_active, omni_previous_nav_state
+    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
 
-    _ws = esp32_audio_ws
-    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
-        try:
-            await _ws.send_text("TTS:END")
-        except Exception:
-            pass
-    _esp32_tts_started = False
+    _tts_send_queue.put_nowait(_TTS_END)
     # New turn next time — don't carry resample state across turn boundaries
     _ratecv_state_8k = None
+    _vision_submitted_for_turn = False
+    _thermal_submitted_for_turn = False
+
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
     # in _on_audio. (The interrupted/barge-in case is cleared separately, via
@@ -410,9 +505,6 @@ async def _on_turn_complete():
         pass
     _output_text_buf.clear()
 
-    if user_text and is_explicit_vision_request(user_text):
-        await request_gemini_vision(f"voice:{user_text[:80]}")
-
     if user_text and not STABILITY_MODE:
         async with interrupt_lock:
             # gemini_live already spoke the reply live over audio; this call
@@ -427,21 +519,18 @@ async def _on_turn_complete():
 
 async def _on_interrupted():
     """User barged in and cut off Gemini's current response."""
-    global _esp32_tts_started, _ratecv_state_8k
+    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
     print("[Gemini Live] Response interrupted by user", flush=True)
 
     # Same as _on_turn_complete: tell the firmware the TTS stream is over so
     # tts_playing clears and the mic un-mutes. Without this, a barge-in left
     # the ESP32 stuck in TTS mode until the next full turn happened to send
     # its own TTS:START/TTS:END pair.
-    _ws = esp32_audio_ws
-    if _esp32_tts_started and _ws and _ws.client_state == WebSocketState.CONNECTED:
-        try:
-            await _ws.send_text("TTS:END")
-        except Exception:
-            pass
-    _esp32_tts_started = False
+    _clear_tts_send_queue()
+    _tts_send_queue.put_nowait(_TTS_ABORT)
     _ratecv_state_8k = None
+    _vision_submitted_for_turn = False
+    _thermal_submitted_for_turn = False
     await hard_reset_audio("gemini_interrupted")
 
 gemini_live.on_audio = _on_audio
@@ -551,7 +640,10 @@ RECENT_MAX = 50
 # newest JPEG, matching latest_rgb's single-value contract.
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 10)
 latest_rgb = LatestFrameStore()
-latest_thermal: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0}
+latest_thermal = LatestFrameStore()
+# Native 24x32 Celsius grid retained independently of the browser-only
+# colorized JPEG path for future RGB/thermal calibration and point queries.
+latest_thermal_matrix: Optional[np.ndarray] = None
 latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
 latest_device_status: Dict[str, Any] = {"timestamp": 0.0, "data": None}
 thermal_display_config: Dict[str, Any] = {
@@ -562,6 +654,7 @@ thermal_display_config: Dict[str, Any] = {
     "hotspot": True,
     "labels": True,
     "interpolation": "cubic",
+    "rotation_deg": 90,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
@@ -571,6 +664,15 @@ thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+
+# True while the ESP32 has explicitly placed the microphone in START mode.
+# Gemini Live receives a low-rate stream of current camera frames during this
+# window, allowing natural visual questions without a hard-coded phrase list.
+mic_streaming = False
+GEMINI_VIDEO_INTERVAL_SEC = max(
+    0.25, float(os.getenv("GEMINI_VIDEO_INTERVAL_SEC", "0.75"))
+)
+_last_gemini_video_submit = 0.0
 
 # Bounded ingest hand-offs keep ESP32 receive loops independent of Gemini,
 # OpenCV, and slow browser viewers. Drop-oldest preserves real-time behavior.
@@ -618,6 +720,93 @@ _VISION_PHRASES = (
 def is_explicit_vision_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
     return any(phrase in normalized for phrase in _VISION_PHRASES)
+
+# ---- Thermal facts for Gemini ----
+# Gemini receives measurements, never the colorized heatmap: palette and
+# auto-range change every frame, so color-reading is unrepeatable. These come
+# straight off the native float32 grid in latest_thermal_matrix.
+THERMAL_FACT_MAX_AGE_SEC = float(os.getenv("THERMAL_FACT_MAX_AGE_SEC", "3.0"))
+# Fraction of the grid treated as "directly ahead". The MLX90640 and OV2640 are
+# rigidly co-mounted a few cm apart, so beyond ~1m parallax is under one thermal
+# pixel and the grid centre is the RGB centre. Deliberately avoids claiming
+# pixel-accurate correspondence, which would need a real calibration pass.
+THERMAL_CENTER_FRACTION = 0.4
+
+_THERMAL_PHRASES = (
+    "hot", "warm", "cold", "cool", "temperature", "burn", "heat",
+    "safe to touch", "safe to hold", "boiling", "is the stove", "is the oven",
+)
+
+
+def is_thermal_request(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return any(phrase in normalized for phrase in _THERMAL_PHRASES)
+
+
+def _describe_grid_position(row: int, col: int, rows: int, cols: int) -> str:
+    vertical = ("upper", "middle", "lower")[min(2, int(row * 3 / rows))]
+    horizontal = ("left", "centre", "right")[min(2, int(col * 3 / cols))]
+    if vertical == "middle" and horizontal == "centre":
+        return "directly ahead"
+    return f"{vertical} {horizontal}"
+
+
+def build_thermal_facts() -> Optional[dict]:
+    """Structured thermal measurements for the current view, or None.
+
+    Reported on a coarse 3x3 grid rather than per object: there is no
+    bounding-box source in STABILITY_MODE (YOLO disabled), and 3x3 answers the
+    questions that matter to a BLV user without asserting a spatial precision
+    this hardware has not been calibrated for.
+    """
+    matrix = latest_thermal_matrix
+    if matrix is None:
+        return None
+    snapshot = latest_thermal.snapshot()
+    if snapshot.data is None:
+        return None
+    age = time.monotonic() - snapshot.timestamp
+    if age > THERMAL_FACT_MAX_AGE_SEC:
+        return None
+    grid = np.asarray(matrix, dtype=np.float32)
+    if not np.isfinite(grid).all():
+        return None
+    rows, cols = grid.shape
+    # 20th percentile stands in for ambient; the true minimum latches onto a
+    # single cold outlier pixel.
+    ambient = float(np.percentile(grid, 20))
+    scene_max = float(grid.max())
+    hot_row, hot_col = np.unravel_index(int(np.argmax(grid)), grid.shape)
+    half = THERMAL_CENTER_FRACTION / 2
+    r0, r1 = int(rows * (0.5 - half)), int(rows * (0.5 + half))
+    c0, c1 = int(cols * (0.5 - half)), int(cols * (0.5 + half))
+    centre = grid[r0:r1, c0:c1]
+    regions = {}
+    for ri, rname in enumerate(("upper", "middle", "lower")):
+        for ci, cname in enumerate(("left", "centre", "right")):
+            block = grid[rows * ri // 3:rows * (ri + 1) // 3,
+                         cols * ci // 3:cols * (ci + 1) // 3]
+            regions[f"{rname}_{cname}"] = round(float(block.mean()), 1)
+    return {
+        "sensor": "MLX90640 32x24 thermopile array, roughly co-aligned with the camera",
+        "measurement_age_sec": round(age, 2),
+        "ambient_c": round(ambient, 1),
+        "scene_max_c": round(scene_max, 1),
+        "scene_min_c": round(float(grid.min()), 1),
+        "directly_ahead_mean_c": round(float(centre.mean()), 1),
+        "directly_ahead_max_c": round(float(centre.max()), 1),
+        "hotspot": {
+            "temperature_c": round(scene_max, 1),
+            "position": _describe_grid_position(int(hot_row), int(hot_col), rows, cols),
+            "above_ambient_c": round(scene_max - ambient, 1),
+        },
+        "region_mean_c": regions,
+        "accuracy_note": (
+            "Surface temperature estimates, +/-2C typical. Emissivity assumed 0.95; "
+            "shiny or metallic surfaces read substantially cooler than they actually "
+            "are. Not reliable for burn-safety decisions."
+        ),
+    }
 
 
 async def request_gemini_vision(reason: str) -> dict:
@@ -831,6 +1020,8 @@ async def full_system_reset(reason: str = ""):
     5) Notify ESP32: RESET (optional)
     """
     # 1) Audio & AI
+    _clear_tts_send_queue()
+    _tts_send_queue.put_nowait(_TTS_ABORT)
     await hard_reset_audio(reason or "full_system_reset")
 
     # 2) ASR
@@ -1219,19 +1410,16 @@ async def start_ai_with_text(user_text: str):
                 try:
                     pcm8k = await _say_to_pcm8k(full_text)
                     if pcm8k:
-                        # Primary path: send raw mono-16 PCM to ESP32 over /ws_audio WebSocket.
-                        # Firmware taskTTSPlay consumes qTTS and writes to i2sOut.
+                        # Primary path: enqueue raw mono-16 PCM for the paced
+                        # /ws_audio sender. Firmware taskTTSPlay consumes qTTS
+                        # and writes to i2sOut.
                         _ws = esp32_audio_ws
                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
-                            try:
-                                await _ws.send_text("TTS:START")
-                                _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
-                                for _i in range(0, len(pcm8k), _CHUNK):
-                                    await _ws.send_bytes(pcm8k[_i:_i + _CHUNK])
-                                await _ws.send_text("TTS:END")
-                                print(f"[TTS-WS] sent {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
-                            except Exception as _ws_err:
-                                print(f"[TTS-WS] send failed: {_ws_err}", flush=True)
+                            _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
+                            for _i in range(0, len(pcm8k), _CHUNK):
+                                _tts_send_queue.put_nowait(pcm8k[_i:_i + _CHUNK])
+                            _tts_send_queue.put_nowait(_TTS_END)
+                            print(f"[TTS-WS] queued {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
                         else:
                             print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
                         # Also broadcast via /stream.wav so browser clients can hear it
@@ -1307,6 +1495,7 @@ def health():
     if sys.platform != "darwin":
         rss *= 1024
     rgb = latest_rgb.snapshot()
+    thermal = latest_thermal.snapshot()
     return JSONResponse({
         "ok": True,
         "stability_mode": STABILITY_MODE,
@@ -1318,12 +1507,12 @@ def health():
         "viewers": {"rgb": len(camera_viewers), "thermal": len(thermal_viewers), "imu": len(imu_ws_clients)},
         "latest_age_sec": {
             "rgb": None if rgb.data is None else max(0.0, now - rgb.timestamp),
-            "thermal": None if not latest_thermal["timestamp"] else max(0.0, now - latest_thermal["timestamp"]),
+            "thermal": None if thermal.data is None else max(0.0, now - thermal.timestamp),
             "imu": None if not latest_imu["timestamp"] else max(0.0, now - latest_imu["timestamp"]),
         },
         "latest_sequences": {
             "rgb": rgb.sequence,
-            "thermal": latest_thermal["sequence"],
+            "thermal": thermal.sequence,
             "imu": latest_imu["sequence"],
         },
         "device_status": latest_device_status,
@@ -1390,6 +1579,7 @@ class ThermalDisplaySettings(BaseModel):
     hotspot: Optional[bool] = None
     labels: Optional[bool] = None
     interpolation: Optional[str] = None
+    rotation_deg: Optional[int] = None
 
 
 @app.get("/api/thermal-display")
@@ -1404,12 +1594,15 @@ def update_thermal_display(settings: ThermalDisplaySettings):
         return JSONResponse({"error": "invalid palette"}, status_code=400)
     if "interpolation" in values and values["interpolation"] not in {"nearest", "cubic"}:
         return JSONResponse({"error": "invalid interpolation"}, status_code=400)
+    if "rotation_deg" in values and values["rotation_deg"] not in {0, 90, 180, 270}:
+        return JSONResponse({"error": "invalid rotation_deg"}, status_code=400)
     next_min = float(values.get("min_c", thermal_display_config["min_c"]))
     next_max = float(values.get("max_c", thermal_display_config["max_c"]))
     if next_min >= next_max:
         return JSONResponse({"error": "min_c must be less than max_c"}, status_code=400)
     thermal_display_config.update(values)
     return JSONResponse(dict(thermal_display_config))
+   
 
 
 @app.get("/api/imu-validation")
@@ -1665,7 +1858,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 #
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
+    global esp32_audio_ws, mic_streaming
     # Evict-and-replace rather than reject: unlike ws_camera_esp, a stale
     # mic connection blocks the VAD/dispatch pipeline, so a reconnect needs
     # to fail over immediately instead of waiting on ping-timeout detection
@@ -1744,6 +1937,7 @@ async def ws_audio(ws: WebSocket):
                 if cmd == "START":
                     print("[MIC] Listening — waiting for speech...")
                     streaming            = True
+                    mic_streaming         = AI_BACKEND == "gemini_live"
                     pcm_buffer           = bytearray()
                     vad_silent_chunks    = 0
                     vad_speech_chunks    = 0
@@ -1867,6 +2061,7 @@ async def ws_audio(ws: WebSocket):
         print(f"\n[WS ERROR] {e}")
     finally:
         streaming  = False
+        mic_streaming = False
         pcm_buffer = None
         if audio_worker_task is not None:
             audio_worker_task.cancel()
@@ -1880,6 +2075,8 @@ async def ws_audio(ws: WebSocket):
         except Exception:
             pass
         if esp32_audio_ws is ws:
+            _clear_tts_send_queue()
+            _tts_send_queue.put_nowait(_TTS_ABORT)
             esp32_audio_ws = None
         backend_metrics["audio_disconnects"] += 1
         print(
@@ -1995,13 +2192,13 @@ def _process_camera_frame_blocking(data: bytes):
 # compile.ino exactly.
 async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, frame_event: asyncio.Event,
                                 gemini_frame_holder: dict, gemini_frame_event: asyncio.Event,
-                                gemini_pump_task) -> int:
+                                gemini_pump_task, received_at: Optional[float] = None) -> int:
     """Per-frame camera ingest: latest-frame cache, nav/recording processor
     hand-off, Gemini Live pump hand-off. Shared verbatim by /ws/camera
     (ws_camera_esp) and the merged /ws/camera_thermal (ws_camera_thermal_esp)
     so both stay on identical processing logic."""
     frame_counter += 1
-    latest_rgb.update(data)
+    latest_rgb.update(data, received_at)
     recording_pipeline.enqueue_latest(data)
 
     # Cheap per-frame bookkeeping stays here; recording runs in the worker.
@@ -2017,11 +2214,25 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
     holder["data"] = data
     frame_event.set()
 
-    if gemini_pump_task is not None:
-        gemini_frame_holder["data"] = data
-        gemini_frame_event.set()
+    global _last_gemini_video_submit
+    if gemini_pump_task is not None and mic_streaming:
+        now = time.monotonic()
+        if now - _last_gemini_video_submit >= GEMINI_VIDEO_INTERVAL_SEC:
+            _last_gemini_video_submit = now
+            gemini_frame_holder["data"] = data
+            gemini_frame_event.set()
 
     return frame_counter
+
+
+def _retain_latest_thermal(data: bytes, received_at: Optional[float] = None) -> np.ndarray:
+    """Retain both the exact wire payload and its native float32 matrix."""
+    global latest_thermal_matrix
+    latest_thermal.update(data, received_at)
+    latest_thermal_matrix = np.frombuffer(
+        data, dtype="<f4"
+    ).reshape(24, 32).copy()
+    return latest_thermal_matrix
 
 
 async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
@@ -2033,12 +2244,12 @@ async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
     3072 bytes (24*32 float32)."""
     if len(data) != 3072:
         return thermal_frame_count
+    frame = _retain_latest_thermal(data)
     thermal_frame_count += 1
     if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
         print(f"[THERMAL] received {thermal_frame_count} frames, "
               f"forwarding to {len(thermal_viewers)} viewer(s)", flush=True)
 
-    frame = np.frombuffer(data, dtype="<f4").reshape(24, 32)
     colorized = _colorize_thermal(frame)
     ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if ok and thermal_viewers:
@@ -2190,7 +2401,7 @@ async def ws_camera_esp(ws: WebSocket):
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
-        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
+        if AI_BACKEND == "gemini_live"
         else None
     )
 
@@ -2200,7 +2411,8 @@ async def ws_camera_esp(ws: WebSocket):
             if "bytes" in msg and msg["bytes"] is not None:
                 frame_counter = await _handle_camera_frame(
                     msg["bytes"], frame_counter, holder, frame_event,
-                    gemini_frame_holder, gemini_frame_event, gemini_pump_task
+                    gemini_frame_holder, gemini_frame_event, gemini_pump_task,
+                    time.monotonic(),
                 )
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
@@ -2397,7 +2609,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
-        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
+        if AI_BACKEND == "gemini_live"
         else None
     )
 
@@ -2414,9 +2626,11 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                         print(f"[WS-INGEST] invalid sensor packet reason={exc}", flush=True)
                     continue
                 if msg_type == MSG_TYPE_CAM:
+                    received_at = time.monotonic()
                     frame_counter = await _handle_camera_frame(
                         payload, frame_counter, holder, frame_event,
-                        gemini_frame_holder, gemini_frame_event, gemini_pump_task
+                        gemini_frame_holder, gemini_frame_event, gemini_pump_task,
+                        received_at,
                     )
                     if frame_counter == 1 or frame_counter % 100 == 0:
                         print(
@@ -2425,8 +2639,8 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                             flush=True,
                         )
                 elif msg_type == MSG_TYPE_THERMAL:
-                    latest_thermal["timestamp"] = time.monotonic()
-                    latest_thermal["sequence"] += 1
+                    received_at = time.monotonic()
+                    _retain_latest_thermal(payload, received_at)
                     if thermal_ingest_q.full():
                         try:
                             thermal_ingest_q.get_nowait()
@@ -2434,7 +2648,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                         except asyncio.QueueEmpty:
                             pass
                     try:
-                        thermal_ingest_q.put_nowait((payload, time.monotonic()))
+                        thermal_ingest_q.put_nowait((payload, received_at))
                     except asyncio.QueueFull:
                         thermal_dropped += 1
                 elif msg_type == MSG_TYPE_IMU:
@@ -2523,6 +2737,18 @@ async def ws_viewer(ws: WebSocket):
 def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
     """Render the latest thermal grid without changing MLX90640 acquisition."""
     cfg = dict(thermal_display_config)
+    # Display-only orientation fix for how the MLX90640 is physically mounted.
+    # Applied here rather than at ingest so latest_thermal/latest_thermal_matrix
+    # stay in the sensor's native orientation for Gemini and RGB/thermal
+    # calibration. ascontiguousarray: np.rot90 returns a negative-stride view
+    # that OpenCV rejects.
+    rotation = int(cfg.get("rotation_deg", 0))
+    if rotation == 90:
+        frame = np.ascontiguousarray(np.rot90(frame, k=-1))
+    elif rotation == 180:
+        frame = np.ascontiguousarray(np.rot90(frame, k=2))
+    elif rotation == 270:
+        frame = np.ascontiguousarray(np.rot90(frame, k=1))
     if cfg["auto_range"]:
         lo, hi = np.percentile(frame, [5, 95])
     else:
@@ -2540,13 +2766,17 @@ def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
     }.get(cfg["palette"], cv2.COLORMAP_INFERNO)
     colored = cv2.applyColorMap(normed, palette)
     interpolation = cv2.INTER_NEAREST if cfg["interpolation"] == "nearest" else cv2.INTER_CUBIC
-    rendered = cv2.resize(colored, (320, 240), interpolation=interpolation)
+    # Scale derived from the (possibly rotated) grid so 90/270 stay square-pixel.
+    rows, cols = frame.shape
+    scale = 10
+    out_w, out_h = cols * scale, rows * scale
+    rendered = cv2.resize(colored, (out_w, out_h), interpolation=interpolation)
     if cfg["hotspot"]:
         row, col = np.unravel_index(int(np.argmax(frame)), frame.shape)
-        cv2.circle(rendered, (int((col + 0.5) * 10), int((row + 0.5) * 10)), 7, (255, 255, 255), 2)
+        cv2.circle(rendered, (int((col + 0.5) * scale), int((row + 0.5) * scale)), 7, (255, 255, 255), 2)
     if cfg["labels"]:
         cv2.putText(rendered, f"{float(frame.min()):.1f}C - {float(frame.max()):.1f}C",
-                    (6, 232), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                    (6, out_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
     return rendered
 
 # ---------- WebSocket: ESP32 thermal entry ("THRM" + 24x32 float32 binary) ----------
@@ -2852,6 +3082,14 @@ async def startup_stability_workers():
     else:
         print("[RECORDER] Startup recording failed; ingestion remains active")
 
+
+@app.on_event("startup")
+async def startup_tts_sender():
+    global _tts_sender_task
+    if _tts_sender_task is None or _tts_sender_task.done():
+        _tts_sender_task = asyncio.create_task(_paced_tts_sender())
+
+
 @app.on_event("startup")
 async def on_startup_init_audio():
     """Initialize the audio system at startup."""
@@ -2911,6 +3149,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     """Clean up resources when the application shuts down."""
+    global _tts_sender_task
     print("[SHUTDOWN] Starting resource cleanup...")
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
@@ -2926,6 +3165,13 @@ async def on_shutdown():
 
     # Stop audio and AI tasks
     await hard_reset_audio("shutdown")
+    if _tts_sender_task is not None:
+        _tts_sender_task.cancel()
+        try:
+            await _tts_sender_task
+        except asyncio.CancelledError:
+            pass
+        _tts_sender_task = None
 
     print("[SHUTDOWN] Resource cleanup complete")
 

@@ -43,23 +43,27 @@ int MLX90640_I2CRead(uint8_t _deviceAddress, unsigned int startAddress, unsigned
     if (Wire.endTransmission(false) != 0) //Do not release bus
     {
       Serial.println("No ack read");
-      return (0); //Sensor did not ACK
+      return (-1); //Sensor did not ACK
     }
 
     uint16_t numberOfBytesToRead = bytesRemaining;
     if (numberOfBytesToRead > I2C_BUFFER_LENGTH) numberOfBytesToRead = I2C_BUFFER_LENGTH;
 
-    Wire.requestFrom((uint8_t)_deviceAddress, numberOfBytesToRead);
-    if (Wire.available())
+    size_t received = Wire.requestFrom((uint8_t)_deviceAddress, numberOfBytesToRead);
+    if (received != numberOfBytesToRead || Wire.available() < numberOfBytesToRead)
     {
-      for (uint16_t x = 0 ; x < numberOfBytesToRead / 2; x++)
-      {
-        //Store data into array
-        data[dataSpot] = Wire.read() << 8; //MSB
-        data[dataSpot] |= Wire.read(); //LSB
+      Serial.printf("Short I2C read: requested=%u received=%u\n",
+                    numberOfBytesToRead, (unsigned)received);
+      while (Wire.available()) Wire.read();
+      return (-1);
+    }
 
-        dataSpot++;
-      }
+    for (uint16_t x = 0 ; x < numberOfBytesToRead / 2; x++)
+    {
+      // dataSpot advances exactly nWordsRead times across all chunks.
+      data[dataSpot] = (uint16_t)Wire.read() << 8; //MSB
+      data[dataSpot] |= (uint16_t)Wire.read(); //LSB
+      dataSpot++;
     }
 
     bytesRemaining -= numberOfBytesToRead;

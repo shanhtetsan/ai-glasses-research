@@ -4,6 +4,39 @@ import asyncio
 from google import genai
 from google.genai import types
 
+SMART_GLASSES_SYSTEM_INSTRUCTION = """
+You are the conversational assistant inside wearable smart glasses for a blind
+or low-vision user. The live session can receive JPEG camera frames from the
+user's first-person viewpoint while microphone audio is streaming.
+
+Treat natural and indirect questions as visually grounded whenever sight would
+help answer them. Examples include asking what is ahead, what the user is
+looking at, describing the scene, locating keys or a phone, checking whether an
+object is present, reading visible text, or asking whether a path appears clear.
+The user does not need to use a fixed command phrase.
+
+Use the most recently received camera evidence for the current question. Never
+claim that you have no camera access merely because the request is phrased
+differently. If no recent usable frame is available, or the view is dark,
+blurred, obstructed, or does not contain the requested object, say that clearly
+and briefly instead of inventing details. Do not ask a blind user to visually
+confirm your answer. Give the direct answer first and keep spoken responses
+concise unless the user requests more detail.
+
+Camera images do not provide reliable object temperatures. Do not infer a
+temperature unless explicit structured thermal measurements are supplied.
+
+When a message beginning with THERMAL_MEASUREMENTS arrives, it carries real
+readings from a thermal sensor covering roughly the same view as the camera.
+Use those numbers instead of guessing from the image, and state them plainly in
+degrees Celsius. "directly_ahead" means the centre of the view. Compare against
+ambient_c so the user knows whether something is genuinely warm or just room
+temperature. Never tell the user something is safe to touch or safe to hold:
+the sensor measures surface temperature with limited accuracy and metallic
+surfaces read far cooler than they are. Report what was measured, say it is
+approximate, and let the user decide.
+""".strip()
+
 class GeminiLiveClient:
     def __init__(self):
         self.client = None
@@ -20,6 +53,7 @@ class GeminiLiveClient:
         self._response_modality = "AUDIO"  # remembered so auto-reconnect uses the same mode
         self._shutting_down = False        # True once disconnect() is called deliberately,
                                             # so receive_loop knows not to try reconnecting
+        self._send_lock = asyncio.Lock()     # serialize audio/image/text websocket writes
 
     async def connect(self, response_modality: str = "AUDIO"):
         
@@ -68,6 +102,9 @@ class GeminiLiveClient:
             model="gemini-3.1-flash-live-preview",
             config={
                 "response_modalities": [self._response_modality],
+                "system_instruction": {
+                    "parts": [{"text": SMART_GLASSES_SYSTEM_INSTRUCTION}]
+                },
                 "input_audio_transcription": {},
                 **({"output_audio_transcription": {}} if self._response_modality == "AUDIO" else {}),
             }
@@ -96,54 +133,63 @@ class GeminiLiveClient:
         print("[Gemini Live] Disconnected")
 
 
-    async def send_text(self, text):
-        if not self.connected:
-            return
-        
-        await self.session.send_realtime_input(
-            text=text
-        )
-
-    async def send_audio(self, audio_bytes):
-        if not self.connected:
-            return
-
-        await self.session.send_realtime_input(
-            audio=types.Blob(
-                data=audio_bytes,
-                mime_type="audio/pcm;rate=16000"
-            )
-        )
-
-        
-   
-    async def send_image(self, image_bytes):
-        if not self.connected:
-            print("[Gemini Live] send_image skipped: not connected")
-            return
-        
-        # print(f"[Gemini Live] Sending image of {len(image_bytes)} bytes")
-
+    async def send_text(self, text: str) -> bool:
+        if not self.connected or self.session is None:
+            return False
+        session = self.session
         try:
-            await asyncio.wait_for(
-                self.session.send_realtime_input(
-                    video = types.Blob(
-                        data = image_bytes,
-                        mime_type = "image/jpeg"
-                    )
-                ),
-                timeout = 3.0,
-            )
-            # print("[Gemini Live] Image sent successfully")
+            async with self._send_lock:
+                if not self.connected or self.session is not session:
+                    return False
+                await session.send_realtime_input(text=text)
+            return True
+        except Exception as e:
+            print(f"[Gemini Live] send_text failed: {e}")
+            return False
 
+    async def send_audio(self, audio_bytes: bytes) -> bool:
+        if not self.connected or self.session is None:
+            return False
+        session = self.session
+        try:
+            async with self._send_lock:
+                if not self.connected or self.session is not session:
+                    return False
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=audio_bytes,
+                        mime_type="audio/pcm;rate=16000",
+                    )
+                )
+            return True
+        except Exception as e:
+            print(f"[Gemini Live] send_audio failed: {e}")
+            return False
+
+    async def send_image(self, image_bytes: bytes) -> bool:
+        if not self.connected or self.session is None:
+            return False
+        session = self.session
+        try:
+            async with self._send_lock:
+                if not self.connected or self.session is not session:
+                    return False
+                await asyncio.wait_for(
+                    session.send_realtime_input(
+                        video=types.Blob(
+                            data=image_bytes,
+                            mime_type="image/jpeg",
+                        )
+                    ),
+                    timeout=3.0,
+                )
+            return True
+        except asyncio.TimeoutError:
+            print("[Gemini Live] send_image timed out after 3s")
+            return False
         except Exception as e:
             print(f"[Gemini Live] send_image failed: {e}")
-            raise 
-
-  
-
-   
-
+            return False
 
     async def receive_loop(self):
         while self.connected:

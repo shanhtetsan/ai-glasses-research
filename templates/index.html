@@ -203,7 +203,9 @@
        .chat-list scrolls internally and .settings-panel.open below caps
        its own height/scroll — regardless of the desktop-only
        overflow-y:auto added to the base .chat rule above. */
-    .chat{height:60vh; overflow:hidden}
+    .chat{ height: auto;
+    min-height: 60vh;
+    overflow: visible;}
 
     .mobile-only-ui{display:flex}
 

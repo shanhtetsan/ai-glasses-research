@@ -14,6 +14,7 @@
  * limitations under the License.
  *
  */
+#include <Arduino.h>
 #include "MLX90640_I2C_Driver.h"
 #include "MLX90640_API.h"
 #include <math.h>
@@ -48,6 +49,7 @@ int MLX90640_GetFrameData(uint8_t slaveAddr, uint16_t *frameData)
     uint16_t statusRegister;
     int error = 1;
     uint8_t cnt = 0;
+    uint16_t readyPolls = 0;
     
     dataReady = 0;
     while(dataReady == 0)
@@ -56,9 +58,18 @@ int MLX90640_GetFrameData(uint8_t slaveAddr, uint16_t *frameData)
         if(error != 0)
         {
             return error;
-        }    
+        }
         dataReady = statusRegister & 0x0008;
-    }       
+        if(dataReady == 0)
+        {
+            readyPolls++;
+            if(readyPolls >= 100)
+            {
+                return -7;
+            }
+            delay(1);
+        }
+    }
         
     while(dataReady != 0 && cnt < 5)
     { 
