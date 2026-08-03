@@ -7,6 +7,7 @@ from stability_runtime import (
     MSG_TYPE_CAM,
     MSG_TYPE_IMU,
     MSG_TYPE_THERMAL,
+    LatencyTracker,
     LatestFrameStore,
     RecordingPipeline,
     VisionController,
@@ -44,6 +45,48 @@ class ProtocolTests(unittest.TestCase):
         latest = frames.update(b"second", 2.0)
         self.assertEqual(latest.data, b"second")
         self.assertEqual(latest.sequence, 2)
+
+    def test_latency_tracker_uses_one_monotonic_timeline(self):
+        now = [1_000_000_000]
+        tracker = LatencyTracker(clock=lambda: now[0])
+        tracker.start_turn(31)
+        now[0] += 100_000_000
+        tracker.mark_microphone_chunk()
+        now[0] += 200_000_000
+        tracker.mark("speech_end_detected", 31)
+        now[0] += 812_000_000
+        tracker.mark("first_gemini_audio_received", 31)
+        now[0] += 12_000_000
+        tracker.mark_tts_sent(2040, 31)
+        now[0] += 1_959_000_000
+        tracker.mark("turn_complete", 31)
+        tracker.update_device_latency(31, 901)
+        record = tracker.finish("completed", 31)
+
+        self.assertEqual(record["speech_end_to_first_gemini_audio_ms"], 812)
+        self.assertEqual(record["speech_end_to_first_tts_send_ms"], 824)
+        self.assertEqual(record["gemini_audio_to_first_tts_send_ms"], 12)
+        self.assertEqual(record["backend_turn_total_ms"], 3083)
+        self.assertEqual(record["speech_end_to_first_i2s_ms"], 901)
+        self.assertEqual(tracker.snapshot()["rolling_median_ms"], 901)
+
+    def test_latency_tracker_missing_events_are_null_and_history_is_bounded(self):
+        now = [0]
+        tracker = LatencyTracker(history_size=2, clock=lambda: now[0])
+        for turn_id in (1, 2, 3):
+            now[0] += 1_000_000
+            tracker.start_turn(turn_id)
+            tracker.update_device_latency(turn_id, 9999)
+            now[0] += 1_000_000
+            tracker.finish("interrupted", turn_id)
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["history_size"], 2)
+        self.assertEqual(snapshot["interrupted_count"], 3)
+        self.assertIsNone(snapshot["rolling_median_ms"])
+        self.assertIsNone(snapshot["p95_ms"])
+        self.assertIsNone(
+            snapshot["latest_backend_metrics"]["speech_end_to_first_tts_send_ms"]
+        )
 
 
 class AsyncStabilityTests(unittest.IsolatedAsyncioTestCase):

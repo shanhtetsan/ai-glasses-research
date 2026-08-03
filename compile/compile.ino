@@ -14,6 +14,8 @@ struct WavFmt;
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include "esp_heap_caps.h"  // MALLOC_CAP_SPIRAM for camThermalTxBuf
+#include "esp_timer.h"
+#include "esp_system.h"
 using namespace websockets;
 
 // Strict hardware-integration mode: keep required sensor/audio paths and
@@ -36,8 +38,8 @@ using namespace websockets;
 // IMU is always multiplexed on wsCamThermal; no third TLS client exists.
 
 // ===== WiFi / Server =====
-const char* WIFI_SSID   = "IanLeeiPhone";
-const char* WIFI_PASS   = "ianleeiphone1";
+const char* WIFI_SSID   = "ShaniPh";
+const char* WIFI_PASS   = "244466666";
 const char* SERVER_HOST = "ai-glasses-for-research.fly.dev";
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
@@ -317,7 +319,7 @@ typedef struct {
 } AudioChunk;
 QueueHandle_t qAudio;
 
-#define TTS_QUEUE_DEPTH 16
+#define TTS_QUEUE_DEPTH 64
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 #if ENABLE_THERMAL_STREAM && ENABLE_THERMAL_TRANSMIT
@@ -367,6 +369,8 @@ volatile uint32_t camLastTrafficMs = 0;
 volatile uint32_t audLastTrafficMs = 0;
 volatile uint32_t micDroppedChunks = 0;
 volatile uint32_t ttsDroppedChunks = 0;
+volatile uint32_t ttsStarveEvents = 0;      // playing, but queue was empty = underrun
+volatile uint32_t ttsDroppedNotPlaying = 0; // audio arrived outside a TTS window
 volatile uint32_t thermalDroppedFrames = 0;
 volatile uint32_t thermalSentFrames = 0;
 volatile uint32_t imuSentPackets = 0;
@@ -378,6 +382,131 @@ volatile uint32_t speakerPlayedChunks = 0;
 volatile bool audioStartPending = false;
 volatile bool controlledRestartRequested = false;
 volatile bool setupComplete = false;
+
+// ====================================================================
+// Conversation latency (device monotonic clock only)
+// ====================================================================
+constexpr uint32_t LATENCY_SPEECH_RMS = 300;
+constexpr uint16_t LATENCY_SILENCE_CHUNKS = 700 / CHUNK_MS;
+constexpr uint64_t LATENCY_PING_INTERVAL_US = 15000000ULL;
+constexpr size_t LATENCY_RTT_HISTORY_SIZE = 64;
+
+portMUX_TYPE latencyMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t latencyBootPrefix = 0;
+uint16_t latencyTurnSequence = 0;
+volatile uint32_t latencyCurrentSpeechTurnId = 0;
+volatile uint32_t latencySpeechEndTurnId = 0;
+volatile int64_t latencySpeechEndUs = 0;
+volatile bool latencySpeechStartPending = false;
+volatile bool latencySpeechEndPending = false;
+volatile uint32_t latencyActiveTtsTurnId = 0;
+volatile bool latencyFirstI2SPending = false;
+volatile bool latencyDeviceReportPending = false;
+volatile uint32_t latencyDeviceReportTurnId = 0;
+volatile uint32_t latencyDeviceReportMs = 0;
+
+uint32_t latencyPingSequence = 0;
+uint32_t latencyOutstandingPingSequence = 0;
+int64_t latencyOutstandingPingUs = 0;
+uint32_t latencyRttHistoryUs[LATENCY_RTT_HISTORY_SIZE] = {};
+size_t latencyRttCount = 0;
+size_t latencyRttIndex = 0;
+volatile bool latencyRttReportPending = false;
+uint32_t latencyRttLatestUs = 0;
+uint32_t latencyRttAverageUs = 0;
+uint32_t latencyRttMinimumUs = 0;
+uint32_t latencyRttMaximumUs = 0;
+uint32_t latencyRttP95Us = 0;
+
+static uint32_t nextLatencyTurnId() {
+  latencyTurnSequence++;
+  if (latencyTurnSequence == 0) latencyTurnSequence = 1;
+  return latencyBootPrefix | latencyTurnSequence;
+}
+
+static void recordLatencyPong(uint32_t sequence, uint64_t echoedEspUs) {
+  if (sequence != latencyOutstandingPingSequence ||
+      echoedEspUs != (uint64_t)latencyOutstandingPingUs) return;
+
+  int64_t nowUs = esp_timer_get_time();
+  if (nowUs < latencyOutstandingPingUs) return;
+  uint64_t elapsedUs = (uint64_t)(nowUs - latencyOutstandingPingUs);
+  uint32_t rttUs = elapsedUs > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsedUs;
+  latencyRttHistoryUs[latencyRttIndex] = rttUs;
+  latencyRttIndex = (latencyRttIndex + 1) % LATENCY_RTT_HISTORY_SIZE;
+  if (latencyRttCount < LATENCY_RTT_HISTORY_SIZE) latencyRttCount++;
+
+  uint64_t totalUs = 0;
+  uint32_t minUs = UINT32_MAX;
+  uint32_t maxUs = 0;
+  static uint32_t sortedUs[LATENCY_RTT_HISTORY_SIZE];
+  for (size_t i = 0; i < latencyRttCount; ++i) {
+    uint32_t value = latencyRttHistoryUs[i];
+    sortedUs[i] = value;
+    totalUs += value;
+    minUs = min(minUs, value);
+    maxUs = max(maxUs, value);
+  }
+  for (size_t i = 1; i < latencyRttCount; ++i) {
+    uint32_t value = sortedUs[i];
+    size_t j = i;
+    while (j > 0 && sortedUs[j - 1] > value) {
+      sortedUs[j] = sortedUs[j - 1];
+      j--;
+    }
+    sortedUs[j] = value;
+  }
+  size_t p95Index = ((latencyRttCount * 95 + 99) / 100) - 1;
+  latencyRttLatestUs = rttUs;
+  latencyRttAverageUs = (uint32_t)(totalUs / latencyRttCount);
+  latencyRttMinimumUs = minUs;
+  latencyRttMaximumUs = maxUs;
+  latencyRttP95Us = sortedUs[p95Index];
+  latencyRttReportPending = true;
+  latencyOutstandingPingSequence = 0;
+  latencyOutstandingPingUs = 0;
+
+  Serial.printf(
+      "[LATENCY-NET] latest_rtt_ms=%.3f average_ms=%.3f min_ms=%.3f "
+      "max_ms=%.3f p95_ms=%.3f samples=%u\n",
+      latencyRttLatestUs / 1000.0,
+      latencyRttAverageUs / 1000.0,
+      latencyRttMinimumUs / 1000.0,
+      latencyRttMaximumUs / 1000.0,
+      latencyRttP95Us / 1000.0,
+      (unsigned)latencyRttCount);
+}
+
+static void recordFirstSuccessfulTtsWrite(size_t wrote) {
+  if (wrote == 0 || !latencyFirstI2SPending) return;
+  int64_t firstWriteUs = esp_timer_get_time();
+  uint32_t turnId = 0;
+  uint32_t latencyMs = 0;
+  bool recorded = false;
+
+  portENTER_CRITICAL(&latencyMux);
+  if (latencyFirstI2SPending && latencySpeechEndUs > 0 &&
+      latencyActiveTtsTurnId == latencySpeechEndTurnId) {
+    int64_t elapsedUs = firstWriteUs - latencySpeechEndUs;
+    if (elapsedUs >= 0) {
+      turnId = latencyActiveTtsTurnId;
+      latencyMs = (uint32_t)(elapsedUs / 1000);
+      latencyDeviceReportTurnId = turnId;
+      latencyDeviceReportMs = latencyMs;
+      latencyDeviceReportPending = true;
+      recorded = true;
+    }
+    latencyFirstI2SPending = false;
+  }
+  portEXIT_CRITICAL(&latencyMux);
+
+  if (recorded) {
+    Serial.printf(
+        "[LATENCY-DEVICE] turn_id=%lu speech_end_to_first_i2s_ms=%lu\n",
+        (unsigned long)turnId,
+        (unsigned long)latencyMs);
+  }
+}
 
 // ====================================================================
 // Camera
@@ -697,6 +826,63 @@ bool init_i2s_in(){
   return true;
 }
 
+static void updateLatencySpeechDetector(const uint8_t* data, size_t byteCount) {
+  static bool speechActive = false;
+  static uint16_t silentChunks = 0;
+  static int64_t silenceStartedUs = 0;
+
+  const int16_t* samples = reinterpret_cast<const int16_t*>(data);
+  size_t sampleCount = byteCount / sizeof(int16_t);
+  if (sampleCount == 0) return;
+  int64_t sampleSum = 0;
+  int64_t squareSum = 0;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    int32_t sample = samples[i];
+    sampleSum += sample;
+    squareSum += (int64_t)sample * sample;
+  }
+  // Remove the PDM microphone's DC offset before applying the RMS threshold.
+  int64_t centeredSquareSum =
+      squareSum - (sampleSum * sampleSum) / (int64_t)sampleCount;
+  if (centeredSquareSum < 0) centeredSquareSum = 0;
+  bool aboveSpeechThreshold =
+      (uint64_t)centeredSquareSum >=
+      (uint64_t)LATENCY_SPEECH_RMS * LATENCY_SPEECH_RMS * sampleCount;
+  int64_t nowUs = esp_timer_get_time();
+
+  if (aboveSpeechThreshold) {
+    silentChunks = 0;
+    silenceStartedUs = 0;
+    if (!speechActive) {
+      speechActive = true;
+      uint32_t turnId = nextLatencyTurnId();
+      portENTER_CRITICAL(&latencyMux);
+      latencyCurrentSpeechTurnId = turnId;
+      latencySpeechStartPending = true;
+      portEXIT_CRITICAL(&latencyMux);
+    }
+    return;
+  }
+
+  if (!speechActive) return;
+  if (silentChunks == 0) {
+    // Backdate to the start of the first silent PCM chunk. The confirmation
+    // window prevents false endings but is not part of perceived latency.
+    silenceStartedUs = nowUs - ((int64_t)CHUNK_MS * 1000);
+  }
+  silentChunks++;
+  if (silentChunks < LATENCY_SILENCE_CHUNKS) return;
+
+  speechActive = false;
+  silentChunks = 0;
+  portENTER_CRITICAL(&latencyMux);
+  latencySpeechEndTurnId = latencyCurrentSpeechTurnId;
+  latencySpeechEndUs = silenceStartedUs;
+  latencySpeechEndPending = true;
+  portEXIT_CRITICAL(&latencyMux);
+  silenceStartedUs = 0;
+}
+
 void taskMicCapture(void*) {
   const int samplesPerChunk = BYTES_PER_CHUNK / 2;
 
@@ -735,6 +921,7 @@ void taskMicCapture(void*) {
     if (sampleIndex != samplesPerChunk) continue;
 
     micCapturedChunks++;
+    updateLatencySpeechDetector(chunk.data, chunk.n);
 
     static bool firstChunkLogged = false;
     if (!firstChunkLogged) {
@@ -766,6 +953,7 @@ void taskMicUpload(void*) {
   uint32_t nextReconnectMs = 0;
   uint32_t connectedSinceMs = 0;
   uint32_t nextPingMs = 0;
+  int64_t nextLatencyPingUs = 0;
 
   // Keep the 640-byte queue receive buffer out of aud_net's stack.
   static AudioChunk chunk;
@@ -823,6 +1011,8 @@ void taskMicUpload(void*) {
           connectedSinceMs = millis();
           audLastTrafficMs = connectedSinceMs;
           nextPingMs = connectedSinceMs + HEARTBEAT_INTERVAL_MS;
+          nextLatencyPingUs =
+              esp_timer_get_time() + LATENCY_PING_INTERVAL_US;
           audioStartPending = true;
           Serial.printf("[WS-AUD] connected in %lu ms\n",
                         (unsigned long)elapsed);
@@ -882,6 +1072,100 @@ void taskMicUpload(void*) {
       Serial.println("[WS-AUD] START sent; microphone enabled");
     }
 
+    uint32_t speechStartTurnId = 0;
+    bool sendSpeechStart = false;
+    portENTER_CRITICAL(&latencyMux);
+    sendSpeechStart = latencySpeechStartPending;
+    speechStartTurnId = latencyCurrentSpeechTurnId;
+    portEXIT_CRITICAL(&latencyMux);
+    if (sendSpeechStart) {
+      char message[48];
+      snprintf(message, sizeof(message), "SPEECH_START:%lu",
+               (unsigned long)speechStartTurnId);
+      if (wsAud.send(message)) {
+        portENTER_CRITICAL(&latencyMux);
+        if (latencyCurrentSpeechTurnId == speechStartTurnId)
+          latencySpeechStartPending = false;
+        portEXIT_CRITICAL(&latencyMux);
+      }
+    }
+
+    uint32_t speechEndTurnId = 0;
+    bool sendSpeechEnd = false;
+    portENTER_CRITICAL(&latencyMux);
+    sendSpeechEnd = latencySpeechEndPending;
+    speechEndTurnId = latencySpeechEndTurnId;
+    portEXIT_CRITICAL(&latencyMux);
+    if (sendSpeechEnd) {
+      char message[48];
+      snprintf(message, sizeof(message), "SPEECH_END:%lu",
+               (unsigned long)speechEndTurnId);
+      if (wsAud.send(message)) {
+        portENTER_CRITICAL(&latencyMux);
+        if (latencySpeechEndTurnId == speechEndTurnId)
+          latencySpeechEndPending = false;
+        portEXIT_CRITICAL(&latencyMux);
+      }
+    }
+
+    uint32_t deviceReportTurnId = 0;
+    uint32_t deviceReportMs = 0;
+    bool sendDeviceReport = false;
+    portENTER_CRITICAL(&latencyMux);
+    sendDeviceReport = latencyDeviceReportPending;
+    deviceReportTurnId = latencyDeviceReportTurnId;
+    deviceReportMs = latencyDeviceReportMs;
+    portEXIT_CRITICAL(&latencyMux);
+    if (sendDeviceReport) {
+      char message[64];
+      snprintf(message, sizeof(message), "LATENCY:DEVICE:%lu:%lu",
+               (unsigned long)deviceReportTurnId,
+               (unsigned long)deviceReportMs);
+      if (wsAud.send(message)) {
+        portENTER_CRITICAL(&latencyMux);
+        if (latencyDeviceReportTurnId == deviceReportTurnId)
+          latencyDeviceReportPending = false;
+        portEXIT_CRITICAL(&latencyMux);
+      }
+    }
+
+    if (latencyRttReportPending) {
+      char message[128];
+      snprintf(
+          message, sizeof(message),
+          "LATENCY:RTT:%lu:%lu:%lu:%lu:%lu",
+          (unsigned long)latencyRttLatestUs,
+          (unsigned long)latencyRttAverageUs,
+          (unsigned long)latencyRttMinimumUs,
+          (unsigned long)latencyRttMaximumUs,
+          (unsigned long)latencyRttP95Us);
+      if (wsAud.send(message)) latencyRttReportPending = false;
+    }
+
+    int64_t latencyNowUs = esp_timer_get_time();
+    if (latencyOutstandingPingSequence != 0 &&
+        latencyNowUs - latencyOutstandingPingUs >=
+            (int64_t)(LATENCY_PING_INTERVAL_US * 2)) {
+      latencyOutstandingPingSequence = 0;
+      latencyOutstandingPingUs = 0;
+    }
+    if (latencyNowUs >= nextLatencyPingUs &&
+        latencyOutstandingPingSequence == 0) {
+      latencyPingSequence++;
+      if (latencyPingSequence == 0) latencyPingSequence = 1;
+      latencyOutstandingPingSequence = latencyPingSequence;
+      latencyOutstandingPingUs = latencyNowUs;
+      char message[72];
+      snprintf(message, sizeof(message), "LATENCY:PING:%lu:%llu",
+               (unsigned long)latencyOutstandingPingSequence,
+               (unsigned long long)latencyOutstandingPingUs);
+      if (!wsAud.send(message)) {
+        latencyOutstandingPingSequence = 0;
+        latencyOutstandingPingUs = 0;
+      }
+      nextLatencyPingUs = latencyNowUs + LATENCY_PING_INTERVAL_US;
+    }
+
     if ((int32_t)(millis() - nextPingMs) >= 0) {
       if (!wsAud.ping("")) {
         Serial.println("[WS-AUD] heartbeat send failed; reconnecting");
@@ -902,6 +1186,48 @@ void taskMicUpload(void*) {
 
     if (run_audio_stream && !tts_playing &&
         xQueueReceive(qAudio, &chunk, pdMS_TO_TICKS(5)) == pdPASS) {
+      // Close the small race where speech can begin while xQueueReceive()
+      // is waiting: correlation text must precede that first speech chunk.
+      uint32_t lateSpeechStartTurnId = 0;
+      bool lateSpeechStartPending = false;
+      portENTER_CRITICAL(&latencyMux);
+      lateSpeechStartPending = latencySpeechStartPending;
+      lateSpeechStartTurnId = latencyCurrentSpeechTurnId;
+      portEXIT_CRITICAL(&latencyMux);
+      if (lateSpeechStartPending) {
+        char message[48];
+        snprintf(message, sizeof(message), "SPEECH_START:%lu",
+                 (unsigned long)lateSpeechStartTurnId);
+        if (!wsAud.send(message)) {
+          micDroppedChunks++;
+          continue;
+        }
+        portENTER_CRITICAL(&latencyMux);
+        if (latencyCurrentSpeechTurnId == lateSpeechStartTurnId)
+          latencySpeechStartPending = false;
+        portEXIT_CRITICAL(&latencyMux);
+      }
+
+      uint32_t lateSpeechEndTurnId = 0;
+      bool lateSpeechEndPending = false;
+      portENTER_CRITICAL(&latencyMux);
+      lateSpeechEndPending = latencySpeechEndPending;
+      lateSpeechEndTurnId = latencySpeechEndTurnId;
+      portEXIT_CRITICAL(&latencyMux);
+      if (lateSpeechEndPending) {
+        char message[48];
+        snprintf(message, sizeof(message), "SPEECH_END:%lu",
+                 (unsigned long)lateSpeechEndTurnId);
+        if (!wsAud.send(message)) {
+          micDroppedChunks++;
+          continue;
+        }
+        portENTER_CRITICAL(&latencyMux);
+        if (latencySpeechEndTurnId == lateSpeechEndTurnId)
+          latencySpeechEndPending = false;
+        portEXIT_CRITICAL(&latencyMux);
+      }
+
       uint32_t audioStarted = millis();
       bool audioOk = wsAud.sendBinary((const char*)chunk.data, chunk.n);
       uint32_t audioElapsed = millis() - audioStarted;
@@ -1335,6 +1661,11 @@ void stopStreamWav(){
   Serial.println("[AUDIO] http_wav task stopped");
 }
 
+// 29491/32768 = 0.90. Ian's branch runs 19660 (0.60). If playback sounds
+// distorted rather than choppy, try 19660 — a small speaker on the MAX98357A
+// can distort acoustically well before the digital path clips.
+constexpr int32_t TTS_GAIN_Q15 = 29491;
+
 // ====================================================================
 // TTS
 // ====================================================================
@@ -1375,7 +1706,10 @@ void taskTTSPlay(void*){
             if (wrote == 0) {
               Serial.println("[TTS] I2S write failure wrote=0");
               vTaskDelay(pdMS_TO_TICKS(1));
-            } else off += wrote;
+            } else {
+              recordFirstSuccessfulTtsWrite(wrote);
+              off += wrote;
+            }
           }
           outPairs = 0;
         }
@@ -1388,9 +1722,14 @@ void taskTTSPlay(void*){
           if (wrote == 0) {
             Serial.println("[TTS] I2S write failure wrote=0");
             vTaskDelay(pdMS_TO_TICKS(1));
-          } else off += wrote;
+          } else {
+            recordFirstSuccessfulTtsWrite(wrote);
+            off += wrote;
+          }
         }
       }
+    } else if (tts_playing) {
+      ttsStarveEvents++;
     }
   }
 }
@@ -1715,6 +2054,8 @@ static void startThermalIfReady() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  latencyBootPrefix = esp_random() & 0xFFFF0000UL;
+  if (latencyBootPrefix == 0) latencyBootPrefix = 0x00010000UL;
 
   // Camera claims its memory first, on a clean/unfragmented heap — before
   // WiFi.begin() brings up the WiFi stack's own internal-RAM allocations,
@@ -1915,6 +2256,8 @@ void setup() {
       aud_ws_ready = false;
       aud_ws_closed_pending_reconnect = true;
       Serial.println("[WS-AUD] closed");
+      tts_reset_queue();   // orphaned audio from a turn whose socket is gone
+      tts_playing = false;
       stopStreamWav();
     }
     if (ev == WebsocketsEvent::GotPing || ev == WebsocketsEvent::GotPong)
@@ -1925,17 +2268,33 @@ void setup() {
     audLastTrafficMs = millis();
     if (msg.isText()){
       String s = msg.data(); s.trim();
-      if (s == "RESTART"){
+      if (s.startsWith("LATENCY:PONG:")) {
+        unsigned long sequence = 0;
+        unsigned long long echoedEspUs = 0;
+        if (sscanf(s.c_str(), "LATENCY:PONG:%lu:%llu",
+                   &sequence, &echoedEspUs) == 2) {
+          recordLatencyPong((uint32_t)sequence, (uint64_t)echoedEspUs);
+        }
+      } else if (s == "RESTART"){
         run_audio_stream = false;
         xQueueReset(qAudio);
         audioStartPending = true; // owner task sends START after callback returns
-      } else if (s == "TTS:START") {
+      } else if (s == "TTS:START" || s.startsWith("TTS:START:")) {
+        uint32_t turnId = 0;
+        if (s.startsWith("TTS:START:"))
+          turnId = (uint32_t)strtoul(s.c_str() + strlen("TTS:START:"), nullptr, 10);
+        portENTER_CRITICAL(&latencyMux);
+        if (turnId == 0) turnId = latencySpeechEndTurnId;
+        latencyActiveTtsTurnId = turnId;
+        latencyFirstI2SPending =
+            latencySpeechEndUs > 0 && turnId == latencySpeechEndTurnId;
+        portEXIT_CRITICAL(&latencyMux);
         run_audio_stream = false;   // mute mic during playback: no echo, no wsAud contention
         xQueueReset(qAudio);        // drop any mic frames already captured
-        tts_reset_queue();
         tts_playing = true;
-        Serial.println("[TTS] START received, tts_playing=true");
-      } else if (s == "TTS:END") {
+        Serial.printf("[TTS] START received turn_id=%lu tts_playing=true\n",
+                      (unsigned long)turnId);
+      } else if (s == "TTS:END" || s.startsWith("TTS:END:")) {
         Serial.println("[TTS] END received, sentinel queued");
         if (!qTTS) {
           Serial.println("[TTS] qTTS is NULL, cannot send end-sentinel");
@@ -1957,9 +2316,17 @@ void setup() {
             run_audio_stream = true;
           }
         }
+      } else if (s == "TTS:RESET" || s.startsWith("TTS:RESET:")) {
+        // Genuine barge-in / reset — the one case where discarding queued
+        // audio is correct. TTS:START must not do this: it would wipe the
+        // tail of the previous response on a fast follow-up.
+        tts_reset_queue();
+        tts_playing = false;
+        run_audio_stream = true;   // no sentinel will run, so un-mute here
+        Serial.println("[TTS] RESET received — queue cleared");
       }
     } else if (msg.isBinary()) {
-      if (!tts_playing) return;
+      if (!tts_playing) { ttsDroppedNotPlaying++; return; }
       if (!qTTS) {
         static bool warned = false;
         if (!warned) { Serial.println("[TTS] qTTS is NULL, dropping TTS audio"); warned = true; }
@@ -2171,7 +2538,7 @@ void loop() {
       "[HEALTH] uptime=%lu heap=%u minHeap=%u maxAlloc=%u internalLargest=%u psram=%u "
       "camQ=%u thermalQ=%u imuQ=%u micQ=%u ttsQ=%u wsCam=%d wsAud=%d "
       "cam=%lu/%lu/%lu thermal=%lu/%lu imu=%lu/%lu mic=%lu/%lu/%lu "
-      "speaker=%lu/%lu/%lu reconnect=%lu/%lu "
+      "speaker=%lu/%lu/%lu/%lu/%lu reconnect=%lu/%lu "
       "ageCam=%lu ageThermal=%lu ageMic=%lu ageSpeaker=%lu activityCam=%lu activityAud=%lu "
       "stackCamCap=%u stackCamNet=%u stackMicCap=%u stackAudNet=%u "
       "stackThermal=%u stackTts=%u stackImu=%u stackHttp=%u\n",
@@ -2186,6 +2553,7 @@ void loop() {
       (unsigned long)micDroppedChunks,
       (unsigned long)speakerQueuedChunks, (unsigned long)speakerPlayedChunks,
       (unsigned long)ttsDroppedChunks,
+      (unsigned long)ttsStarveEvents, (unsigned long)ttsDroppedNotPlaying,
       (unsigned long)camReconnectAttempts, (unsigned long)audReconnectAttempts,
       lastCameraSendMs ? (unsigned long)(now - lastCameraSendMs) : 0UL,
       lastThermalSendMs ? (unsigned long)(now - lastThermalSendMs) : 0UL,

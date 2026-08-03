@@ -13,10 +13,14 @@ primary_region = 'ewr'
 [http_service]
   internal_port = 8081
   force_https = true
-  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[http_service.concurrency]
+  type = "connections"
+  soft_limit = 20
+  hard_limit = 25
 
 [[vm]]
   memory = '1gb'

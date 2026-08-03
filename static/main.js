@@ -866,3 +866,43 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   window.addEventListener('resize', resize);
   resize();
 })();
+
+// ================= Latency dashboard =================
+(() => {
+  const fields = {
+    network_rtt: document.getElementById('latencyRtt'),
+    speech_end_to_gemini: document.getElementById('latencyGemini'),
+    speech_end_to_first_tts: document.getElementById('latencyTts'),
+    backend_total: document.getElementById('latencyBackend'),
+    device_end_to_end: document.getElementById('latencyDevice'),
+    median: document.getElementById('latencyMedian'),
+    p95: document.getElementById('latencyP95'),
+  };
+  const turn = document.getElementById('latencyTurn');
+  const status = document.getElementById('latencyStatus');
+
+  function renderMetric(element, metric) {
+    if (!element || !metric) return;
+    element.textContent = metric.text;
+    element.dataset.color = metric.color;
+  }
+
+  async function refreshLatency() {
+    try {
+      const response = await fetch('/latency/metrics', {cache: 'no-store'});
+      if (!response.ok) return;
+      const metrics = await response.json();
+      const display = metrics.display || {};
+      if (turn) turn.textContent = display.current_turn ?? '--';
+      if (status) status.textContent = display.status || 'idle';
+      Object.entries(fields).forEach(([name, element]) => {
+        renderMetric(element, display[name]);
+      });
+    } catch (_) {
+      if (status) status.textContent = 'unavailable';
+    }
+  }
+
+  refreshLatency();
+  setInterval(refreshLatency, 1000);
+})();

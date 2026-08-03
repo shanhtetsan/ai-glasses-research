@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, tempfile, wave
+import os, sys, time, json, asyncio, base64, csv, tempfile, wave
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -262,13 +262,20 @@ _input_text_buf: List[str] = []   # what the user said this turn (from input_aud
 _output_text_buf: List[str] = []  # what Gemini said this turn (from output_audio_transcription)
 _esp32_tts_started: bool = False  # whether we've sent TTS:START to the ESP32 for the current turn
 _TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware side
-_TTS_END = object()
-_TTS_ABORT = object()
+
+
+@dataclass(frozen=True)
+class _TTSQueueItem:
+    turn_id: int
+    chunk: Optional[bytes] = None
+    terminal_status: Optional[str] = None
+
+
 _tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
 _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
-_TTS_TARGET_LEAD_SEC = 0.75       # audio allowed to sit buffered on the device
+_TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
 # so consecutive chunks resample smoothly instead of clicking at boundaries.
@@ -312,6 +319,37 @@ def _clear_tts_send_queue() -> None:
             return
 
 
+def _enqueue_tts_chunk(chunk: bytes, turn_id: int) -> None:
+    _tts_send_queue.put_nowait(_TTSQueueItem(turn_id=turn_id, chunk=bytes(chunk)))
+    latency_tracker.mark_tts_queued(_tts_send_queue.qsize(), turn_id)
+
+
+def _enqueue_tts_terminal(status: str, turn_id: Optional[int] = None) -> None:
+    correlated_turn_id = latency_tracker.active_turn_id if turn_id is None else turn_id
+    _tts_send_queue.put_nowait(_TTSQueueItem(
+        turn_id=correlated_turn_id or 0,
+        terminal_status=status,
+    ))
+
+
+async def _send_esp32_audio_text(ws: WebSocket, message: str) -> None:
+    lock = _esp32_audio_send_lock if ws is esp32_audio_ws else None
+    if lock is None:
+        await ws.send_text(message)
+        return
+    async with lock:
+        await ws.send_text(message)
+
+
+async def _send_esp32_audio_bytes(ws: WebSocket, chunk: bytes) -> None:
+    lock = _esp32_audio_send_lock if ws is esp32_audio_ws else None
+    if lock is None:
+        await ws.send_bytes(chunk)
+        return
+    async with lock:
+        await ws.send_bytes(chunk)
+
+
 async def _paced_tts_sender() -> None:
     """Sole owner of paced Gemini Live TTS writes to the ESP32 websocket.
 
@@ -321,39 +359,62 @@ async def _paced_tts_sender() -> None:
     slower than realtime and starve the firmware's I2S writer. At most
     _TTS_TARGET_LEAD_SEC of audio is ever in flight, keeping qTTS well under
     TTS_QUEUE_DEPTH while still holding a cushion against WiFi jitter.
+
+    Latency turns are finalized by the callbacks that end them, not here —
+    draining can lag a turn's end by seconds, and a fast follow-up would
+    otherwise mark an already-completed turn as interrupted and evict it
+    from the rolling median/p95.
     """
     global _esp32_tts_started
     owner_ws: Optional[WebSocket] = None
+    owner_turn_id = 0
     playback_clock = 0.0
 
     while True:
         item = await _tts_send_queue.get()
         try:
-            if item is _TTS_END or item is _TTS_ABORT:
+            if item.terminal_status is not None:
+                terminal_turn_id = item.turn_id or owner_turn_id
                 if (_esp32_tts_started and owner_ws and
                         owner_ws.client_state == WebSocketState.CONNECTED):
                     try:
-                        await owner_ws.send_text("TTS:END")
+                        # RESET discards whatever is still queued on the device
+                        # (correct for a barge-in); END lets it play out.
+                        await _send_esp32_audio_text(
+                            owner_ws,
+                            f"TTS:RESET:{terminal_turn_id}"
+                            if item.terminal_status == "interrupted"
+                            else f"TTS:END:{terminal_turn_id}"
+                        )
                     except Exception:
                         pass
                 _esp32_tts_started = False
                 owner_ws = None
+                owner_turn_id = 0
                 playback_clock = 0.0
                 continue
 
-            chunk = item
+            chunk = item.chunk
+            if chunk is None:
+                continue
             ws = esp32_audio_ws
             if not ws or ws.client_state != WebSocketState.CONNECTED:
                 _esp32_tts_started = False
                 owner_ws = None
+                owner_turn_id = 0
                 playback_clock = 0.0
                 continue
 
-            if owner_ws is not ws or not _esp32_tts_started:
-                await ws.send_text("TTS:START")
+            if (owner_ws is not ws or owner_turn_id != item.turn_id
+                    or not _esp32_tts_started):
+                await _send_esp32_audio_text(
+                    ws, f"TTS:START:{item.turn_id}"
+                )
                 owner_ws = ws
+                owner_turn_id = item.turn_id
                 _esp32_tts_started = True
                 playback_clock = time.monotonic()
+                latency_tracker.mark("tts_start_sent", item.turn_id)
 
             now = time.monotonic()
             if playback_clock < now:
@@ -361,17 +422,20 @@ async def _paced_tts_sender() -> None:
             lead = playback_clock - now
             if lead > _TTS_TARGET_LEAD_SEC:
                 await asyncio.sleep(lead - _TTS_TARGET_LEAD_SEC)
-            await ws.send_bytes(chunk)
+            await _send_esp32_audio_bytes(ws, chunk)
+            latency_tracker.mark_tts_sent(len(chunk), item.turn_id)
             playback_clock += len(chunk) / (audio_stream.STREAM_SR * 2)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             _esp32_tts_started = False
             owner_ws = None
+            owner_turn_id = 0
             playback_clock = 0.0
             print(f"[TTS-WS] paced send failed: {e}", flush=True)
         finally:
             _tts_send_queue.task_done()
+
 
 async def _on_audio(pcm24k: bytes):
     """Gemini Live streams 24kHz PCM16 audio deltas.
@@ -380,6 +444,8 @@ async def _on_audio(pcm24k: bytes):
     so a single 24k->8k resample feeds it directly.
     """
     global _ratecv_state_8k
+    turn_id = latency_tracker.ensure_turn()
+    latency_tracker.mark("first_gemini_audio_received", turn_id)
 
     _mark_gemini_playing()
 
@@ -391,13 +457,15 @@ async def _on_audio(pcm24k: bytes):
 
     if pcm8k:
         for i in range(0, len(pcm8k), _TTS_CHUNK):
-            _tts_send_queue.put_nowait(bytes(pcm8k[i:i + _TTS_CHUNK]))
+            _enqueue_tts_chunk(pcm8k[i:i + _TTS_CHUNK], turn_id)
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn
     if not text:
         return
+    turn_id = latency_tracker.ensure_turn()
+    latency_tracker.mark("first_input_transcription", turn_id)
     _input_text_buf.append(text)
     try:
         # Tagged so the UI can tell this apart from the AI's partial text —
@@ -470,7 +538,10 @@ async def _on_turn_complete():
     global omni_conversation_active, omni_previous_nav_state
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
 
-    _tts_send_queue.put_nowait(_TTS_END)
+    turn_id = latency_tracker.ensure_turn()
+    latency_tracker.mark("turn_complete", turn_id)
+    _enqueue_tts_terminal("completed", turn_id)
+    await _finalize_latency_turn("completed", turn_id)
     # New turn next time — don't carry resample state across turn boundaries
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
@@ -521,13 +592,18 @@ async def _on_interrupted():
     """User barged in and cut off Gemini's current response."""
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
     print("[Gemini Live] Response interrupted by user", flush=True)
+    turn_id = latency_tracker.active_turn_id
 
     # Same as _on_turn_complete: tell the firmware the TTS stream is over so
     # tts_playing clears and the mic un-mutes. Without this, a barge-in left
     # the ESP32 stuck in TTS mode until the next full turn happened to send
     # its own TTS:START/TTS:END pair.
     _clear_tts_send_queue()
-    _tts_send_queue.put_nowait(_TTS_ABORT)
+    if turn_id is not None:
+        latency_tracker.mark("interrupted", turn_id)
+    _enqueue_tts_terminal("interrupted", turn_id)
+    if turn_id is not None:
+        await _finalize_latency_turn("interrupted", turn_id)
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
@@ -619,7 +695,7 @@ import signal
 import atexit
 from stability_runtime import (
     MSG_TYPE_CAM, MSG_TYPE_THERMAL, MSG_TYPE_IMU, MSG_TYPE_STATUS,
-    LatestFrameStore, RecordingPipeline, VisionController,
+    LatencyTracker, LatestFrameStore, RecordingPipeline, VisionController,
     parse_sensor_message,
 )
 
@@ -641,6 +717,8 @@ RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 10)
 latest_rgb = LatestFrameStore()
 latest_thermal = LatestFrameStore()
+latency_tracker = LatencyTracker(history_size=200)
+_latency_csv_lock = threading.Lock()
 # Native 24x32 Celsius grid retained independently of the browser-only
 # colorized JPEG path for future RGB/thermal calibration and point queries.
 latest_thermal_matrix: Optional[np.ndarray] = None
@@ -664,6 +742,7 @@ thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+_esp32_audio_send_lock: Optional[asyncio.Lock] = None
 
 # True while the ESP32 has explicitly placed the microphone in START mode.
 # Gemini Live receives a low-rate stream of current camera frames during this
@@ -686,6 +765,46 @@ backend_metrics = {
     "invalid_sensor_packets": 0,
     "last_audio_activity": 0.0,
 }
+
+
+def _append_latency_csv(record: dict) -> None:
+    csv_path = os.getenv("LATENCY_LOG_CSV", "").strip()
+    if not csv_path:
+        return
+    fields = (
+        "turn_id", "status",
+        "speech_end_to_first_gemini_audio_ms",
+        "speech_end_to_first_tts_send_ms",
+        "first_mic_to_first_gemini_audio_ms",
+        "gemini_audio_to_first_tts_send_ms",
+        "backend_turn_total_ms",
+        "speech_end_to_first_i2s_ms",
+        "tts_chunks", "tts_bytes", "max_queue_depth",
+    )
+    row = {field: record.get(field) for field in fields}
+    with _latency_csv_lock:
+        needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+        with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            if needs_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+async def _append_latency_csv_safely(record: dict) -> None:
+    try:
+        await asyncio.to_thread(_append_latency_csv, record)
+    except Exception as exc:
+        print(f"[LATENCY] CSV append failed: {exc}", flush=True)
+
+
+async def _finalize_latency_turn(status: str, turn_id: int) -> None:
+    record = latency_tracker.finish(status, turn_id)
+    if record is None:
+        return
+    print("[LATENCY] " + json.dumps(record, separators=(",", ":")), flush=True)
+    if status == "completed" and os.getenv("LATENCY_LOG_CSV", "").strip():
+        asyncio.create_task(_append_latency_csv_safely(record))
 
 recording_pipeline = RecordingPipeline(
     sync_recorder.record_frame,
@@ -1021,7 +1140,7 @@ async def full_system_reset(reason: str = ""):
     """
     # 1) Audio & AI
     _clear_tts_send_queue()
-    _tts_send_queue.put_nowait(_TTS_ABORT)
+    _enqueue_tts_terminal("interrupted")
     await hard_reset_audio(reason or "full_system_reset")
 
     # 2) ASR
@@ -1415,10 +1534,12 @@ async def start_ai_with_text(user_text: str):
                         # and writes to i2sOut.
                         _ws = esp32_audio_ws
                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
+                            turn_id = latency_tracker.ensure_turn()
                             _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
                             for _i in range(0, len(pcm8k), _CHUNK):
-                                _tts_send_queue.put_nowait(pcm8k[_i:_i + _CHUNK])
-                            _tts_send_queue.put_nowait(_TTS_END)
+                                _enqueue_tts_chunk(pcm8k[_i:_i + _CHUNK], turn_id)
+                            latency_tracker.mark("turn_complete", turn_id)
+                            _enqueue_tts_terminal("completed", turn_id)
                             print(f"[TTS-WS] queued {len(pcm8k)} bytes in {-(-len(pcm8k)//_CHUNK)} chunks", flush=True)
                         else:
                             print("[TTS-WS] esp32_audio_ws not connected — skipping WebSocket send", flush=True)
@@ -1524,6 +1645,11 @@ def health():
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "connections": dict(backend_metrics),
     })
+
+
+@app.get("/latency/metrics")
+def latency_metrics():
+    return JSONResponse(latency_tracker.snapshot())
 
 
 class RecordingCommand(BaseModel):
@@ -1858,7 +1984,7 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 #
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws, mic_streaming
+    global esp32_audio_ws, _esp32_audio_send_lock, mic_streaming
     # Evict-and-replace rather than reject: unlike ws_camera_esp, a stale
     # mic connection blocks the VAD/dispatch pipeline, so a reconnect needs
     # to fail over immediately instead of waiting on ping-timeout detection
@@ -1872,6 +1998,7 @@ async def ws_audio(ws: WebSocket):
             pass
     esp32_audio_ws = ws
     await ws.accept()
+    _esp32_audio_send_lock = asyncio.Lock()
     device_id = _device_id(ws)
     connected_at = time.monotonic()
     backend_metrics["audio_connects"] += 1
@@ -1934,6 +2061,60 @@ async def ws_audio(ws: WebSocket):
                 raw = (msg["text"] or "").strip()
                 cmd = raw.upper()
 
+                if raw.startswith("LATENCY:PING:"):
+                    parts = raw.split(":")
+                    if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+                        # Echo the device timestamp unchanged. The ESP32
+                        # computes RTT only with esp_timer_get_time().
+                        await _send_esp32_audio_text(
+                            ws,
+                            f"LATENCY:PONG:{parts[2]}:{parts[3]}"
+                        )
+                    continue
+
+                if raw.startswith("LATENCY:RTT:"):
+                    parts = raw.split(":")
+                    if len(parts) == 7:
+                        try:
+                            values_ms = [int(value) / 1000.0 for value in parts[2:]]
+                            latency_tracker.update_rtt(*values_ms)
+                        except ValueError:
+                            pass
+                    continue
+
+                if raw.startswith("LATENCY:DEVICE:"):
+                    parts = raw.split(":")
+                    if len(parts) == 4:
+                        try:
+                            latency_tracker.update_device_latency(
+                                int(parts[2]), float(parts[3])
+                            )
+                        except ValueError:
+                            pass
+                    continue
+
+                if raw.startswith("SPEECH_START:"):
+                    try:
+                        turn_id = int(raw.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                    active_turn_id = latency_tracker.active_turn_id
+                    if active_turn_id is not None and active_turn_id != turn_id:
+                        latency_tracker.mark("interrupted", active_turn_id)
+                        await _finalize_latency_turn("interrupted", active_turn_id)
+                    latency_tracker.start_turn(turn_id)
+                    continue
+
+                if raw.startswith("SPEECH_END:"):
+                    try:
+                        turn_id = int(raw.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                    if latency_tracker.active_turn_id is None:
+                        latency_tracker.start_turn(turn_id)
+                    latency_tracker.mark("speech_end_detected", turn_id)
+                    continue
+
                 if cmd == "START":
                     print("[MIC] Listening — waiting for speech...")
                     streaming            = True
@@ -1943,14 +2124,14 @@ async def ws_audio(ws: WebSocket):
                     vad_speech_chunks    = 0
                     vad_speech_detected  = False
                     await ui_broadcast_partial("（Recording…）")
-                    await ws.send_text("OK:STARTED")
+                    await _send_esp32_audio_text(ws, "OK:STARTED")
 
                 elif cmd == "STOP":
                     streaming = False
                     if AI_BACKEND == "gemini_live":
                         print("[MIC] Stopped streaming")
                         mic_streaming = False
-                        await ws.send_text("OK:STOPPED")
+                        await _send_esp32_audio_text(ws, "OK:STOPPED")
                     else:
                         print("[MIC] Transcribing...")
                         buf = bytes(pcm_buffer) if pcm_buffer else b""
@@ -1958,7 +2139,7 @@ async def ws_audio(ws: WebSocket):
                         vad_silent_chunks   = 0
                         vad_speech_chunks   = 0
                         vad_speech_detected = False
-                        await ws.send_text("OK:STOPPED")
+                        await _send_esp32_audio_text(ws, "OK:STOPPED")
                         await _run_whisper_and_dispatch(buf)
 
                 elif raw.startswith("PROMPT:"):
@@ -1967,12 +2148,15 @@ async def ws_audio(ws: WebSocket):
                     if text:
                         async with interrupt_lock:
                             await start_ai_with_text_custom(text)
-                        await ws.send_text("OK:PROMPT_ACCEPTED")
+                        await _send_esp32_audio_text(ws, "OK:PROMPT_ACCEPTED")
                     else:
-                        await ws.send_text("ERR:EMPTY_PROMPT")
+                        await _send_esp32_audio_text(ws, "ERR:EMPTY_PROMPT")
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
+                latency_tracker.mark_microphone_chunk(
+                    now_ns=time.monotonic_ns()
+                )
                 backend_metrics["last_audio_activity"] = time.monotonic()
 
                 if AI_BACKEND == "gemini_live":
@@ -2076,8 +2260,9 @@ async def ws_audio(ws: WebSocket):
             pass
         if esp32_audio_ws is ws:
             _clear_tts_send_queue()
-            _tts_send_queue.put_nowait(_TTS_ABORT)
+            _enqueue_tts_terminal("interrupted")
             esp32_audio_ws = None
+            _esp32_audio_send_lock = None
         backend_metrics["audio_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=audio event=disconnect "
@@ -3162,6 +3347,11 @@ async def on_shutdown():
     # state below.
     if AI_BACKEND == "gemini_live":
         await gemini_live.disconnect()
+
+    active_turn_id = latency_tracker.active_turn_id
+    if active_turn_id is not None:
+        latency_tracker.mark("interrupted", active_turn_id)
+        await _finalize_latency_turn("interrupted", active_turn_id)
 
     # Stop audio and AI tasks
     await hard_reset_audio("shutdown")
