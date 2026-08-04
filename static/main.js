@@ -863,8 +863,10 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
     }
   }, 500);
 
-  window.addEventListener('resize', resize);
-  resize();
+  // requestSync is the existing IMU resize function.
+  // Using undefined resize() here stopped module execution before latency polling.
+  window.addEventListener('resize', requestSync);
+  requestSync();
 })();
 
 // ================= Latency dashboard =================
