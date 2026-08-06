@@ -9,6 +9,10 @@
 **/.DS_Store
 **/.vscode
 
+# Git history — 1.5GB, and the build has no use for it. Without this the
+# build context alone is >1.1GB and the upload to Fly times out.
+**/.git
+
 # Model files (download with scripts/download_models.sh)
 **/model/*.pt
 **/model/*.task
