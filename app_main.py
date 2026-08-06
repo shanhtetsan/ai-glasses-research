@@ -264,6 +264,21 @@ _esp32_tts_started: bool = False  # whether we've sent TTS:START to the ESP32 fo
 _TTS_CHUNK = 2040                 # fits TTSChunk.data[2048] on the firmware side
 
 
+def _clear_turn_text_buffers():
+    """Drop whatever transcript accumulated for the turn that's ending.
+
+    _on_turn_complete consumes these before clearing them itself. The abnormal
+    exits — barge-in, a Gemini reconnect that never sends turn_complete, a full
+    reset — have nothing to consume, so they just drop them. Leaving them dirty
+    is what makes latency compound: _on_input_transcription re-joins and
+    re-scans the entire buffer on *every* delta, and a stale vision/thermal
+    phrase or hotword stays in `combined` forever, re-firing its side effect
+    on every subsequent turn.
+    """
+    _input_text_buf.clear()
+    _output_text_buf.clear()
+
+
 @dataclass(frozen=True)
 class _TTSQueueItem:
     turn_id: int
@@ -607,6 +622,21 @@ async def _on_interrupted():
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
+
+    # Consume the transcript here rather than just dropping it. Gemini can send
+    # `interrupted` and then a separate `turn_complete` for the same cut-off
+    # turn; since we now clear on the way out, that later _on_turn_complete
+    # would see an empty buffer and skip the "(user)" FINAL entirely. Emit it
+    # here so a barged-in utterance still shows up in the UI exactly once —
+    # the subsequent turn_complete finds the buffer empty and no-ops.
+    user_text = "".join(_input_text_buf).strip()
+    _clear_turn_text_buffers()
+    if user_text:
+        try:
+            await ui_broadcast_final("(user) " + user_text)
+        except Exception:
+            pass
+
     await hard_reset_audio("gemini_interrupted")
 
 gemini_live.on_audio = _on_audio
@@ -1150,6 +1180,7 @@ async def full_system_reset(reason: str = ""):
     global current_partial, recent_finals
     current_partial = ""
     recent_finals = []
+    _clear_turn_text_buffers()
 
     # 4) Camera frames
     try:
@@ -3070,8 +3101,6 @@ ref = {"roll":0.0, "pitch":0.0, "yaw":0.0}
 holdStart = 0.0
 isStill   = False
 last_ts_imu = 0.0
-last_wall = 0.0
-imu_store: List[Dict[str, Any]] = []
 
 # Startup gyro-bias calibration state
 _cal_done     = False  # True once the fast startup calibration has completed
@@ -3085,7 +3114,7 @@ def _wrap180(a: float) -> float:
     return a
 
 def process_imu_and_maybe_store(d: Dict[str, Any]):
-    global gLP, gOff, yaw, Rf, Pf, Yf, ref, holdStart, isStill, last_ts_imu, last_wall
+    global gLP, gOff, yaw, Rf, Pf, Yf, ref, holdStart, isStill, last_ts_imu
     global _cal_done, _cal_samples, _cal_start_ms
 
     t_ms = float(d.get("ts", 0.0))
@@ -3170,7 +3199,7 @@ def process_imu_and_maybe_store(d: Dict[str, Any]):
         if abs(yaw) <= abs(step): yaw = 0.0
         else: yaw += step
 
-    global Rf, Pf, Yf, ref, last_wall
+    global Rf, Pf, Yf, ref
     Rf = ANG_EMA * roll  + (1.0 - ANG_EMA) * Rf
     Pf = ANG_EMA * pitch + (1.0 - ANG_EMA) * Pf
     Yf = ANG_EMA * yaw   + (1.0 - ANG_EMA) * Yf
@@ -3184,17 +3213,6 @@ def process_imu_and_maybe_store(d: Dict[str, Any]):
     R = _wrap180(Rf - ref["roll"])
     P = _wrap180(Pf - ref["pitch"])
     Y = _wrap180(Yf - ref["yaw"])
-
-    now_wall = time.monotonic()
-    if last_wall <= 0.0 or (now_wall - last_wall) >= 0.100:
-        last_wall = now_wall
-        item = {
-            "ts": t_ms/1000.0,
-            "angles": {"roll": R, "pitch": P, "yaw": Y},
-            "accel":  {"x": ax, "y": ay, "z": az},
-            "gyro":   {"x": wx, "y": wy, "z": wz},
-        }
-        imu_store.append(item)
 
 # ---------- UDP: receive IMU data and forward ----------
 class UDPProto(asyncio.DatagramProtocol):
