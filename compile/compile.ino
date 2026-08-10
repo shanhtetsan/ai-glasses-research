@@ -41,6 +41,8 @@ using namespace websockets;
 const char* WIFI_SSID   = "ShaniPh";
 const char* WIFI_PASS   = "244466666";
 const char* SERVER_HOST = "ai-glasses-for-research.fly.dev";
+// const char* SERVER_HOST = "ai-glasses-research-test.fly.dev";
+
 const uint16_t SERVER_PORT = 443;  // HTTPS/WSS port
 
 // ===== Stability configuration =====
@@ -379,9 +381,37 @@ volatile uint32_t micCapturedChunks = 0;
 volatile uint32_t micSentChunks = 0;
 volatile uint32_t speakerQueuedChunks = 0;
 volatile uint32_t speakerPlayedChunks = 0;
+constexpr size_t SEND_LATENCY_BUCKET_COUNT = 6;
+volatile uint32_t camSlowSuccessfulSendCount = 0;
+volatile uint32_t camMaxSuccessfulSendMs = 0;
+volatile uint32_t camSuccessfulSendBuckets[SEND_LATENCY_BUCKET_COUNT] = {};
+volatile uint32_t audSlowSuccessfulSendCount = 0;
+volatile uint32_t audMaxSuccessfulSendMs = 0;
+volatile uint32_t audSuccessfulSendBuckets[SEND_LATENCY_BUCKET_COUNT] = {};
 volatile bool audioStartPending = false;
 volatile bool controlledRestartRequested = false;
 volatile bool setupComplete = false;
+
+static size_t successfulSendLatencyBucket(uint32_t elapsedMs) {
+  if (elapsedMs < 100) return 0;
+  if (elapsedMs < 250) return 1;
+  if (elapsedMs < 500) return 2;
+  if (elapsedMs < 1000) return 3;
+  if (elapsedMs < 2000) return 4;
+  return 5;
+}
+
+static void recordCamSuccessfulSend(uint32_t elapsedMs) {
+  camSuccessfulSendBuckets[successfulSendLatencyBucket(elapsedMs)]++;
+  if (elapsedMs > camMaxSuccessfulSendMs) camMaxSuccessfulSendMs = elapsedMs;
+  if (elapsedMs >= CAMERA_SEND_UNHEALTHY_MS) camSlowSuccessfulSendCount++;
+}
+
+static void recordAudSuccessfulSend(uint32_t elapsedMs) {
+  audSuccessfulSendBuckets[successfulSendLatencyBucket(elapsedMs)]++;
+  if (elapsedMs > audMaxSuccessfulSendMs) audMaxSuccessfulSendMs = elapsedMs;
+  if (elapsedMs >= CAMERA_SEND_UNHEALTHY_MS) audSlowSuccessfulSendCount++;
+}
 
 // ====================================================================
 // Conversation latency (device monotonic clock only)
@@ -721,10 +751,14 @@ void taskCamSend(void*) {
       uint32_t statusStarted = millis();
       bool statusOk = wsCamThermal.sendBinary((const char*)statusWire, sizeof(statusWire));
       uint32_t statusElapsed = millis() - statusStarted;
-      if (!statusOk || statusElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
-        closeCamSocket(statusOk ? "status-send-unhealthy" : "status-send-failed");
+      if (!statusOk) {
+        Serial.printf("[STATUS] send failed elapsed_ms=%lu\n", (unsigned long)statusElapsed);
+        closeCamSocket("status-send-failed");
         continue;
       }
+      recordCamSuccessfulSend(statusElapsed);
+      if (statusElapsed >= CAMERA_SEND_UNHEALTHY_MS)
+        Serial.printf("[STATUS] slow successful send elapsed_ms=%lu\n", (unsigned long)statusElapsed);
       lastStatusMs = now;
       camLastTrafficMs = millis();
     }
@@ -735,11 +769,15 @@ void taskCamSend(void*) {
       uint32_t thermalStarted = millis();
       bool ok = wsCamThermal.sendBinary((const char*)thermal.data, sizeof(thermal.data));
       uint32_t thermalElapsed = millis() - thermalStarted;
-      if (!ok || thermalElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+      if (!ok) {
+        Serial.printf("[THERMAL] send failed elapsed_ms=%lu\n", (unsigned long)thermalElapsed);
         thermalDroppedFrames++;
-        closeCamSocket(ok ? "thermal-send-unhealthy" : "thermal-send-failed");
+        closeCamSocket("thermal-send-failed");
         continue;
       }
+      recordCamSuccessfulSend(thermalElapsed);
+      if (thermalElapsed >= CAMERA_SEND_UNHEALTHY_MS)
+        Serial.printf("[THERMAL] slow successful send elapsed_ms=%lu\n", (unsigned long)thermalElapsed);
       lastThermalSendMs = camLastTrafficMs = millis();
       thermalSentFrames++;
       static bool firstThermalPacketSent = false;
@@ -756,11 +794,15 @@ void taskCamSend(void*) {
       uint32_t started = millis();
       bool ok = wsCamThermal.sendBinary((const char*)imuWire, sizeof(imuWire));
       uint32_t elapsed = millis() - started;
-      if (!ok || elapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+      if (!ok) {
+        Serial.printf("[IMU] send failed elapsed_ms=%lu\n", (unsigned long)elapsed);
         imuDroppedPackets++;
-        closeCamSocket(ok ? "imu-send-unhealthy" : "imu-send-failed");
+        closeCamSocket("imu-send-failed");
         continue;
       }
+      recordCamSuccessfulSend(elapsed);
+      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS)
+        Serial.printf("[IMU] slow successful send elapsed_ms=%lu\n", (unsigned long)elapsed);
       imuSentPackets++;
       camLastTrafficMs = millis();
       static bool firstImuPacketSent = false;
@@ -800,15 +842,17 @@ void taskCamSend(void*) {
       } else {
         ws_send_fail_count++;
       }
-      // ArduinoWebsockets 0.5.4 exposes no socket/write-timeout setter.
-      // This detects a blocked TLS write only after it returns; it cannot
-      // interrupt the call. The owner closes and drops the stale frame then.
-      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS) {
-        Serial.printf("[CAM] unhealthy send elapsed_ms=%lu; reconnecting\n", elapsed);
-        closeCamSocket("camera-send-unhealthy");
+      if (!ok) {
+        Serial.printf("[CAM] send failed elapsed_ms=%lu\n", (unsigned long)elapsed);
+        closeCamSocket("camera-send-failed");
         continue;
       }
-      if (!ok) { closeCamSocket("camera-send-failed"); continue; }
+      // ArduinoWebsockets 0.5.4 exposes no socket/write-timeout setter.
+      // A slow successful TLS write is observable only after it returns; it is
+      // telemetry, not proof that the established socket is unhealthy.
+      recordCamSuccessfulSend(elapsed);
+      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS)
+        Serial.printf("[CAM] slow successful send elapsed_ms=%lu\n", (unsigned long)elapsed);
     }
     vTaskDelay(pdMS_TO_TICKS(2));
   }
@@ -1053,9 +1097,8 @@ void taskMicUpload(void*) {
       bool startOk = wsAud.send("START");
       uint32_t startElapsed = millis() - startStarted;
 
-      if (!startOk || startElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
-        Serial.printf("[WS-AUD] START send failed ok=%d elapsed=%lu\n",
-                      startOk ? 1 : 0,
+      if (!startOk) {
+        Serial.printf("[WS-AUD] START send failed elapsed_ms=%lu\n",
                       (unsigned long)startElapsed);
         run_audio_stream = false;
         audioStartPending = false;
@@ -1064,6 +1107,10 @@ void taskMicUpload(void*) {
         if (qAudio) xQueueReset(qAudio);
         continue;
       }
+      recordAudSuccessfulSend(startElapsed);
+      if (startElapsed >= CAMERA_SEND_UNHEALTHY_MS)
+        Serial.printf("[WS-AUD] slow successful START elapsed_ms=%lu\n",
+                      (unsigned long)startElapsed);
 
       audioStartPending = false;
       run_audio_stream = true;
@@ -1232,10 +1279,9 @@ void taskMicUpload(void*) {
       bool audioOk = wsAud.sendBinary((const char*)chunk.data, chunk.n);
       uint32_t audioElapsed = millis() - audioStarted;
 
-      if (!audioOk || audioElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
-        Serial.printf("[MIC] upload failed bytes=%u ok=%d elapsed=%lu; reconnecting\n",
+      if (!audioOk) {
+        Serial.printf("[MIC] upload failed bytes=%u elapsed_ms=%lu; reconnecting\n",
                       (unsigned)chunk.n,
-                      audioOk ? 1 : 0,
                       (unsigned long)audioElapsed);
         micDroppedChunks++;
         run_audio_stream = false;
@@ -1244,6 +1290,12 @@ void taskMicUpload(void*) {
         wsAud.close();
         if (qAudio) xQueueReset(qAudio);
         continue;
+      }
+      recordAudSuccessfulSend(audioElapsed);
+      if (audioElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        Serial.printf("[MIC] slow successful upload bytes=%u elapsed_ms=%lu\n",
+                      (unsigned)chunk.n,
+                      (unsigned long)audioElapsed);
       }
 
       lastMicSendMs = millis();
@@ -2563,6 +2615,26 @@ void loop() {
       audLastTrafficMs ? (unsigned long)(now - audLastTrafficMs) : 0UL,
       (unsigned)swCamCap, (unsigned)swCamNet, (unsigned)swMicCap, (unsigned)swAudNet,
       (unsigned)swThermal, (unsigned)swTts, (unsigned)swImu, (unsigned)swHttp);
+
+  Serial.printf(
+      "[SEND-HEALTH] camSlow=%lu camMaxMs=%lu camBuckets=%lu/%lu/%lu/%lu/%lu/%lu "
+      "audSlow=%lu audMaxMs=%lu audBuckets=%lu/%lu/%lu/%lu/%lu/%lu\n",
+      (unsigned long)camSlowSuccessfulSendCount,
+      (unsigned long)camMaxSuccessfulSendMs,
+      (unsigned long)camSuccessfulSendBuckets[0],
+      (unsigned long)camSuccessfulSendBuckets[1],
+      (unsigned long)camSuccessfulSendBuckets[2],
+      (unsigned long)camSuccessfulSendBuckets[3],
+      (unsigned long)camSuccessfulSendBuckets[4],
+      (unsigned long)camSuccessfulSendBuckets[5],
+      (unsigned long)audSlowSuccessfulSendCount,
+      (unsigned long)audMaxSuccessfulSendMs,
+      (unsigned long)audSuccessfulSendBuckets[0],
+      (unsigned long)audSuccessfulSendBuckets[1],
+      (unsigned long)audSuccessfulSendBuckets[2],
+      (unsigned long)audSuccessfulSendBuckets[3],
+      (unsigned long)audSuccessfulSendBuckets[4],
+      (unsigned long)audSuccessfulSendBuckets[5]);
 
   if (internalLargest < CRITICAL_INTERNAL_BLOCK_BYTES) criticalMemoryCount++;
   else criticalMemoryCount = 0;
