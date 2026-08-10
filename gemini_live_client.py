@@ -121,7 +121,7 @@ class GeminiLiveClient:
             "output_audio_transcription": (
                 {} if self._response_modality == "AUDIO" else None
             ),
-            "session_resumption": {"enabled": True, "transparent": False},
+            "session_resumption": {"enabled": True},
             "context_window_compression": {"sliding_window": {}},
         }
         encoded = json.dumps(
@@ -138,7 +138,6 @@ class GeminiLiveClient:
             "input_audio_transcription": {},
             "session_resumption": types.SessionResumptionConfig(
                 handle=resumption_handle,
-                transparent=False,
             ),
             "context_window_compression": types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow()

@@ -80,7 +80,10 @@ class GeminiLiveConfigurationTests(unittest.TestCase):
         self.assertEqual(config.response_modalities, ["AUDIO"])
         self.assertIsNotNone(config.session_resumption)
         self.assertIsNone(config.session_resumption.handle)
-        self.assertFalse(config.session_resumption.transparent)
+        self.assertIsNone(config.session_resumption.transparent)
+        self.assertNotIn(
+            "transparent", config.session_resumption.model_fields_set
+        )
         self.assertIsNotNone(config.context_window_compression)
         self.assertIsNotNone(config.context_window_compression.sliding_window)
         self.assertEqual(
