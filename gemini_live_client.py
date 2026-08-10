@@ -44,6 +44,7 @@ approximate, and let the user decide.
 
 GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 GOAWAY_SAFETY_MARGIN_SEC = 2.0
+AUDIO_SEND_BUCKET_LIMITS_MS = (10, 25, 50, 100, 250, 1000)
 
 
 class GeminiLiveClient:
@@ -81,6 +82,14 @@ class GeminiLiveClient:
         self._audio_lock_wait_over_50 = 0
         self._audio_lock_wait_over_100 = 0
         self._audio_lock_wait_over_250 = 0
+        self._audio_lock_wait_buckets = [
+            0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
+        ]
+        self._audio_sdk_send_count = 0
+        self._audio_sdk_send_max_ms = 0.0
+        self._audio_sdk_send_buckets = [
+            0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
+        ]
 
     def _current_turn_id(self):
         if self.turn_id_provider is None:
@@ -97,6 +106,13 @@ class GeminiLiveClient:
         if not self._session_opened_at:
             return 0.0
         return max(0.0, time.monotonic() - self._session_opened_at)
+
+    @staticmethod
+    def _audio_send_bucket(duration_ms: float) -> int:
+        for index, limit_ms in enumerate(AUDIO_SEND_BUCKET_LIMITS_MS):
+            if duration_ms < limit_ms:
+                return index
+        return len(AUDIO_SEND_BUCKET_LIMITS_MS)
 
     @staticmethod
     def _duration_seconds(value: str) -> float:
@@ -413,6 +429,9 @@ class GeminiLiveClient:
                 self._audio_lock_wait_max_ms = max(
                     self._audio_lock_wait_max_ms, wait_ms
                 )
+                self._audio_lock_wait_buckets[
+                    self._audio_send_bucket(wait_ms)
+                ] += 1
                 if wait_ms > 50:
                     self._audio_lock_wait_over_50 += 1
                 if wait_ms > 100:
@@ -421,12 +440,25 @@ class GeminiLiveClient:
                     self._audio_lock_wait_over_250 += 1
                 if not self.connected or self.session is not session:
                     return False
-                await session.send_realtime_input(
-                    audio=types.Blob(
-                        data=audio_bytes,
-                        mime_type="audio/pcm;rate=16000",
+                sdk_send_started_ns = time.monotonic_ns()
+                try:
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=audio_bytes,
+                            mime_type="audio/pcm;rate=16000",
+                        )
                     )
-                )
+                finally:
+                    sdk_send_ms = (
+                        time.monotonic_ns() - sdk_send_started_ns
+                    ) / 1_000_000
+                    self._audio_sdk_send_count += 1
+                    self._audio_sdk_send_max_ms = max(
+                        self._audio_sdk_send_max_ms, sdk_send_ms
+                    )
+                    self._audio_sdk_send_buckets[
+                        self._audio_send_bucket(sdk_send_ms)
+                    ] += 1
             return True
         except Exception as exc:
             print(
@@ -458,6 +490,7 @@ class GeminiLiveClient:
             and self._audio_lock_wait_over_50 == 0
             and self._audio_lock_wait_over_100 == 0
             and self._audio_lock_wait_over_250 == 0
+            and self._audio_sdk_send_count == 0
         ):
             return
         self._log_timing(
@@ -468,11 +501,24 @@ class GeminiLiveClient:
             waits_over_50_ms=self._audio_lock_wait_over_50,
             waits_over_100_ms=self._audio_lock_wait_over_100,
             waits_over_250_ms=self._audio_lock_wait_over_250,
+            bucket_limits_ms="10/25/50/100/250/1000",
+            wait_buckets="/".join(map(str, self._audio_lock_wait_buckets)),
+            sdk_send_count=self._audio_sdk_send_count,
+            sdk_send_max_ms=round(self._audio_sdk_send_max_ms, 3),
+            sdk_send_buckets="/".join(map(str, self._audio_sdk_send_buckets)),
         )
         self._audio_lock_wait_max_ms = 0.0
         self._audio_lock_wait_over_50 = 0
         self._audio_lock_wait_over_100 = 0
         self._audio_lock_wait_over_250 = 0
+        self._audio_lock_wait_buckets = [
+            0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
+        ]
+        self._audio_sdk_send_count = 0
+        self._audio_sdk_send_max_ms = 0.0
+        self._audio_sdk_send_buckets = [
+            0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
+        ]
 
     def _retain_resumption_update(self, update):
         resumable = bool(update and update.resumable)

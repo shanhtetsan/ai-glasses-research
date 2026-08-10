@@ -169,36 +169,49 @@ volatile unsigned long ws_send_fail_count = 0;
 SemaphoreHandle_t i2cMutex;
 
 #if ENABLE_THERMAL_STREAM
-paramsMLX90640 mlx90640;
 constexpr size_t THERMAL_PIXEL_COUNT = 32 * 24;
 constexpr size_t THERMAL_PIXEL_BYTES = THERMAL_PIXEL_COUNT * sizeof(float);
 constexpr size_t THERMAL_EE_WORDS = 832;
 constexpr size_t THERMAL_FRAME_WORDS = 834;
+typedef struct { uint8_t data[1 + THERMAL_PIXEL_BYTES]; } ThermalChunk;
+static paramsMLX90640* mlx90640 = nullptr;
 static uint16_t* thermalEeData = nullptr;
 static uint16_t* thermalFrameData = nullptr;
 static float* thermalPixels = nullptr;
+#if ENABLE_THERMAL_TRANSMIT
+static ThermalChunk* thermalProducerScratch = nullptr;
+static ThermalChunk* thermalNetworkScratch = nullptr;
+#endif
 volatile bool thermalReady = false;
 volatile bool thermalSubsystemEnabled = false;
 static bool thermalStartupAttempted = false;
 
 // Deadline past which thermal starts even if wsAud never came up. Thermal's
-// 12KB task stack is internal SRAM — the same pool mbedTLS takes a contiguous
+// task stack is internal SRAM — the same pool mbedTLS takes a contiguous
 // block from inside connectSecure() — so startup holds off while audio is
 // still handshaking, without letting a dead audio socket disable thermal.
 static uint32_t thermalAudioGraceDeadlineMs = 0;
 
 static void freeThermalBuffers() {
+  if (mlx90640) heap_caps_free(mlx90640);
   if (thermalEeData) heap_caps_free(thermalEeData);
   if (thermalFrameData) heap_caps_free(thermalFrameData);
   if (thermalPixels) heap_caps_free(thermalPixels);
+  mlx90640 = nullptr;
   thermalEeData = nullptr;
   thermalFrameData = nullptr;
   thermalPixels = nullptr;
+#if ENABLE_THERMAL_TRANSMIT
+  if (thermalProducerScratch) heap_caps_free(thermalProducerScratch);
+  if (thermalNetworkScratch) heap_caps_free(thermalNetworkScratch);
+  thermalProducerScratch = nullptr;
+  thermalNetworkScratch = nullptr;
+#endif
 }
 
 bool initThermal() {
   Serial.println("[THERMAL] Initializing...");
-  if (!thermalEeData || !thermalFrameData || !thermalPixels) {
+  if (!mlx90640 || !thermalEeData || !thermalFrameData || !thermalPixels) {
     Serial.println("[THERMAL] buffers unavailable; subsystem disabled");
     return false;
   }
@@ -221,7 +234,7 @@ bool initThermal() {
     return false;
   }
 
-  if (MLX90640_ExtractParameters(thermalEeData, &mlx90640) != 0) {
+  if (MLX90640_ExtractParameters(thermalEeData, mlx90640) != 0) {
     xSemaphoreGive(i2cMutex);
     Serial.println("[THERMAL] parameter extraction failed");
     return false;
@@ -325,7 +338,6 @@ QueueHandle_t qAudio;
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 #if ENABLE_THERMAL_STREAM && ENABLE_THERMAL_TRANSMIT
-typedef struct { uint8_t data[1 + THERMAL_PIXEL_BYTES]; } ThermalChunk;
 QueueHandle_t qThermal;
 #endif
 typedef struct __attribute__((packed)) {
@@ -388,6 +400,21 @@ volatile uint32_t camSuccessfulSendBuckets[SEND_LATENCY_BUCKET_COUNT] = {};
 volatile uint32_t audSlowSuccessfulSendCount = 0;
 volatile uint32_t audMaxSuccessfulSendMs = 0;
 volatile uint32_t audSuccessfulSendBuckets[SEND_LATENCY_BUCKET_COUNT] = {};
+volatile uint32_t micPcmSlowSuccessfulSendCount = 0;
+volatile uint32_t micPcmMaxSuccessfulSendMs = 0;
+volatile uint32_t micPcmSuccessfulSendBuckets[SEND_LATENCY_BUCKET_COUNT] = {};
+portMUX_TYPE micDiagMux = portMUX_INITIALIZER_UNLOCKED;
+volatile UBaseType_t micQueueHighWaterDepth = 0;
+
+typedef struct {
+  uint32_t pollMs;
+  uint32_t heartbeatMs;
+  uint32_t controlMs;
+  uint32_t latencyMs;
+  uint32_t speechMarkerMs;
+} AudioSocketOperationMaxima;
+portMUX_TYPE audioOpDiagMux = portMUX_INITIALIZER_UNLOCKED;
+AudioSocketOperationMaxima audioSocketOperationMaxima = {};
 volatile bool audioStartPending = false;
 volatile bool controlledRestartRequested = false;
 volatile bool setupComplete = false;
@@ -411,6 +438,71 @@ static void recordAudSuccessfulSend(uint32_t elapsedMs) {
   audSuccessfulSendBuckets[successfulSendLatencyBucket(elapsedMs)]++;
   if (elapsedMs > audMaxSuccessfulSendMs) audMaxSuccessfulSendMs = elapsedMs;
   if (elapsedMs >= CAMERA_SEND_UNHEALTHY_MS) audSlowSuccessfulSendCount++;
+}
+
+static void recordMicPcmSuccessfulSend(uint32_t elapsedMs) {
+  micPcmSuccessfulSendBuckets[successfulSendLatencyBucket(elapsedMs)]++;
+  if (elapsedMs > micPcmMaxSuccessfulSendMs) micPcmMaxSuccessfulSendMs = elapsedMs;
+  if (elapsedMs >= CAMERA_SEND_UNHEALTHY_MS) micPcmSlowSuccessfulSendCount++;
+}
+
+static void recordMicQueueDepth(UBaseType_t depth) {
+  portENTER_CRITICAL(&micDiagMux);
+  if (depth > micQueueHighWaterDepth) micQueueHighWaterDepth = depth;
+  portEXIT_CRITICAL(&micDiagMux);
+}
+
+static UBaseType_t readMicQueueHighWaterDepth() {
+  portENTER_CRITICAL(&micDiagMux);
+  UBaseType_t depth = micQueueHighWaterDepth;
+  portEXIT_CRITICAL(&micDiagMux);
+  return depth;
+}
+
+static UBaseType_t takeMicQueueHighWaterDepth() {
+  UBaseType_t currentDepth = qAudio ? uxQueueMessagesWaiting(qAudio) : 0;
+  portENTER_CRITICAL(&micDiagMux);
+  UBaseType_t depth = micQueueHighWaterDepth;
+  micQueueHighWaterDepth = currentDepth;
+  portEXIT_CRITICAL(&micDiagMux);
+  return depth;
+}
+
+static void recordAudioSocketOperationMax(uint32_t* maximum, uint32_t elapsedMs) {
+  portENTER_CRITICAL(&audioOpDiagMux);
+  if (elapsedMs > *maximum) *maximum = elapsedMs;
+  portEXIT_CRITICAL(&audioOpDiagMux);
+}
+
+static void takeAudioSocketOperationMaxima(
+    uint32_t* pollMs, uint32_t* heartbeatMs, uint32_t* controlMs,
+    uint32_t* latencyMs, uint32_t* speechMarkerMs) {
+  portENTER_CRITICAL(&audioOpDiagMux);
+  *pollMs = audioSocketOperationMaxima.pollMs;
+  *heartbeatMs = audioSocketOperationMaxima.heartbeatMs;
+  *controlMs = audioSocketOperationMaxima.controlMs;
+  *latencyMs = audioSocketOperationMaxima.latencyMs;
+  *speechMarkerMs = audioSocketOperationMaxima.speechMarkerMs;
+  audioSocketOperationMaxima = {};
+  portEXIT_CRITICAL(&audioOpDiagMux);
+}
+
+constexpr uint8_t AUDIO_SOCKET_OPERATION_CONTROL = 0;
+constexpr uint8_t AUDIO_SOCKET_OPERATION_LATENCY = 1;
+constexpr uint8_t AUDIO_SOCKET_OPERATION_SPEECH_MARKER = 2;
+
+static bool sendAudioTextTimed(const char* message, uint8_t kind) {
+  uint32_t started = millis();
+  bool ok = wsAud.send(message);
+  uint32_t elapsed = millis() - started;
+  if (kind == AUDIO_SOCKET_OPERATION_CONTROL) {
+    recordAudioSocketOperationMax(&audioSocketOperationMaxima.controlMs, elapsed);
+  } else if (kind == AUDIO_SOCKET_OPERATION_LATENCY) {
+    recordAudioSocketOperationMax(&audioSocketOperationMaxima.latencyMs, elapsed);
+  } else {
+    recordAudioSocketOperationMax(&audioSocketOperationMaxima.speechMarkerMs, elapsed);
+  }
+  return ok;
 }
 
 // ====================================================================
@@ -677,9 +769,6 @@ void taskCamSend(void*) {
   uint32_t nextPingMs = 0;
   uint32_t lastStatusMs = 0;
   uint32_t lastCamAttemptMs = 0;
-#if ENABLE_THERMAL_STREAM && ENABLE_THERMAL_TRANSMIT
-  static ThermalChunk thermal;
-#endif
   ImuPacket imuPacket;
   uint8_t imuWire[1 + sizeof(ImuPacket)];
   uint8_t statusWire[1 + sizeof(StatusPacket)];
@@ -765,9 +854,12 @@ void taskCamSend(void*) {
 
 #if ENABLE_THERMAL_STREAM && ENABLE_THERMAL_TRANSMIT
     // Audio remains higher priority; thermal goes before the larger camera frame.
-    if (xQueueReceive(qThermal, &thermal, 0) == pdPASS) {
+    if (thermalNetworkScratch &&
+        xQueueReceive(qThermal, thermalNetworkScratch, 0) == pdPASS) {
       uint32_t thermalStarted = millis();
-      bool ok = wsCamThermal.sendBinary((const char*)thermal.data, sizeof(thermal.data));
+      bool ok = wsCamThermal.sendBinary(
+          (const char*)thermalNetworkScratch->data,
+          sizeof(thermalNetworkScratch->data));
       uint32_t thermalElapsed = millis() - thermalStarted;
       if (!ok) {
         Serial.printf("[THERMAL] send failed elapsed_ms=%lu\n", (unsigned long)thermalElapsed);
@@ -782,7 +874,8 @@ void taskCamSend(void*) {
       thermalSentFrames++;
       static bool firstThermalPacketSent = false;
       if (!firstThermalPacketSent) {
-        Serial.printf("[THERMAL] first packet sent bytes=%u\n", (unsigned)sizeof(thermal.data));
+        Serial.printf("[THERMAL] first packet sent bytes=%u\n",
+                      (unsigned)sizeof(thermalNetworkScratch->data));
         firstThermalPacketSent = true;
       }
     }
@@ -818,6 +911,9 @@ void taskCamSend(void*) {
       lastCamAttemptMs = now;
       bool ok = false;
       size_t wireLen = 0;
+      uint32_t heapBefore = ESP.getFreeHeap();
+      size_t largestBefore = heap_caps_get_largest_free_block(
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
       uint32_t sendStarted = millis();
       if (fb && fb->len + 1 <= CAM_TX_BUF_MAX) {
         camThermalTxBuf[0] = MSG_TYPE_CAM;
@@ -851,8 +947,21 @@ void taskCamSend(void*) {
       // A slow successful TLS write is observable only after it returns; it is
       // telemetry, not proof that the established socket is unhealthy.
       recordCamSuccessfulSend(elapsed);
-      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS)
-        Serial.printf("[CAM] slow successful send elapsed_ms=%lu\n", (unsigned long)elapsed);
+      if (elapsed >= CAMERA_SEND_UNHEALTHY_MS) {
+        uint32_t heapAfter = ESP.getFreeHeap();
+        size_t largestAfter = heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        Serial.printf(
+            "[CAM] slow successful send bytes=%u elapsed_ms=%lu heap=%u/%u "
+            "largest=%u/%u rssi=%d\n",
+            (unsigned)wireLen,
+            (unsigned long)elapsed,
+            (unsigned)heapBefore,
+            (unsigned)heapAfter,
+            (unsigned)largestBefore,
+            (unsigned)largestAfter,
+            WiFi.RSSI());
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(2));
   }
@@ -977,6 +1086,7 @@ void taskMicCapture(void*) {
 
     // Latest-audio policy: if the queue is full, discard its oldest chunk.
     if (xQueueSend(qAudio, &chunk, 0) != pdPASS) {
+      recordMicQueueDepth(AUDIO_QUEUE_DEPTH);
       if (xQueueReceive(qAudio, &discarded, 0) == pdPASS) {
         micDroppedChunks++;
       }
@@ -988,6 +1098,7 @@ void taskMicCapture(void*) {
                       (unsigned long)micDroppedChunks);
       }
     }
+    recordMicQueueDepth(uxQueueMessagesWaiting(qAudio));
 
     taskYIELD();
   }
@@ -1074,7 +1185,10 @@ void taskMicUpload(void*) {
     }
 
     // This task is the sole owner of wsAud.
+    uint32_t pollStarted = millis();
     wsAud.poll();
+    recordAudioSocketOperationMax(
+        &audioSocketOperationMaxima.pollMs, millis() - pollStarted);
 
     // poll() can synchronously invoke ConnectionClosed.
     if (!aud_ws_ready) {
@@ -1096,6 +1210,8 @@ void taskMicUpload(void*) {
       uint32_t startStarted = millis();
       bool startOk = wsAud.send("START");
       uint32_t startElapsed = millis() - startStarted;
+      recordAudioSocketOperationMax(
+          &audioSocketOperationMaxima.controlMs, startElapsed);
 
       if (!startOk) {
         Serial.printf("[WS-AUD] START send failed elapsed_ms=%lu\n",
@@ -1129,7 +1245,7 @@ void taskMicUpload(void*) {
       char message[48];
       snprintf(message, sizeof(message), "SPEECH_START:%lu",
                (unsigned long)speechStartTurnId);
-      if (wsAud.send(message)) {
+      if (sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
         portENTER_CRITICAL(&latencyMux);
         if (latencyCurrentSpeechTurnId == speechStartTurnId)
           latencySpeechStartPending = false;
@@ -1147,7 +1263,7 @@ void taskMicUpload(void*) {
       char message[48];
       snprintf(message, sizeof(message), "SPEECH_END:%lu",
                (unsigned long)speechEndTurnId);
-      if (wsAud.send(message)) {
+      if (sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
         portENTER_CRITICAL(&latencyMux);
         if (latencySpeechEndTurnId == speechEndTurnId)
           latencySpeechEndPending = false;
@@ -1168,7 +1284,7 @@ void taskMicUpload(void*) {
       snprintf(message, sizeof(message), "LATENCY:DEVICE:%lu:%lu",
                (unsigned long)deviceReportTurnId,
                (unsigned long)deviceReportMs);
-      if (wsAud.send(message)) {
+      if (sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_LATENCY)) {
         portENTER_CRITICAL(&latencyMux);
         if (latencyDeviceReportTurnId == deviceReportTurnId)
           latencyDeviceReportPending = false;
@@ -1186,7 +1302,8 @@ void taskMicUpload(void*) {
           (unsigned long)latencyRttMinimumUs,
           (unsigned long)latencyRttMaximumUs,
           (unsigned long)latencyRttP95Us);
-      if (wsAud.send(message)) latencyRttReportPending = false;
+      if (sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_LATENCY))
+        latencyRttReportPending = false;
     }
 
     int64_t latencyNowUs = esp_timer_get_time();
@@ -1206,7 +1323,7 @@ void taskMicUpload(void*) {
       snprintf(message, sizeof(message), "LATENCY:PING:%lu:%llu",
                (unsigned long)latencyOutstandingPingSequence,
                (unsigned long long)latencyOutstandingPingUs);
-      if (!wsAud.send(message)) {
+      if (!sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_LATENCY)) {
         latencyOutstandingPingSequence = 0;
         latencyOutstandingPingUs = 0;
       }
@@ -1214,7 +1331,12 @@ void taskMicUpload(void*) {
     }
 
     if ((int32_t)(millis() - nextPingMs) >= 0) {
-      if (!wsAud.ping("")) {
+      uint32_t heartbeatStarted = millis();
+      bool heartbeatOk = wsAud.ping("");
+      recordAudioSocketOperationMax(
+          &audioSocketOperationMaxima.heartbeatMs,
+          millis() - heartbeatStarted);
+      if (!heartbeatOk) {
         Serial.println("[WS-AUD] heartbeat send failed; reconnecting");
         run_audio_stream = false;
         audioStartPending = false;
@@ -1245,7 +1367,7 @@ void taskMicUpload(void*) {
         char message[48];
         snprintf(message, sizeof(message), "SPEECH_START:%lu",
                  (unsigned long)lateSpeechStartTurnId);
-        if (!wsAud.send(message)) {
+        if (!sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
           micDroppedChunks++;
           continue;
         }
@@ -1265,7 +1387,7 @@ void taskMicUpload(void*) {
         char message[48];
         snprintf(message, sizeof(message), "SPEECH_END:%lu",
                  (unsigned long)lateSpeechEndTurnId);
-        if (!wsAud.send(message)) {
+        if (!sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
           micDroppedChunks++;
           continue;
         }
@@ -1275,6 +1397,12 @@ void taskMicUpload(void*) {
         portEXIT_CRITICAL(&latencyMux);
       }
 
+      uint32_t heapBefore = ESP.getFreeHeap();
+      size_t largestBefore = heap_caps_get_largest_free_block(
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      UBaseType_t queueBefore = uxQueueMessagesWaiting(qAudio);
+      uint32_t capturedBefore = micCapturedChunks;
+      uint32_t droppedBefore = micDroppedChunks;
       uint32_t audioStarted = millis();
       bool audioOk = wsAud.sendBinary((const char*)chunk.data, chunk.n);
       uint32_t audioElapsed = millis() - audioStarted;
@@ -1291,11 +1419,27 @@ void taskMicUpload(void*) {
         if (qAudio) xQueueReset(qAudio);
         continue;
       }
-      recordAudSuccessfulSend(audioElapsed);
+      recordMicPcmSuccessfulSend(audioElapsed);
       if (audioElapsed >= CAMERA_SEND_UNHEALTHY_MS) {
-        Serial.printf("[MIC] slow successful upload bytes=%u elapsed_ms=%lu\n",
+        uint32_t heapAfter = ESP.getFreeHeap();
+        size_t largestAfter = heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        UBaseType_t queueAfter = uxQueueMessagesWaiting(qAudio);
+        Serial.printf(
+            "[MIC-SLOW] bytes=%u elapsed_ms=%lu q=%u/%u qHigh=%u "
+            "heap=%u/%u largest=%u/%u rssi=%d capturedDuring=%lu droppedDuring=%lu\n",
                       (unsigned)chunk.n,
-                      (unsigned long)audioElapsed);
+                      (unsigned long)audioElapsed,
+                      (unsigned)queueBefore,
+                      (unsigned)queueAfter,
+                      (unsigned)readMicQueueHighWaterDepth(),
+                      (unsigned)heapBefore,
+                      (unsigned)heapAfter,
+                      (unsigned)largestBefore,
+                      (unsigned)largestAfter,
+                      WiFi.RSSI(),
+                      (unsigned long)(micCapturedChunks - capturedBefore),
+                      (unsigned long)(micDroppedChunks - droppedBefore));
       }
 
       lastMicSendMs = millis();
@@ -1970,18 +2114,17 @@ void taskThermalLoop(void* pv) {
       continue;
     }
 
-    float Ta = MLX90640_GetTa(thermalFrameData, &mlx90640);
+    float Ta = MLX90640_GetTa(thermalFrameData, mlx90640);
     float tr = Ta - THERMAL_TA_SHIFT;
     MLX90640_CalculateTo(
-        thermalFrameData, &mlx90640, THERMAL_EMISSIVITY, tr, thermalPixels);
+        thermalFrameData, mlx90640, THERMAL_EMISSIVITY, tr, thermalPixels);
     consecutiveReadFailures = 0;
     framesRead++;
 
 #if ENABLE_THERMAL_TRANSMIT
-    static ThermalChunk chunk;
-    chunk.data[0] = MSG_TYPE_THERMAL;
-    memcpy(chunk.data + 1, thermalPixels, THERMAL_PIXEL_BYTES);
-    if (xQueueOverwrite(qThermal, &chunk) != pdPASS) {
+    thermalProducerScratch->data[0] = MSG_TYPE_THERMAL;
+    memcpy(thermalProducerScratch->data + 1, thermalPixels, THERMAL_PIXEL_BYTES);
+    if (xQueueOverwrite(qThermal, thermalProducerScratch) != pdPASS) {
       thermalDroppedFrames++;
       Serial.printf("[THERMAL] latest-frame queue failed dropped=%lu\n",
                     (unsigned long)thermalDroppedFrames);
@@ -2052,23 +2195,52 @@ static void logTaskCreation(const char* name, BaseType_t result, TaskHandle_t ha
 
 #if ENABLE_THERMAL_STREAM
 static bool allocateThermalBuffers() {
+  mlx90640 = (paramsMLX90640*)heap_caps_calloc(
+      1, sizeof(paramsMLX90640), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thermalEeData = (uint16_t*)heap_caps_calloc(
       THERMAL_EE_WORDS, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thermalFrameData = (uint16_t*)heap_caps_calloc(
       THERMAL_FRAME_WORDS, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thermalPixels = (float*)heap_caps_calloc(
       THERMAL_PIXEL_COUNT, sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!thermalEeData || !thermalFrameData || !thermalPixels) {
+#if ENABLE_THERMAL_TRANSMIT
+  thermalProducerScratch = (ThermalChunk*)heap_caps_calloc(
+      1, sizeof(ThermalChunk), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  thermalNetworkScratch = (ThermalChunk*)heap_caps_calloc(
+      1, sizeof(ThermalChunk), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+  if (!mlx90640 || !thermalEeData || !thermalFrameData || !thermalPixels
+#if ENABLE_THERMAL_TRANSMIT
+      || !thermalProducerScratch || !thermalNetworkScratch
+#endif
+  ) {
     Serial.printf(
-        "[THERMAL] buffer allocation failed ee=%p frame=%p pixels=%p; thermal disabled\n",
-        thermalEeData, thermalFrameData, thermalPixels);
+        "[THERMAL] PSRAM allocation failed params=%p ee=%p frame=%p pixels=%p"
+#if ENABLE_THERMAL_TRANSMIT
+        " producer=%p network=%p"
+#endif
+        "; thermal disabled\n",
+        mlx90640, thermalEeData, thermalFrameData, thermalPixels
+#if ENABLE_THERMAL_TRANSMIT
+        , thermalProducerScratch, thermalNetworkScratch
+#endif
+    );
     freeThermalBuffers();
     return false;
   }
-  Serial.printf("[THERMAL] buffers allocated in PSRAM ee=%u frame=%u pixels=%u bytes\n",
+  Serial.printf("[THERMAL] buffers allocated in PSRAM params=%u ee=%u frame=%u pixels=%u"
+#if ENABLE_THERMAL_TRANSMIT
+                " producer=%u network=%u"
+#endif
+                " bytes\n",
+                (unsigned)sizeof(paramsMLX90640),
                 (unsigned)(THERMAL_EE_WORDS * sizeof(uint16_t)),
                 (unsigned)(THERMAL_FRAME_WORDS * sizeof(uint16_t)),
-                (unsigned)THERMAL_PIXEL_BYTES);
+                (unsigned)THERMAL_PIXEL_BYTES
+#if ENABLE_THERMAL_TRANSMIT
+                , (unsigned)sizeof(ThermalChunk), (unsigned)sizeof(ThermalChunk)
+#endif
+  );
   return true;
 }
 
@@ -2321,12 +2493,16 @@ void setup() {
     if (msg.isText()){
       String s = msg.data(); s.trim();
       if (s.startsWith("LATENCY:PONG:")) {
+        uint32_t latencyPongStarted = millis();
         unsigned long sequence = 0;
         unsigned long long echoedEspUs = 0;
         if (sscanf(s.c_str(), "LATENCY:PONG:%lu:%llu",
                    &sequence, &echoedEspUs) == 2) {
           recordLatencyPong((uint32_t)sequence, (uint64_t)echoedEspUs);
         }
+        recordAudioSocketOperationMax(
+            &audioSocketOperationMaxima.latencyMs,
+            millis() - latencyPongStarted);
       } else if (s == "RESTART"){
         run_audio_stream = false;
         xQueueReset(qAudio);
@@ -2527,7 +2703,7 @@ if (mic_upload_task_ok != pdPASS) {
 
 #if ENABLE_THERMAL_STREAM
   // Thermal only *requires* the camera/sensor socket, but waiting on wsAud
-  // here too keeps thermal's 12KB internal-SRAM stack out of audio's TLS
+  // here too keeps thermal's internal-SRAM stack out of audio's TLS
   // handshake window. Bounded, so a dead audio socket delays thermal by at
   // most 20s instead of disabling it (see startThermalIfReady).
   Serial.println("[THERMAL] waiting for WebSockets before startup");
@@ -2559,6 +2735,9 @@ void loop() {
 #endif
   static uint32_t lastHealthMs = 0;
   static uint8_t criticalMemoryCount = 0;
+  static uint32_t previousMicCapturedChunks = 0;
+  static uint32_t previousMicSentChunks = 0;
+  static uint32_t previousMicDroppedChunks = 0;
   uint32_t now = millis();
   if (now - lastHealthMs < HEALTH_LOG_INTERVAL_MS) {
     delay(20);
@@ -2585,6 +2764,20 @@ void loop() {
   UBaseType_t swTts = ttsPlaybackTaskHandle ? uxTaskGetStackHighWaterMark(ttsPlaybackTaskHandle) : 0;
   UBaseType_t swImu = imuTaskHandle ? uxTaskGetStackHighWaterMark(imuTaskHandle) : 0;
   UBaseType_t swHttp = taskHttpPlayHandle ? uxTaskGetStackHighWaterMark(taskHttpPlayHandle) : 0;
+  UBaseType_t micQueueHighWater = takeMicQueueHighWaterDepth();
+  AudioSocketOperationMaxima audioOperationMaxima = {};
+  takeAudioSocketOperationMaxima(
+      &audioOperationMaxima.pollMs,
+      &audioOperationMaxima.heartbeatMs,
+      &audioOperationMaxima.controlMs,
+      &audioOperationMaxima.latencyMs,
+      &audioOperationMaxima.speechMarkerMs);
+  uint32_t micCapturedDelta = micCapturedChunks - previousMicCapturedChunks;
+  uint32_t micSentDelta = micSentChunks - previousMicSentChunks;
+  uint32_t micDroppedDelta = micDroppedChunks - previousMicDroppedChunks;
+  previousMicCapturedChunks = micCapturedChunks;
+  previousMicSentChunks = micSentChunks;
+  previousMicDroppedChunks = micDroppedChunks;
 
   Serial.printf(
       "[HEALTH] uptime=%lu heap=%u minHeap=%u maxAlloc=%u internalLargest=%u psram=%u "
@@ -2618,7 +2811,8 @@ void loop() {
 
   Serial.printf(
       "[SEND-HEALTH] camSlow=%lu camMaxMs=%lu camBuckets=%lu/%lu/%lu/%lu/%lu/%lu "
-      "audSlow=%lu audMaxMs=%lu audBuckets=%lu/%lu/%lu/%lu/%lu/%lu\n",
+      "audControlSlow=%lu audControlMaxMs=%lu "
+      "audControlBuckets=%lu/%lu/%lu/%lu/%lu/%lu\n",
       (unsigned long)camSlowSuccessfulSendCount,
       (unsigned long)camMaxSuccessfulSendMs,
       (unsigned long)camSuccessfulSendBuckets[0],
@@ -2635,6 +2829,28 @@ void loop() {
       (unsigned long)audSuccessfulSendBuckets[3],
       (unsigned long)audSuccessfulSendBuckets[4],
       (unsigned long)audSuccessfulSendBuckets[5]);
+
+  Serial.printf(
+      "[MIC-HEALTH] qHigh=%u capturedDelta=%lu sentDelta=%lu droppedDelta=%lu "
+      "pcmSlow=%lu pcmMaxMs=%lu pcmBuckets=%lu/%lu/%lu/%lu/%lu/%lu "
+      "audioOpMaxMs=poll:%lu,heartbeat:%lu,control:%lu,latency:%lu,speech:%lu\n",
+      (unsigned)micQueueHighWater,
+      (unsigned long)micCapturedDelta,
+      (unsigned long)micSentDelta,
+      (unsigned long)micDroppedDelta,
+      (unsigned long)micPcmSlowSuccessfulSendCount,
+      (unsigned long)micPcmMaxSuccessfulSendMs,
+      (unsigned long)micPcmSuccessfulSendBuckets[0],
+      (unsigned long)micPcmSuccessfulSendBuckets[1],
+      (unsigned long)micPcmSuccessfulSendBuckets[2],
+      (unsigned long)micPcmSuccessfulSendBuckets[3],
+      (unsigned long)micPcmSuccessfulSendBuckets[4],
+      (unsigned long)micPcmSuccessfulSendBuckets[5],
+      (unsigned long)audioOperationMaxima.pollMs,
+      (unsigned long)audioOperationMaxima.heartbeatMs,
+      (unsigned long)audioOperationMaxima.controlMs,
+      (unsigned long)audioOperationMaxima.latencyMs,
+      (unsigned long)audioOperationMaxima.speechMarkerMs);
 
   if (internalLargest < CRITICAL_INTERNAL_BLOCK_BYTES) criticalMemoryCount++;
   else criticalMemoryCount = 0;

@@ -34,6 +34,15 @@ class _ReceiveSession(_FakeSession):
             await self.blocker.wait()
 
 
+class _AudioSendSession(_FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.audio_calls = []
+
+    async def send_realtime_input(self, **kwargs):
+        self.audio_calls.append(kwargs)
+
+
 class _FakeContextManager:
     def __init__(self, outcome):
         self.outcome = outcome
@@ -110,6 +119,29 @@ class GeminiLiveConfigurationTests(unittest.TestCase):
 
 
 class GeminiLiveLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_audio_send_records_lock_wait_and_sdk_duration_histograms(self):
+        session = _AudioSendSession()
+        client = GeminiLiveClient()
+        client.session = session
+        client.connected = True
+
+        self.assertTrue(await client.send_audio(b"\x00\x00"))
+        self.assertEqual(len(session.audio_calls), 1)
+        self.assertEqual(sum(client._audio_lock_wait_buckets), 1)
+        self.assertEqual(client._audio_sdk_send_count, 1)
+        self.assertEqual(sum(client._audio_sdk_send_buckets), 1)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            client._log_audio_lock_summary(turn_id=1, reason="test")
+
+        summary = output.getvalue()
+        self.assertIn("wait_buckets=", summary)
+        self.assertIn("sdk_send_count=1", summary)
+        self.assertIn("sdk_send_buckets=", summary)
+        self.assertEqual(sum(client._audio_lock_wait_buckets), 0)
+        self.assertEqual(client._audio_sdk_send_count, 0)
+
     async def test_connect_refuses_second_receive_lifecycle(self):
         client = GeminiLiveClient()
         client.receive_task = asyncio.create_task(asyncio.sleep(60))

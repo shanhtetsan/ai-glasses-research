@@ -841,6 +841,8 @@ _last_gemini_video_submit = 0.0
 # OpenCV, and slow browser viewers. Drop-oldest preserves real-time behavior.
 ESP_AUDIO_INGEST_QUEUE_MAX = 12
 ESP_THERMAL_INGEST_QUEUE_MAX = 1
+ESP_AUDIO_HEALTH_INTERVAL_SEC = 10.0
+ESP_AUDIO_GAP_BUCKET_LIMITS_MS = (30, 50, 100, 250, 500, 1000)
 backend_metrics = {
     "camera_sensor_connects": 0,
     "camera_sensor_disconnects": 0,
@@ -2093,6 +2095,57 @@ async def ws_audio(ws: WebSocket):
         maxsize=ESP_AUDIO_INGEST_QUEUE_MAX
     )
     audio_dropped = 0
+    audio_dropped_interval = 0
+    audio_queue_high_water = 0
+    audio_last_receive_at: Optional[float] = None
+    audio_receive_count_interval = 0
+    audio_receive_gap_max_ms = 0.0
+    audio_receive_gap_buckets = [
+        0 for _ in range(len(ESP_AUDIO_GAP_BUCKET_LIMITS_MS) + 1)
+    ]
+    audio_health_started_at = time.monotonic()
+
+    def _record_audio_receive(now: float) -> None:
+        nonlocal audio_last_receive_at
+        nonlocal audio_receive_count_interval, audio_receive_gap_max_ms
+        if audio_last_receive_at is not None:
+            gap_ms = (now - audio_last_receive_at) * 1000
+            audio_receive_gap_max_ms = max(audio_receive_gap_max_ms, gap_ms)
+            bucket = len(ESP_AUDIO_GAP_BUCKET_LIMITS_MS)
+            for index, limit_ms in enumerate(ESP_AUDIO_GAP_BUCKET_LIMITS_MS):
+                if gap_ms < limit_ms:
+                    bucket = index
+                    break
+            audio_receive_gap_buckets[bucket] += 1
+        audio_last_receive_at = now
+        audio_receive_count_interval += 1
+
+    def _emit_audio_health(*, force: bool = False) -> None:
+        nonlocal audio_dropped_interval, audio_queue_high_water
+        nonlocal audio_receive_count_interval, audio_receive_gap_max_ms
+        nonlocal audio_receive_gap_buckets, audio_health_started_at
+        now = time.monotonic()
+        interval_sec = now - audio_health_started_at
+        if not force and interval_sec < ESP_AUDIO_HEALTH_INTERVAL_SEC:
+            return
+        print(
+            f"[AUDIO-HEALTH] device={device_id} interval_s={interval_sec:.1f} "
+            f"received={audio_receive_count_interval} "
+            f"receive_gap_max_ms={audio_receive_gap_max_ms:.1f} "
+            "receive_gap_limits_ms=30/50/100/250/500/1000 "
+            f"receive_gap_buckets={'/'.join(map(str, audio_receive_gap_buckets))} "
+            f"queue_high_water={audio_queue_high_water} "
+            f"dropped_delta={audio_dropped_interval} dropped_total={audio_dropped}",
+            flush=True,
+        )
+        audio_dropped_interval = 0
+        audio_queue_high_water = audio_ingest_q.qsize()
+        audio_receive_count_interval = 0
+        audio_receive_gap_max_ms = 0.0
+        audio_receive_gap_buckets = [
+            0 for _ in range(len(ESP_AUDIO_GAP_BUCKET_LIMITS_MS) + 1)
+        ]
+        audio_health_started_at = now
 
     async def _gemini_audio_worker():
         while True:
@@ -2241,10 +2294,12 @@ async def ws_audio(ws: WebSocket):
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
+                audio_receive_now = time.monotonic()
+                _record_audio_receive(audio_receive_now)
                 latency_tracker.mark_microphone_chunk(
                     now_ns=time.monotonic_ns()
                 )
-                backend_metrics["last_audio_activity"] = time.monotonic()
+                backend_metrics["last_audio_activity"] = audio_receive_now
 
                 if AI_BACKEND == "gemini_live":
                     # Gemini Live owns the mic entirely in this mode — it runs
@@ -2257,12 +2312,17 @@ async def ws_audio(ws: WebSocket):
                             try:
                                 audio_ingest_q.get_nowait()
                                 audio_dropped += 1
+                                audio_dropped_interval += 1
                             except asyncio.QueueEmpty:
                                 pass
                         try:
                             audio_ingest_q.put_nowait(chunk)
                         except asyncio.QueueFull:
                             audio_dropped += 1
+                            audio_dropped_interval += 1
+                        audio_queue_high_water = max(
+                            audio_queue_high_water, audio_ingest_q.qsize()
+                        )
                         if audio_dropped and audio_dropped % 50 == 1:
                             print(
                                 f"[WS-INGEST] device={device_id} socket=audio "
@@ -2270,6 +2330,7 @@ async def ws_audio(ws: WebSocket):
                                 f"queue={audio_ingest_q.qsize()} dropped={audio_dropped}",
                                 flush=True,
                             )
+                    _emit_audio_health()
                     continue
 
                 if streaming and pcm_buffer is not None:
@@ -2334,6 +2395,7 @@ async def ws_audio(ws: WebSocket):
         streaming  = False
         mic_streaming = False
         pcm_buffer = None
+        _emit_audio_health(force=True)
         if audio_worker_task is not None:
             audio_worker_task.cancel()
             try:
