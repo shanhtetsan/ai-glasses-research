@@ -282,6 +282,39 @@ _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 # Reset whenever a new response turn starts (on turn_complete/interrupted).
 _ratecv_state_8k = None
 
+
+def _log_gemini_timing(event: str, turn_id: Optional[int], **fields) -> None:
+    parts = [
+        f"event={event}",
+        f"mono_ns={time.monotonic_ns()}",
+        f"generation={gemini_live.session_generation}",
+        f"turn_id={turn_id if turn_id is not None else 0}",
+    ]
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print("[GEMINI-TIMING] " + " ".join(parts), flush=True)
+
+
+def _clear_gemini_turn_state(reason: str) -> None:
+    """Drop only ephemeral per-turn grounding/transcription state."""
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    had_state = bool(
+        _input_text_buf
+        or _output_text_buf
+        or _vision_submitted_for_turn
+        or _thermal_submitted_for_turn
+    )
+    _input_text_buf.clear()
+    _output_text_buf.clear()
+    _vision_submitted_for_turn = False
+    _thermal_submitted_for_turn = False
+    if had_state:
+        print(
+            f"[GEMINI-TURN] state_cleared reason={reason} "
+            f"generation={gemini_live.session_generation}",
+            flush=True,
+        )
+
+
 def _mark_gemini_playing() -> None:
     """Make is_playing_now() return True for the duration of the current
     Gemini Live turn, so ws_audio's mic-mute guard actually engages while
@@ -445,7 +478,11 @@ async def _on_audio(pcm24k: bytes):
     """
     global _ratecv_state_8k
     turn_id = latency_tracker.ensure_turn()
-    latency_tracker.mark("first_gemini_audio_received", turn_id)
+    first_audio = latency_tracker.mark("first_gemini_audio_received", turn_id)
+    if first_audio:
+        _log_gemini_timing(
+            "on_audio_begin", turn_id, bytes=len(pcm24k)
+        )
 
     _mark_gemini_playing()
 
@@ -458,6 +495,13 @@ async def _on_audio(pcm24k: bytes):
     if pcm8k:
         for i in range(0, len(pcm8k), _TTS_CHUNK):
             _enqueue_tts_chunk(pcm8k[i:i + _TTS_CHUNK], turn_id)
+            if first_audio and i == 0:
+                _log_gemini_timing(
+                    "first_tts_chunk_queued",
+                    turn_id,
+                    bytes=min(_TTS_CHUNK, len(pcm8k)),
+                    queue_depth=_tts_send_queue.qsize(),
+                )
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
@@ -478,28 +522,63 @@ async def _on_input_transcription(text: str):
     wants_vision = is_explicit_vision_request(combined)
     wants_thermal = is_thermal_request(combined)
     if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
+        _log_gemini_timing(
+            "vision_intent_detected",
+            turn_id,
+            thermal_intent="yes" if wants_thermal else "no",
+        )
         frame = latest_rgb.snapshot()
         if frame.data is not None:
+            frame_age_ms = max(
+                0.0, (time.monotonic() - frame.timestamp) * 1000
+            )
+            _log_gemini_timing(
+                "vision_snapshot",
+                turn_id,
+                sequence=frame.sequence,
+                age_ms=round(frame_age_ms, 3),
+                bytes=len(frame.data),
+            )
             data = frame.data
             if CAMERA_ROTATION_DEG != 0:
                 data = await asyncio.to_thread(_rotate_jpeg_bytes, data)
-            _vision_submitted_for_turn = await gemini_live.send_image(data)
+            _vision_submitted_for_turn = await gemini_live.send_image(
+                data,
+                turn_id=turn_id,
+                sequence=frame.sequence,
+                source="pre_response",
+            )
             print(
-                f"[VISION] pre-response latest_rgb sequence={frame.sequence} "
+                f"[VISION] generation={gemini_live.session_generation} "
+                f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
                 f"submitted={_vision_submitted_for_turn}",
                 flush=True,
             )
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
+        build_started_ns = time.monotonic_ns()
+        _log_gemini_timing("thermal_build_begin", turn_id)
         facts = build_thermal_facts()
+        _log_gemini_timing(
+            "thermal_build_end",
+            turn_id,
+            build_ms=round(
+                (time.monotonic_ns() - build_started_ns) / 1_000_000, 3
+            ),
+            facts_available="yes" if facts is not None else "no",
+        )
         if facts is None:
             print("[THERMAL] no recent thermal frame; facts not submitted", flush=True)
         else:
             _thermal_submitted_for_turn = await gemini_live.send_text(
-                "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":"))
+                "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":")),
+                turn_id=turn_id,
+                source="thermal_facts",
             )
             print(
-                f"[THERMAL] facts submitted ahead={facts['directly_ahead_mean_c']}C "
+                f"[THERMAL] generation={gemini_live.session_generation} "
+                f"turn_id={turn_id} facts submitted "
+                f"ahead={facts['directly_ahead_mean_c']}C "
                 f"max={facts['scene_max_c']}C submitted={_thermal_submitted_for_turn}",
                 flush=True,
             )
@@ -590,7 +669,7 @@ async def _on_turn_complete():
 
 async def _on_interrupted():
     """User barged in and cut off Gemini's current response."""
-    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _ratecv_state_8k
     print("[Gemini Live] Response interrupted by user", flush=True)
     turn_id = latency_tracker.active_turn_id
 
@@ -605,15 +684,20 @@ async def _on_interrupted():
     if turn_id is not None:
         await _finalize_latency_turn("interrupted", turn_id)
     _ratecv_state_8k = None
-    _vision_submitted_for_turn = False
-    _thermal_submitted_for_turn = False
+    _clear_gemini_turn_state("interrupted")
     await hard_reset_audio("gemini_interrupted")
+
+
+async def _on_gemini_session_transition(reason: str, _generation: int):
+    _clear_gemini_turn_state(f"session_{reason}")
 
 gemini_live.on_audio = _on_audio
 gemini_live.on_input_transcription = _on_input_transcription
 gemini_live.on_output_transcription = _on_output_transcription
 gemini_live.on_turn_complete = _on_turn_complete
 gemini_live.on_interrupted = _on_interrupted
+gemini_live.on_session_transition = _on_gemini_session_transition
+gemini_live.turn_id_provider = lambda: latency_tracker.active_turn_id
 
 # ---- Helper for the non-live backends (gemini_regular / qwen) ----
 # These backends are text-only for this comparison — no TTS, no audio out.
@@ -1141,6 +1225,7 @@ async def full_system_reset(reason: str = ""):
     # 1) Audio & AI
     _clear_tts_send_queue()
     _enqueue_tts_terminal("interrupted")
+    _clear_gemini_turn_state("full_system_reset")
     await hard_reset_audio(reason or "full_system_reset")
 
     # 2) ASR
@@ -2102,6 +2187,8 @@ async def ws_audio(ws: WebSocket):
                     if active_turn_id is not None and active_turn_id != turn_id:
                         latency_tracker.mark("interrupted", active_turn_id)
                         await _finalize_latency_turn("interrupted", active_turn_id)
+                    if active_turn_id != turn_id:
+                        _clear_gemini_turn_state("speech_start")
                     latency_tracker.start_turn(turn_id)
                     continue
 
