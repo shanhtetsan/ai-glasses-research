@@ -1,0 +1,8 @@
+.git
+yoloe-11l-seg-pf.pt
+static/
+hand_landmarker.task
+venv/
+.venv/
+__pycache__/
+*.pyc

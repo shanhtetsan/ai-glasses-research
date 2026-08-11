@@ -9,6 +9,11 @@ primary_region = 'ewr'
 [build]
 [env]
   STABILITY_MODE = 'true'
+  ENABLE_YOLO = 'true'
+  YOLO_SERVICE_URL = 'https://ai-glasses-yolo-perception.fly.dev'
+  YOLO_CONFIDENCE = '0.25'
+  YOLO_MIN_INTERVAL_SEC = '1.0'
+  YOLO_REQUEST_TIMEOUT_SEC = '3.0'
 
 [http_service]
   internal_port = 8081

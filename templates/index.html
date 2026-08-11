@@ -86,6 +86,16 @@
     font-size:11px; font-weight:600; padding:4px 12px; border-radius:999px; cursor:pointer;
   }
   .seg.active{background:var(--accent); color:#fff}
+  .perception-status{
+    position:absolute; z-index:21; right:10px; top:10px;
+    display:flex; align-items:center; gap:7px; flex-wrap:wrap; justify-content:flex-end;
+    max-width:calc(100% - 100px); font:11px var(--mono);
+  }
+  .perception-status button,.perception-status span{
+    background:rgba(10,16,23,.82); border:1px solid rgba(255,255,255,.12);
+    border-radius:999px; padding:5px 10px; color:var(--muted); backdrop-filter:blur(6px);
+  }
+  .perception-status button.active{color:var(--ok); border-color:rgba(126,231,135,.4)}
 
   .metrics{display:grid; grid-template-columns:repeat(3,1fr); gap:8px}
   .metric{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:9px 12px}
@@ -169,7 +179,7 @@
     box-shadow:0 10px 30px rgba(0,0,0,.4);
     background:#000;
   }
-  #overlayCanvas{display:none !important;}
+  #overlayCanvas{display:block !important;}
 
   /* Keep full transcript visible and independently scrollable. */
   .rightcol{
@@ -263,7 +273,13 @@
       <canvas id="thermalCanvas"></canvas>
       <canvas id="overlayCanvas"></canvas>
       <div class="float tl"><span class="dot" id="liveDot"></span><span id="liveText">live</span></div>
-<div class="float bl" id="stageInfo">--</div>
+      <div class="perception-status">
+        <button id="objectsToggle" class="active" type="button">Objects: ON</button>
+        <span id="yoloState">YOLO: waiting</span>
+        <span id="yoloObjects">Objects: 0</span>
+        <span id="yoloInference">Inference: --</span>
+      </div>
+      <div class="float bl" id="stageInfo">--</div>
     </div>
     <div class="metrics">
       <div class="metric"><div class="k">response</div><div class="v" id="mResponse">--</div></div>

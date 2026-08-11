@@ -782,6 +782,7 @@ from stability_runtime import (
     LatencyTracker, LatestFrameStore, RecordingPipeline, VisionController,
     parse_sensor_message,
 )
+from yolo_client import YoloClientSettings, YoloShadowClient
 
 # ---- IMU UDP ----
 UDP_IP   = "0.0.0.0"
@@ -801,6 +802,12 @@ RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 10)
 latest_rgb = LatestFrameStore()
 latest_thermal = LatestFrameStore()
+yolo_settings = YoloClientSettings.from_env()
+yolo_client = YoloShadowClient(
+    yolo_settings,
+    latest_rgb,
+    rotation_provider=lambda: CAMERA_ROTATION_DEG,
+)
 latency_tracker = LatencyTracker(history_size=200)
 _latency_csv_lock = threading.Lock()
 # Native 24x32 Celsius grid retained independently of the browser-only
@@ -1729,6 +1736,7 @@ def health():
             "audio": recording_audio_pipeline.health(),
         },
         "vision": dict(vision_controller.metrics),
+        "yolo": yolo_client.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "connections": dict(backend_metrics),
     })
@@ -1737,6 +1745,22 @@ def health():
 @app.get("/latency/metrics")
 def latency_metrics():
     return JSONResponse(latency_tracker.snapshot())
+
+
+@app.get("/api/yolo/detections")
+def yolo_detections():
+    """Read-only Phase 2.1 shadow cache; never feeds Gemini or navigation."""
+    return JSONResponse({
+        "enabled": yolo_settings.enabled,
+        **yolo_client.latest_detections(),
+    })
+
+
+@app.get("/api/perception/latest")
+def latest_perception():
+    """Read-only browser view of the latest YOLO shadow result."""
+    display_rotation_deg = 0 if STABILITY_MODE else CAMERA_ROTATION_DEG
+    return JSONResponse(yolo_client.latest_perception(display_rotation_deg))
 
 
 class RecordingCommand(BaseModel):
@@ -3364,6 +3388,11 @@ class UDPProto(asyncio.DatagramProtocol):
 
 # === New: register a send callback for bridge_io (broadcast JPEG to /ws/viewer) ===
 @app.on_event("startup")
+async def startup_yolo_shadow():
+    await yolo_client.start()
+
+
+@app.on_event("startup")
 async def on_startup_register_bridge_sender():
     # Save the main thread's event loop
     main_loop = asyncio.get_event_loop()
@@ -3485,6 +3514,7 @@ async def on_shutdown():
     """Clean up resources when the application shuts down."""
     global _tts_sender_task
     print("[SHUTDOWN] Starting resource cleanup...")
+    await yolo_client.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
     

@@ -1,4 +1,9 @@
 // static/main.js
+import {
+  drawObjectDetections,
+  isPerceptionFresh,
+  resizeOverlayCanvas,
+} from './perception_overlay.mjs';
 
 // ================= Camera + ASR =================
 (() => {
@@ -11,10 +16,21 @@
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
+  const overlayCanvas = document.getElementById('overlayCanvas');
+  const overlayCtx = overlayCanvas.getContext('2d');
+  const objectsToggle = document.getElementById('objectsToggle');
+  const yoloState = document.getElementById('yoloState');
+  const yoloObjects = document.getElementById('yoloObjects');
+  const yoloInference = document.getElementById('yoloInference');
   const thermalCanvas = document.getElementById('thermalCanvas');
   const thermalCtx    = thermalCanvas.getContext('2d');
   thermalCanvas.width  = 260;
   thermalCanvas.height = 195;
+  const PERCEPTION_POLL_MS = 1000;
+  const PERCEPTION_MAX_DISPLAY_AGE_MS = 3000;
+  let objectsEnabled = true;
+  let latestPerception = null;
+  let perceptionReceivedAt = 0;
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -212,10 +228,70 @@
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w; canvas.height = h;
     }
+    resizeOverlayCanvas(overlayCanvas, rect.width, rect.height);
+    renderPerception();
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
   let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
+
+  function renderPerception(){
+    const rect = overlayCanvas.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const elapsed = perceptionReceivedAt ? performance.now() - perceptionReceivedAt : 0;
+    const fresh = isPerceptionFresh(
+      latestPerception,
+      elapsed,
+      PERCEPTION_MAX_DISPLAY_AGE_MS,
+    );
+    if (objectsEnabled && fresh) {
+      drawObjectDetections(
+        overlayCtx,
+        latestPerception.objects,
+        {width: rect.width, height: rect.height},
+        {
+          inferenceRotationDeg: latestPerception.inference_rotation_deg,
+          displayRotationDeg: latestPerception.display_rotation_deg,
+          mirrored: latestPerception.mirrored,
+        },
+      );
+    }
+
+    const enabled = latestPerception ? latestPerception.enabled : true;
+    const healthy = latestPerception && latestPerception.service_healthy;
+    yoloState.textContent = !enabled
+      ? 'YOLO: disabled'
+      : fresh ? (healthy === false ? 'YOLO: degraded' : 'YOLO: healthy')
+        : latestPerception && latestPerception.stale ? 'YOLO: stale' : 'YOLO: waiting';
+    yoloObjects.textContent = `Objects: ${fresh ? latestPerception.objects.length : 0}`;
+    yoloInference.textContent = fresh
+      ? `Inference: ${Math.round(latestPerception.inference_ms)} ms`
+      : 'Inference: --';
+  }
+
+  async function refreshPerception(){
+    try {
+      const response = await fetch('/api/perception/latest', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      latestPerception = await response.json();
+      perceptionReceivedAt = performance.now();
+    } catch (_error) {
+      latestPerception = null;
+      perceptionReceivedAt = 0;
+    }
+    renderPerception();
+  }
+
+  objectsToggle.onclick = ()=>{
+    objectsEnabled = !objectsEnabled;
+    objectsToggle.textContent = `Objects: ${objectsEnabled ? 'ON' : 'OFF'}`;
+    objectsToggle.classList.toggle('active', objectsEnabled);
+    renderPerception();
+  };
 
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
@@ -344,6 +420,9 @@
   connectCamera();
   connectASR();
   connectThermal();
+  refreshPerception();
+  setInterval(refreshPerception, PERCEPTION_POLL_MS);
+  setInterval(renderPerception, 250);
 })();
 
 
