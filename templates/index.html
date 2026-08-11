@@ -170,8 +170,8 @@
     display:block !important;
     position:absolute !important;
     inset:auto 14px 14px auto !important;
-    width:260px !important;
-    height:195px !important;
+    width:195px !important;
+    height:260px !important;
     opacity:1 !important;
     z-index:20 !important;
     border:1px solid var(--line);
@@ -236,7 +236,7 @@
     #thermalCanvas{
       width:min(42vw,220px) !important;
       height:auto !important;
-      aspect-ratio:4/3;
+      aspect-ratio:3/4;
     }
     .imu-claude-grid{
       grid-template-columns:1fr;
@@ -373,12 +373,6 @@
       <label>interpolation
         <select id="thermalInterpolation"><option>cubic</option><option>nearest</option></select>
       </label>
-      <label>rotation
-        <select id="thermalRotation">
-          <option value="0">0°</option><option value="90">90°</option>
-          <option value="180">180°</option><option value="270">270°</option>
-        </select>
-      </label>
       <label><input id="thermalAuto" type="checkbox" checked> auto range</label>
       <label><input id="thermalHotspot" type="checkbox" checked> hotspot</label>
       <label><input id="thermalLabels" type="checkbox" checked> labels</label>
@@ -488,7 +482,8 @@
       const h = await (await fetch('/api/health', {cache:'no-store'})).json();
       q('stabilityHealth').textContent = JSON.stringify(h, null, 2);
 
-      setChip(q('camStatus'), !!h.sockets.camera_sensor, 'camera');
+      // main.js owns the three-state camera badge because backend socket
+      // connectivity alone does not prove browser frames are rendering.
       setChip(q('asrStatus'), !!h.sockets.audio, 'audio');
       const tAge = h.latest_age_sec && h.latest_age_sec.thermal;
       setChip(q('chipThermal'), tAge !== null && tAge !== undefined && tAge < 5, 'thermal');
@@ -515,7 +510,6 @@
     await fetch('/api/thermal-display',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         palette:q('thermalPalette').value, interpolation:q('thermalInterpolation').value,
-        rotation_deg:Number(q('thermalRotation').value),
         auto_range:q('thermalAuto').checked, hotspot:q('thermalHotspot').checked,
         labels:q('thermalLabels').checked,
         min_c:Number(q('thermalMinInput').value), max_c:Number(q('thermalMaxInput').value)
@@ -532,7 +526,6 @@
     q('thermalAuto').checked=c.auto_range; q('thermalHotspot').checked=c.hotspot;
     q('thermalLabels').checked=c.labels;
     q('thermalMinInput').value=c.min_c; q('thermalMaxInput').value=c.max_c;
-    if (c.rotation_deg !== undefined) q('thermalRotation').value = String(c.rotation_deg);
   }).catch(()=>{});
 
   const btnRestart = document.getElementById('btnRestart');

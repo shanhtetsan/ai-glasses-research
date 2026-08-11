@@ -1,9 +1,14 @@
 // static/main.js
 import {
+  containRect,
   drawObjectDetections,
   isPerceptionFresh,
   resizeOverlayCanvas,
 } from './perception_overlay.mjs';
+import {
+  RGB_VIEWER_STATE,
+  RgbViewerFreshness,
+} from './rgb_viewer_freshness.mjs';
 
 // ================= Camera + ASR =================
 (() => {
@@ -24,8 +29,8 @@ import {
   const yoloInference = document.getElementById('yoloInference');
   const thermalCanvas = document.getElementById('thermalCanvas');
   const thermalCtx    = thermalCanvas.getContext('2d');
-  thermalCanvas.width  = 260;
-  thermalCanvas.height = 195;
+  let rgbFrameWidth = 0;
+  let rgbFrameHeight = 0;
   const PERCEPTION_POLL_MS = 1000;
   const PERCEPTION_MAX_DISPLAY_AGE_MS = 3000;
   let objectsEnabled = true;
@@ -221,19 +226,58 @@ import {
     return { label, text: `${label} ${t}` };
   }
 
-  function fitCanvas(){
-    const rect = canvas.getBoundingClientRect();
-    const w = Math.max(320, Math.floor(rect.width));
-    const h = Math.max(240, Math.floor(rect.width * 3/4)); // 4:3
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w; canvas.height = h;
+  function fitCanvas(frameWidth = rgbFrameWidth, frameHeight = rgbFrameHeight){
+    if (!frameWidth || !frameHeight) return;
+    rgbFrameWidth = frameWidth;
+    rgbFrameHeight = frameHeight;
+    const stage = canvas.parentElement;
+    const fitted = containRect(stage.clientWidth, stage.clientHeight, frameWidth, frameHeight);
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    for (const layer of [canvas, overlayCanvas]) {
+      layer.style.inset = 'auto';
+      layer.style.left = `${fitted.left}px`;
+      layer.style.top = `${fitted.top}px`;
+      layer.style.width = `${fitted.width}px`;
+      layer.style.height = `${fitted.height}px`;
     }
-    resizeOverlayCanvas(overlayCanvas, rect.width, rect.height);
+    const backingWidth = Math.max(1, Math.round(fitted.width * dpr));
+    const backingHeight = Math.max(1, Math.round(fitted.height * dpr));
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+    resizeOverlayCanvas(overlayCanvas, fitted.width, fitted.height, dpr);
     renderPerception();
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
+  const RGB_STALE_AFTER_MS = 2500;
+  const RGB_FRESHNESS_CHECK_MS = 250;
+  const RGB_BACKEND_CHECK_MS = 1000;
   let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
+  let cameraGeneration = 0;
+  let freshnessTimer, backendFreshnessTimer, perceptionPollTimer, perceptionRenderTimer;
+
+  function setCameraState(snapshot){
+    if (snapshot.state === RGB_VIEWER_STATE.FRESH) {
+      $camStatus.className = 'chip ok';
+      $camStatus.textContent = 'Camera: fresh';
+      return;
+    }
+    if (snapshot.state === RGB_VIEWER_STATE.DISCONNECTED) {
+      $camStatus.className = 'chip err';
+      $camStatus.textContent = snapshot.cause === 'backend_socket'
+        ? 'Camera: device disconnected'
+        : 'Camera: disconnected';
+      return;
+    }
+    $camStatus.className = 'chip warn';
+    $camStatus.textContent = snapshot.state === RGB_VIEWER_STATE.RECOVERING
+      ? 'Camera: recovering…'
+      : snapshot.cause === 'backend_frame'
+        ? 'Camera: upstream stale'
+        : 'Camera: stale';
+  }
+
+  let rgbFreshness;
 
   function renderPerception(){
     const rect = overlayCanvas.getBoundingClientRect();
@@ -253,11 +297,6 @@ import {
         overlayCtx,
         latestPerception.objects,
         {width: rect.width, height: rect.height},
-        {
-          inferenceRotationDeg: latestPerception.inference_rotation_deg,
-          displayRotationDeg: latestPerception.display_rotation_deg,
-          mirrored: latestPerception.mirrored,
-        },
       );
     }
 
@@ -293,18 +332,8 @@ import {
     renderPerception();
   };
 
-  function drawBlob(buf){
-    const blob = new Blob([buf], {type:'image/jpeg'});
-    if ('createImageBitmap' in window){
-      createImageBitmap(blob).then(bmp=>{
-        fitCanvas();
-        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-      }).catch(()=>{});
-    }else{
-      const img = new Image();
-      img.onload = ()=>{ fitCanvas(); ctx.drawImage(img,0,0,canvas.width,canvas.height); URL.revokeObjectURL(img.src); };
-      img.src = URL.createObjectURL(blob);
-    }
+  function noteRenderedFrame(){
+    rgbFreshness.frameRendered();
     frames++;
     const now = performance.now();
     if (!fpsTimer) fpsTimer = now;
@@ -314,27 +343,89 @@ import {
     }
   }
 
-  function connectCamera(){
-    try{ if (wsCam) wsCam.close(); }catch(e){}
+  function drawBlob(buf, generation){
+    const blob = new Blob([buf], {type:'image/jpeg'});
+    if ('createImageBitmap' in window){
+      createImageBitmap(blob).then(bmp=>{
+        if (generation !== cameraGeneration) { bmp.close(); return; }
+        fitCanvas(bmp.width, bmp.height);
+        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+        bmp.close();
+        noteRenderedFrame();
+      }).catch(()=>{});
+    }else{
+      const img = new Image();
+      img.onload = ()=>{
+        if (generation === cameraGeneration) {
+          fitCanvas(img.naturalWidth, img.naturalHeight);
+          ctx.drawImage(img,0,0,canvas.width,canvas.height);
+          noteRenderedFrame();
+        }
+        URL.revokeObjectURL(img.src);
+      };
+      img.src = URL.createObjectURL(blob);
+    }
+  }
+
+  function connectCamera({manual = false} = {}){
+    rgbFreshness.beginConnection({manual});
+    const generation = ++cameraGeneration;
+    if (wsCam) {
+      wsCam.onopen = null;
+      wsCam.onclose = null;
+      wsCam.onerror = null;
+      wsCam.onmessage = null;
+      try{ wsCam.close(); }catch(e){}
+    }
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
-    setBadge($camStatus, false, 'Camera: connecting…');
-    wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Camera: connected');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Camera: disconnected');
-    wsCam.onerror = ()=> setBadge($camStatus, false, 'Camera: error');
-    wsCam.onmessage = (ev)=> drawBlob(ev.data);
+    const socket = new WebSocket(`${proto}://${location.host}/ws/viewer`);
+    wsCam = socket;
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketOpened();
+    };
+    socket.onclose = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketClosed();
+    };
+    socket.onerror = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketClosed();
+    };
+    socket.onmessage = (ev)=>{
+      if (socket === wsCam && generation === cameraGeneration) drawBlob(ev.data, generation);
+    };
+  }
+
+  async function refreshCameraBackendFreshness(){
+    try {
+      const response = await fetch('/api/camera-freshness', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      const state = await response.json();
+      rgbFreshness.updateBackend({
+        socketConnected: state.camera_socket_connected,
+        canonicalFrameAgeMs: state.canonical_frame_age_ms,
+      });
+    } catch (_error) {
+      rgbFreshness.updateBackend({
+        socketConnected: null,
+        canonicalFrameAgeMs: null,
+        available: false,
+      });
+    }
   }
 
   function drawThermalBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
     if ('createImageBitmap' in window){
       createImageBitmap(blob).then(bmp=>{
+        thermalCanvas.width = bmp.width;
+        thermalCanvas.height = bmp.height;
+        thermalCanvas.style.aspectRatio = `${bmp.width}/${bmp.height}`;
         thermalCtx.drawImage(bmp, 0, 0, thermalCanvas.width, thermalCanvas.height);
+        bmp.close();
       }).catch(()=>{});
     }else{
       const img = new Image();
-      img.onload = ()=>{ thermalCtx.drawImage(img,0,0,thermalCanvas.width,thermalCanvas.height); URL.revokeObjectURL(img.src); };
+      img.onload = ()=>{ thermalCanvas.width=img.naturalWidth; thermalCanvas.height=img.naturalHeight; thermalCanvas.style.aspectRatio=`${img.naturalWidth}/${img.naturalHeight}`; thermalCtx.drawImage(img,0,0,thermalCanvas.width,thermalCanvas.height); URL.revokeObjectURL(img.src); };
       img.src = URL.createObjectURL(blob);
     }
   }
@@ -415,14 +506,48 @@ import {
     messages.forEach(msg => msg.remove());
     lastTimestamp = 0;
   };
-  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); connectThermal(); };
+  function closeSocket(socket){
+    if (!socket) return;
+    socket.onopen = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.onmessage = null;
+    try { socket.close(); } catch (_error) {}
+  }
+
+  function cleanupViewer(){
+    clearInterval(freshnessTimer);
+    clearInterval(backendFreshnessTimer);
+    clearInterval(perceptionPollTimer);
+    clearInterval(perceptionRenderTimer);
+    clearTimeout(thermalReconnectTimer);
+    window.removeEventListener('resize', fitCanvas);
+    window.removeEventListener('pagehide', cleanupViewer);
+    rgbFreshness.dispose();
+    closeSocket(wsCam);
+    closeSocket(wsUI);
+    closeSocket(wsThermal);
+  }
+
+  rgbFreshness = new RgbViewerFreshness({
+    staleAfterMs: RGB_STALE_AFTER_MS,
+    recoveryBackoffMs: [2000, 4000, 8000, 15000],
+    onRecovery: ()=>connectCamera(),
+    onStateChange: setCameraState,
+  });
+
+  $btnRe.onclick = ()=> { connectCamera({manual: true}); connectASR(); connectThermal(); };
 
   connectCamera();
   connectASR();
   connectThermal();
   refreshPerception();
-  setInterval(refreshPerception, PERCEPTION_POLL_MS);
-  setInterval(renderPerception, 250);
+  refreshCameraBackendFreshness();
+  freshnessTimer = setInterval(()=>rgbFreshness.tick(), RGB_FRESHNESS_CHECK_MS);
+  backendFreshnessTimer = setInterval(refreshCameraBackendFreshness, RGB_BACKEND_CHECK_MS);
+  perceptionPollTimer = setInterval(refreshPerception, PERCEPTION_POLL_MS);
+  perceptionRenderTimer = setInterval(renderPerception, 250);
+  window.addEventListener('pagehide', cleanupViewer);
 })();
 
 

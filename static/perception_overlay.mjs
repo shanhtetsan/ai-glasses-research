@@ -1,41 +1,24 @@
-const VALID_ROTATIONS = new Set([0, 90, 180, 270]);
-
-function rotation(value) {
-  const normalized = Number(value);
-  return VALID_ROTATIONS.has(normalized) ? normalized : 0;
-}
-
 function clamp01(value) {
   return Math.max(0, Math.min(1, Number(value)));
 }
 
-function rotatePoint(x, y, degrees) {
-  if (degrees === 90) return [1 - y, x];
-  if (degrees === 180) return [1 - x, 1 - y];
-  if (degrees === 270) return [y, 1 - x];
-  return [x, y];
-}
-
-export function transformNormalizedBox(
-  bbox,
-  inferenceRotationDeg = 0,
-  displayRotationDeg = 0,
-  mirrored = false,
-) {
+export function transformNormalizedBox(bbox) {
   if (!Array.isArray(bbox) || bbox.length !== 4 || bbox.some(v => !Number.isFinite(Number(v)))) {
     return null;
   }
-  const [x1, y1, x2, y2] = bbox.map(clamp01);
-  const delta = (rotation(displayRotationDeg) - rotation(inferenceRotationDeg) + 360) % 360;
-  const corners = [
-    rotatePoint(x1, y1, delta),
-    rotatePoint(x2, y1, delta),
-    rotatePoint(x2, y2, delta),
-    rotatePoint(x1, y2, delta),
-  ].map(([x, y]) => mirrored ? [1 - x, y] : [x, y]);
-  const xs = corners.map(point => point[0]);
-  const ys = corners.map(point => point[1]);
-  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  return bbox.map(clamp01);
+}
+
+export function containRect(containerWidth, containerHeight, contentWidth, contentHeight) {
+  const cw = Math.max(0, Number(containerWidth) || 0);
+  const ch = Math.max(0, Number(containerHeight) || 0);
+  const iw = Math.max(0, Number(contentWidth) || 0);
+  const ih = Math.max(0, Number(contentHeight) || 0);
+  if (!cw || !ch || !iw || !ih) return {left: 0, top: 0, width: 0, height: 0};
+  const scale = Math.min(cw / iw, ch / ih);
+  const width = iw * scale;
+  const height = ih * scale;
+  return {left: (cw - width) / 2, top: (ch - height) / 2, width, height};
 }
 
 export function isPerceptionFresh(perception, elapsedSinceFetchMs, maxDisplayAgeMs = 3000) {
@@ -57,7 +40,7 @@ export function resizeOverlayCanvas(canvas, cssWidth, cssHeight, pixelRatio = wi
   return dpr;
 }
 
-export function drawObjectDetections(ctx, objects, viewport, orientation = {}) {
+export function drawObjectDetections(ctx, objects, viewport) {
   const width = Math.max(0, Number(viewport.width) || 0);
   const height = Math.max(0, Number(viewport.height) || 0);
   if (!width || !height || !Array.isArray(objects)) return;
@@ -66,12 +49,7 @@ export function drawObjectDetections(ctx, objects, viewport, orientation = {}) {
   ctx.textBaseline = 'top';
   ctx.lineWidth = 2;
   for (const object of objects) {
-    const box = transformNormalizedBox(
-      object.bbox_norm,
-      orientation.inferenceRotationDeg,
-      orientation.displayRotationDeg,
-      orientation.mirrored,
-    );
+    const box = transformNormalizedBox(object.bbox_norm);
     if (!box) continue;
     const x = box[0] * width;
     const y = box[1] * height;

@@ -71,6 +71,14 @@ from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
 import numpy as np
+from perception_orientation import (
+    RgbCanonicalizerTelemetry,
+    canonicalize_thermal_payload,
+    log_rgb_canonicalizer_health,
+    queue_latest_raw_rgb,
+    run_latest_rgb_canonicalizer,
+    summarize_thermal_grid,
+)
 try:
     import audioop
 except ModuleNotFoundError:
@@ -183,15 +191,10 @@ except ImportError as e:
 VAD_SILENCE_RMS    = 300
 JPEG_QUALITY       = 80
 
-# CAMERA_ROTATION_DEG — corrects physical camera mounting orientation
-# (0/90/180/270) in software, so a remount doesn't need a firmware change.
-# Applied to every consumer of camera frames: nav/detection, browser
-# broadcast (both via _process_camera_frame_blocking), and Gemini Live
-# vision (via _rotate_jpeg_bytes in the ws_camera_esp gemini pump — that
-# path reads raw ESP32 bytes directly and bypasses
-# _process_camera_frame_blocking, so it needs its own rotation call).
+# All frames downstream of ingest are already in canonical portrait space.
+# Kept in the settings response for compatibility; active display/inference
+# rotation must remain zero to prevent a second physical rotation.
 CAMERA_ROTATION_DEG = 0
-_ROTATE_REENCODE_QUALITY = 90  # re-encode quality for the raw-bytes (Gemini) path; independent of JPEG_QUALITY, which is the browser-broadcast setting
 
 # VAD_SILENCE_MS    — milliseconds of continuous silence (after speech has
 #                     been detected) that trigger auto-transcription.
@@ -539,11 +542,8 @@ async def _on_input_transcription(text: str):
                 age_ms=round(frame_age_ms, 3),
                 bytes=len(frame.data),
             )
-            data = frame.data
-            if CAMERA_ROTATION_DEG != 0:
-                data = await asyncio.to_thread(_rotate_jpeg_bytes, data)
             _vision_submitted_for_turn = await gemini_live.send_image(
-                data,
+                frame.data,
                 turn_id=turn_id,
                 sequence=frame.sequence,
                 source="pre_response",
@@ -802,16 +802,16 @@ RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 10)
 latest_rgb = LatestFrameStore()
 latest_thermal = LatestFrameStore()
+rgb_canonicalizer_telemetry = RgbCanonicalizerTelemetry()
 yolo_settings = YoloClientSettings.from_env()
 yolo_client = YoloShadowClient(
     yolo_settings,
     latest_rgb,
-    rotation_provider=lambda: CAMERA_ROTATION_DEG,
+    rotation_provider=lambda: 0,
 )
 latency_tracker = LatencyTracker(history_size=200)
 _latency_csv_lock = threading.Lock()
-# Native 24x32 Celsius grid retained independently of the browser-only
-# colorized JPEG path for future RGB/thermal calibration and point queries.
+# Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
 latest_thermal_matrix: Optional[np.ndarray] = None
 latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
 latest_device_status: Dict[str, Any] = {"timestamp": 0.0, "data": None}
@@ -823,7 +823,6 @@ thermal_display_config: Dict[str, Any] = {
     "hotspot": True,
     "labels": True,
     "interpolation": "cubic",
-    "rotation_deg": 90,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
@@ -936,7 +935,7 @@ def is_explicit_vision_request(text: str) -> bool:
 # ---- Thermal facts for Gemini ----
 # Gemini receives measurements, never the colorized heatmap: palette and
 # auto-range change every frame, so color-reading is unrepeatable. These come
-# straight off the native float32 grid in latest_thermal_matrix.
+# straight off the canonical float32 grid in latest_thermal_matrix.
 THERMAL_FACT_MAX_AGE_SEC = float(os.getenv("THERMAL_FACT_MAX_AGE_SEC", "3.0"))
 # Fraction of the grid treated as "directly ahead". The MLX90640 and OV2640 are
 # rigidly co-mounted a few cm apart, so beyond ~1m parallax is under one thermal
@@ -953,14 +952,6 @@ _THERMAL_PHRASES = (
 def is_thermal_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
     return any(phrase in normalized for phrase in _THERMAL_PHRASES)
-
-
-def _describe_grid_position(row: int, col: int, rows: int, cols: int) -> str:
-    vertical = ("upper", "middle", "lower")[min(2, int(row * 3 / rows))]
-    horizontal = ("left", "centre", "right")[min(2, int(col * 3 / cols))]
-    if vertical == "middle" and horizontal == "centre":
-        return "directly ahead"
-    return f"{vertical} {horizontal}"
 
 
 def build_thermal_facts() -> Optional[dict]:
@@ -980,45 +971,7 @@ def build_thermal_facts() -> Optional[dict]:
     age = time.monotonic() - snapshot.timestamp
     if age > THERMAL_FACT_MAX_AGE_SEC:
         return None
-    grid = np.asarray(matrix, dtype=np.float32)
-    if not np.isfinite(grid).all():
-        return None
-    rows, cols = grid.shape
-    # 20th percentile stands in for ambient; the true minimum latches onto a
-    # single cold outlier pixel.
-    ambient = float(np.percentile(grid, 20))
-    scene_max = float(grid.max())
-    hot_row, hot_col = np.unravel_index(int(np.argmax(grid)), grid.shape)
-    half = THERMAL_CENTER_FRACTION / 2
-    r0, r1 = int(rows * (0.5 - half)), int(rows * (0.5 + half))
-    c0, c1 = int(cols * (0.5 - half)), int(cols * (0.5 + half))
-    centre = grid[r0:r1, c0:c1]
-    regions = {}
-    for ri, rname in enumerate(("upper", "middle", "lower")):
-        for ci, cname in enumerate(("left", "centre", "right")):
-            block = grid[rows * ri // 3:rows * (ri + 1) // 3,
-                         cols * ci // 3:cols * (ci + 1) // 3]
-            regions[f"{rname}_{cname}"] = round(float(block.mean()), 1)
-    return {
-        "sensor": "MLX90640 32x24 thermopile array, roughly co-aligned with the camera",
-        "measurement_age_sec": round(age, 2),
-        "ambient_c": round(ambient, 1),
-        "scene_max_c": round(scene_max, 1),
-        "scene_min_c": round(float(grid.min()), 1),
-        "directly_ahead_mean_c": round(float(centre.mean()), 1),
-        "directly_ahead_max_c": round(float(centre.max()), 1),
-        "hotspot": {
-            "temperature_c": round(scene_max, 1),
-            "position": _describe_grid_position(int(hot_row), int(hot_col), rows, cols),
-            "above_ambient_c": round(scene_max - ambient, 1),
-        },
-        "region_mean_c": regions,
-        "accuracy_note": (
-            "Surface temperature estimates, +/-2C typical. Emissivity assumed 0.95; "
-            "shiny or metallic surfaces read substantially cooler than they actually "
-            "are. Not reliable for burn-safety decisions."
-        ),
-    }
+    return summarize_thermal_grid(matrix, age, THERMAL_CENTER_FRACTION)
 
 
 async def request_gemini_vision(reason: str) -> dict:
@@ -1730,6 +1683,7 @@ def health():
             "thermal": thermal.sequence,
             "imu": latest_imu["sequence"],
         },
+        "rgb_canonicalizer": rgb_canonicalizer_telemetry.health(),
         "device_status": latest_device_status,
         "recording": {
             **recording_pipeline.health(),
@@ -1739,6 +1693,21 @@ def health():
         "yolo": yolo_client.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "connections": dict(backend_metrics),
+    })
+
+
+@app.get("/api/camera-freshness")
+def camera_freshness():
+    """Compact upstream state for browser-viewer freshness recovery."""
+    now = time.monotonic()
+    rgb = latest_rgb.snapshot()
+    return JSONResponse({
+        "camera_socket_connected": esp32_camera_ws is not None,
+        "canonical_frame_age_ms": (
+            None if rgb.data is None
+            else round(max(0.0, now - rgb.timestamp) * 1000.0, 1)
+        ),
+        "canonical_frame_sequence": rgb.sequence,
     })
 
 
@@ -1759,8 +1728,7 @@ def yolo_detections():
 @app.get("/api/perception/latest")
 def latest_perception():
     """Read-only browser view of the latest YOLO shadow result."""
-    display_rotation_deg = 0 if STABILITY_MODE else CAMERA_ROTATION_DEG
-    return JSONResponse(yolo_client.latest_perception(display_rotation_deg))
+    return JSONResponse(yolo_client.latest_perception(display_rotation_deg=0))
 
 
 class RecordingCommand(BaseModel):
@@ -1816,7 +1784,6 @@ class ThermalDisplaySettings(BaseModel):
     hotspot: Optional[bool] = None
     labels: Optional[bool] = None
     interpolation: Optional[str] = None
-    rotation_deg: Optional[int] = None
 
 
 @app.get("/api/thermal-display")
@@ -1831,8 +1798,6 @@ def update_thermal_display(settings: ThermalDisplaySettings):
         return JSONResponse({"error": "invalid palette"}, status_code=400)
     if "interpolation" in values and values["interpolation"] not in {"nearest", "cubic"}:
         return JSONResponse({"error": "invalid interpolation"}, status_code=400)
-    if "rotation_deg" in values and values["rotation_deg"] not in {0, 90, 180, 270}:
-        return JSONResponse({"error": "invalid rotation_deg"}, status_code=400)
     next_min = float(values.get("min_c", thermal_display_config["min_c"]))
     next_max = float(values.get("max_c", thermal_display_config["max_c"]))
     if next_min >= next_max:
@@ -1931,11 +1896,14 @@ def get_settings():
 @app.post("/api/settings")
 def update_settings(payload: SettingsPayload):
     global JPEG_QUALITY, VAD_SILENCE_RMS, VAD_SILENCE_MS, VAD_MIN_SPEECH_MS
-    global VAD_SILENCE_CHUNKS, VAD_MIN_SPEECH_CHUNKS, CAMERA_ROTATION_DEG
+    global VAD_SILENCE_CHUNKS, VAD_MIN_SPEECH_CHUNKS
     if payload.jpeg_quality is not None:
         JPEG_QUALITY = max(1, min(100, payload.jpeg_quality))
-    if payload.camera_rotation_deg is not None and payload.camera_rotation_deg in (0, 90, 180, 270):
-        CAMERA_ROTATION_DEG = payload.camera_rotation_deg
+    if payload.camera_rotation_deg not in (None, 0):
+        return JSONResponse(
+            {"error": "camera rotation is fixed at canonical 0 degrees"},
+            status_code=400,
+        )
     if payload.vad_silence_rms is not None:
         VAD_SILENCE_RMS = max(50, min(5000, payload.vad_silence_rms))
     if payload.vad_silence_ms is not None:
@@ -2444,38 +2412,6 @@ async def ws_audio(ws: WebSocket):
             flush=True,
         )
 
-def _apply_camera_rotation(bgr):
-    """Correct physical camera mounting orientation. Single source of truth
-    shared by _process_camera_frame_blocking (nav/detection/browser) and
-    _rotate_jpeg_bytes (Gemini Live vision's raw-bytes path) so both stay in
-    sync if the rotation options ever change.
-    """
-    if CAMERA_ROTATION_DEG == 90:
-        return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
-    elif CAMERA_ROTATION_DEG == 180:
-        return cv2.rotate(bgr, cv2.ROTATE_180)
-    elif CAMERA_ROTATION_DEG == 270:
-        return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return bgr
-
-def _rotate_jpeg_bytes(data: bytes) -> bytes:
-    """Decode/rotate/re-encode one raw JPEG frame. For consumers that read
-    ESP32 bytes directly instead of going through _process_camera_frame_blocking
-    — currently just the Gemini Live vision pump (see ws_camera_esp). No-op
-    cost when CAMERA_ROTATION_DEG == 0 is enforced by the caller skipping
-    this function entirely, not by this function itself.
-    """
-    try:
-        arr = np.frombuffer(data, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if bgr is None or bgr.size == 0:
-            return data
-        bgr = _apply_camera_rotation(bgr)
-        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), _ROTATE_REENCODE_QUALITY])
-        return enc.tobytes() if ok else data
-    except Exception:
-        return data
-
 def _process_camera_frame_blocking(data: bytes):
     """Decode one JPEG frame and run detection/navigation on it.
 
@@ -2490,7 +2426,6 @@ def _process_camera_frame_blocking(data: bytes):
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is None or bgr.size == 0:
             return (None, None)
-        bgr = _apply_camera_rotation(bgr)
     except Exception:
         return (None, None)
 
@@ -2551,8 +2486,9 @@ def _process_camera_frame_blocking(data: bytes):
 async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, frame_event: asyncio.Event,
                                 gemini_frame_holder: dict, gemini_frame_event: asyncio.Event,
                                 gemini_pump_task, received_at: Optional[float] = None) -> int:
-    """Per-frame camera ingest: latest-frame cache, nav/recording processor
-    hand-off, Gemini Live pump hand-off. Shared verbatim by /ws/camera
+    """Fan out one already-canonical RGB frame to every main consumer.
+
+    Shared verbatim by /ws/camera
     (ws_camera_esp) and the merged /ws/camera_thermal (ws_camera_thermal_esp)
     so both stay on identical processing logic."""
     frame_counter += 1
@@ -2584,12 +2520,13 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
 
 
 def _retain_latest_thermal(data: bytes, received_at: Optional[float] = None) -> np.ndarray:
-    """Retain both the exact wire payload and its native float32 matrix."""
+    """Canonicalize once, then retain the shared 32x24 thermal matrix."""
     global latest_thermal_matrix
-    latest_thermal.update(data, received_at)
-    latest_thermal_matrix = np.frombuffer(
-        data, dtype="<f4"
-    ).reshape(24, 32).copy()
+    canonical = canonicalize_thermal_payload(data)
+    if canonical is None:
+        raise ValueError("invalid thermal payload")
+    latest_thermal_matrix = canonical
+    latest_thermal.update(canonical.astype("<f4", copy=False).tobytes(), received_at)
     return latest_thermal_matrix
 
 
@@ -2625,12 +2562,9 @@ async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
     return thermal_frame_count
 
 
-def _prepare_thermal_frame_blocking(data: bytes):
-    """CPU-only thermal parse/colorize/JPEG encode for executor workers."""
-    if len(data) != 3072:
-        return None, None
-    frame = np.frombuffer(data, dtype="<f4").reshape(24, 32)
-    if not np.isfinite(frame).all():
+def _prepare_thermal_frame_blocking(frame: np.ndarray):
+    """CPU-only colorize/JPEG encode for a canonical thermal matrix."""
+    if frame.shape != (32, 24) or not np.isfinite(frame).all():
         return None, None
     colorized = _colorize_thermal(frame)
     ok, enc = cv2.imencode(".jpg", colorized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -2745,13 +2679,6 @@ async def ws_camera_esp(ws: WebSocket):
             if data is None:
                 continue
             try:
-                # This holder is fed the raw ESP32 bytes directly (see the
-                # receive loop below) and never passes through
-                # _process_camera_frame_blocking, so rotation has to be
-                # applied here too — otherwise Gemini vision would see an
-                # unrotated frame while nav/browser see a corrected one.
-                if CAMERA_ROTATION_DEG != 0:
-                    data = await loop.run_in_executor(None, _rotate_jpeg_bytes, data)
                 await gemini_live.send_image(data)
             except Exception as e:
                 if DEBUG:
@@ -2763,14 +2690,34 @@ async def ws_camera_esp(ws: WebSocket):
         else None
     )
 
+    raw_holder = {"data": None}
+    raw_event = asyncio.Event()
+
+    async def _publish_canonical(data: bytes, received_at: float):
+        nonlocal frame_counter
+        frame_counter = await _handle_camera_frame(
+            data, frame_counter, holder, frame_event,
+            gemini_frame_holder, gemini_frame_event, gemini_pump_task,
+            received_at,
+        )
+
+    canonicalizer_task = asyncio.create_task(
+        run_latest_rgb_canonicalizer(
+            raw_holder, raw_event, _publish_canonical,
+            rgb_canonicalizer_telemetry,
+        )
+    )
+    canonicalizer_health_task = asyncio.create_task(
+        log_rgb_canonicalizer_health(rgb_canonicalizer_telemetry)
+    )
+
     try:
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
-                frame_counter = await _handle_camera_frame(
-                    msg["bytes"], frame_counter, holder, frame_event,
-                    gemini_frame_holder, gemini_frame_event, gemini_pump_task,
-                    time.monotonic(),
+                queue_latest_raw_rgb(
+                    msg["bytes"], time.monotonic(), raw_holder, raw_event,
+                    rgb_canonicalizer_telemetry,
                 )
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
@@ -2779,6 +2726,16 @@ async def ws_camera_esp(ws: WebSocket):
     except Exception as e:
         print(f"[CAMERA ERROR] {e}")
     finally:
+        canonicalizer_health_task.cancel()
+        try:
+            await canonicalizer_health_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        canonicalizer_task.cancel()
+        try:
+            await canonicalizer_task
+        except (asyncio.CancelledError, Exception):
+            pass
         processor_task.cancel()
         try:
             await processor_task
@@ -2859,18 +2816,19 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         if DEBUG: print("[NAV MASTER] Master state machine initialized")
     loop = asyncio.get_running_loop()
     frame_counter = 0
+    camera_received_count = 0
     thermal_frame_count = 0
     thermal_dropped = 0
-    thermal_ingest_q: asyncio.Queue[tuple[bytes, float]] = asyncio.Queue(
+    thermal_ingest_q: asyncio.Queue[tuple[np.ndarray, float]] = asyncio.Queue(
         maxsize=ESP_THERMAL_INGEST_QUEUE_MAX
     )
 
     async def _thermal_processor():
         nonlocal thermal_frame_count
         while True:
-            payload, received_at = await thermal_ingest_q.get()
+            frame, received_at = await thermal_ingest_q.get()
             jpeg_bytes, stats = await asyncio.get_running_loop().run_in_executor(
-                None, _prepare_thermal_frame_blocking, payload
+                None, _prepare_thermal_frame_blocking, frame
             )
             if jpeg_bytes is None:
                 continue
@@ -2888,7 +2846,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
             if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
                 print(
                     f"[WS-INGEST] device={device_id} socket=camera_thermal "
-                    f"type=thermal bytes={len(payload)} queue={thermal_ingest_q.qsize()} "
+                    f"type=thermal bytes={frame.nbytes} queue={thermal_ingest_q.qsize()} "
                     f"latency_ms={latency_ms:.1f}",
                     flush=True,
                 )
@@ -2958,8 +2916,6 @@ async def ws_camera_thermal_esp(ws: WebSocket):
             if data is None:
                 continue
             try:
-                if CAMERA_ROTATION_DEG != 0:
-                    data = await loop.run_in_executor(None, _rotate_jpeg_bytes, data)
                 await gemini_live.send_image(data)
             except Exception as e:
                 if DEBUG:
@@ -2969,6 +2925,27 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         asyncio.create_task(_gemini_image_pump())
         if AI_BACKEND == "gemini_live"
         else None
+    )
+
+    raw_holder = {"data": None}
+    raw_event = asyncio.Event()
+
+    async def _publish_canonical(data: bytes, received_at: float):
+        nonlocal frame_counter
+        frame_counter = await _handle_camera_frame(
+            data, frame_counter, holder, frame_event,
+            gemini_frame_holder, gemini_frame_event, gemini_pump_task,
+            received_at,
+        )
+
+    canonicalizer_task = asyncio.create_task(
+        run_latest_rgb_canonicalizer(
+            raw_holder, raw_event, _publish_canonical,
+            rgb_canonicalizer_telemetry,
+        )
+    )
+    canonicalizer_health_task = asyncio.create_task(
+        log_rgb_canonicalizer_health(rgb_canonicalizer_telemetry)
     )
 
     try:
@@ -2985,20 +2962,24 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                     continue
                 if msg_type == MSG_TYPE_CAM:
                     received_at = time.monotonic()
-                    frame_counter = await _handle_camera_frame(
-                        payload, frame_counter, holder, frame_event,
-                        gemini_frame_holder, gemini_frame_event, gemini_pump_task,
-                        received_at,
+                    camera_received_count += 1
+                    queue_latest_raw_rgb(
+                        payload, received_at, raw_holder, raw_event,
+                        rgb_canonicalizer_telemetry,
                     )
-                    if frame_counter == 1 or frame_counter % 100 == 0:
+                    if camera_received_count == 1 or camera_received_count % 100 == 0:
                         print(
                             f"[WS-INGEST] device={device_id} socket=camera_thermal "
-                            f"type=camera bytes={len(payload)} queue=latest count={frame_counter}",
+                            f"type=camera bytes={len(payload)} queue=latest count={camera_received_count}",
                             flush=True,
                         )
                 elif msg_type == MSG_TYPE_THERMAL:
                     received_at = time.monotonic()
-                    _retain_latest_thermal(payload, received_at)
+                    try:
+                        canonical_thermal = _retain_latest_thermal(payload, received_at)
+                    except ValueError:
+                        backend_metrics["invalid_sensor_packets"] += 1
+                        continue
                     if thermal_ingest_q.full():
                         try:
                             thermal_ingest_q.get_nowait()
@@ -3006,7 +2987,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                         except asyncio.QueueEmpty:
                             pass
                     try:
-                        thermal_ingest_q.put_nowait((payload, received_at))
+                        thermal_ingest_q.put_nowait((canonical_thermal, received_at))
                     except asyncio.QueueFull:
                         thermal_dropped += 1
                 elif msg_type == MSG_TYPE_IMU:
@@ -3028,6 +3009,16 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     except Exception as e:
         print(f"[CAMERA-THERMAL ERROR] {e}")
     finally:
+        canonicalizer_health_task.cancel()
+        try:
+            await canonicalizer_health_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        canonicalizer_task.cancel()
+        try:
+            await canonicalizer_task
+        except (asyncio.CancelledError, Exception):
+            pass
         imu_pump_task.cancel()
         try:
             await imu_pump_task
@@ -3093,20 +3084,8 @@ async def ws_viewer(ws: WebSocket):
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
 def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
-    """Render the latest thermal grid without changing MLX90640 acquisition."""
+    """Render the canonical thermal grid without another orientation change."""
     cfg = dict(thermal_display_config)
-    # Display-only orientation fix for how the MLX90640 is physically mounted.
-    # Applied here rather than at ingest so latest_thermal/latest_thermal_matrix
-    # stay in the sensor's native orientation for Gemini and RGB/thermal
-    # calibration. ascontiguousarray: np.rot90 returns a negative-stride view
-    # that OpenCV rejects.
-    rotation = int(cfg.get("rotation_deg", 0))
-    if rotation == 90:
-        frame = np.ascontiguousarray(np.rot90(frame, k=-1))
-    elif rotation == 180:
-        frame = np.ascontiguousarray(np.rot90(frame, k=2))
-    elif rotation == 270:
-        frame = np.ascontiguousarray(np.rot90(frame, k=1))
     if cfg["auto_range"]:
         lo, hi = np.percentile(frame, [5, 95])
     else:
@@ -3124,7 +3103,7 @@ def _colorize_thermal(frame: np.ndarray) -> np.ndarray:
     }.get(cfg["palette"], cv2.COLORMAP_INFERNO)
     colored = cv2.applyColorMap(normed, palette)
     interpolation = cv2.INTER_NEAREST if cfg["interpolation"] == "nearest" else cv2.INTER_CUBIC
-    # Scale derived from the (possibly rotated) grid so 90/270 stay square-pixel.
+    # Scale from the canonical 32x24 portrait grid with square thermal pixels.
     rows, cols = frame.shape
     scale = 10
     out_w, out_h = cols * scale, rows * scale
