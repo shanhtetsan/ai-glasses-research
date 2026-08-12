@@ -847,6 +847,7 @@ from stability_runtime import (
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
 from yolo_client import YoloClientSettings, YoloShadowClient
+from hand_client import HandClientSettings, HandTrackingClient
 from research_exporter import (
     DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
     ResearchExporter, ResearchExporterSettings, SessionGate,
@@ -892,6 +893,9 @@ yolo_client = YoloShadowClient(
     rotation_provider=lambda: 0,
     on_event=research_exporter.publish_event,
 )
+hand_settings = HandClientSettings.from_env()
+hand_client = HandTrackingClient(hand_settings, latest_rgb)
+latency_tracker = LatencyTracker(history_size=200)
 latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
 audio_freshness_tracker = AudioFreshnessTracker(
     stale_after_ms=float(os.getenv("AUDIO_STALE_AFTER_MS", "500")),
@@ -1788,6 +1792,7 @@ def health():
         },
         "vision": dict(vision_controller.metrics),
         "yolo": yolo_client.health(),
+        "hands": hand_client.health(),
         "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "audio_freshness": audio_freshness_tracker.snapshot(),
@@ -1834,6 +1839,12 @@ def yolo_detections():
 def latest_perception():
     """Read-only browser view of the latest YOLO shadow result."""
     return JSONResponse(yolo_client.latest_perception(display_rotation_deg=0))
+
+
+@app.get("/api/perception/hands/latest")
+def latest_hands():
+    """Read-only hand cache in the canonical RGB source coordinate space."""
+    return JSONResponse(hand_client.latest_hands())
 
 
 class RecordingCommand(BaseModel):
@@ -3599,6 +3610,11 @@ async def startup_yolo_shadow():
 
 
 @app.on_event("startup")
+async def startup_hand_tracking():
+    await hand_client.start()
+
+
+@app.on_event("startup")
 async def startup_research_exporter():
     await research_exporter.start()
 
@@ -3725,6 +3741,7 @@ async def on_shutdown():
     """Clean up resources when the application shuts down."""
     global _tts_sender_task
     print("[SHUTDOWN] Starting resource cleanup...")
+    await hand_client.stop()
     await yolo_client.stop()
     await research_exporter.stop()
     await recording_pipeline.stop()

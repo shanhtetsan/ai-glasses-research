@@ -1,4 +1,4 @@
-# YOLO shadow inference service
+# Perception inference service
 
 This service is deployed independently from the glasses/Gemini backend. Build
 from the repository root so the validated `yolov8n.pt` is available:
@@ -17,9 +17,19 @@ Deploying the service does not enable the client in the main backend. Configure
 `YOLO_SERVICE_URL` and the matching secret there, then explicitly set
 `ENABLE_YOLO=true`. Keep the service token out of TOML and logs.
 
+Hand tracking is independently enabled with `ENABLE_HAND_TRACKING=true`.
+`HAND_SERVICE_URL` and `HAND_SERVICE_TOKEN` may be set explicitly; when omitted,
+the client reuses `YOLO_SERVICE_URL` and `YOLO_SERVICE_TOKEN` because both
+endpoints live in this authenticated service. `HAND_MIN_INTERVAL_SEC` defaults
+to `0.33` and `HAND_CACHE_STALE_SEC` defaults to `1.25`.
+
 The default image uses CPU-only PyTorch. `PYTORCH_INDEX_URL` is a build argument
 so a compatible GPU wheel index and `YOLO_DEVICE` can be selected for a future
 GPU deployment without changing the API contract.
+
+The same process loads the repository's existing `hand_landmarker.task` once
+at startup. Hand inference has its own single admission slot and executor, so
+a concurrent hand request receives HTTP 429 instead of entering a queue.
 
 ## HTTP contract
 
@@ -64,3 +74,10 @@ Normalized values are clamped to `[0, 1]`. The service returns 401 for failed
 authentication, 429 when its single inference slot is busy, 413 for an invalid
 body size, 422 for malformed JPEG/inference failure, and 503 when the model is
 unavailable.
+
+`POST /v1/hands` uses the same bearer token and raw JPEG body. It requires
+`X-Frame-ID` and accepts `X-Frame-Received-Monotonic-Ns`. It intentionally has
+no rotation or mirror parameter: the caller sends the already-canonical RGB
+JPEG and every normalized coordinate is in that exact source space. A response
+contains at most two hands, each with 21 landmarks plus `index_tip_norm`,
+`wrist_norm`, `hand_center_norm`, and `bbox_norm`.

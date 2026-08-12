@@ -1,7 +1,9 @@
 // static/main.js
 import {
   containRect,
+  drawHandLandmarks,
   drawObjectDetections,
+  isHandResultFresh,
   isPerceptionFresh,
   resizeOverlayCanvas,
 } from './perception_overlay.mjs';
@@ -25,18 +27,27 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   const overlayCanvas = document.getElementById('overlayCanvas');
   const overlayCtx = overlayCanvas.getContext('2d');
   const objectsToggle = document.getElementById('objectsToggle');
+  const handsToggle = document.getElementById('handsToggle');
   const yoloState = document.getElementById('yoloState');
   const yoloObjects = document.getElementById('yoloObjects');
   const yoloInference = document.getElementById('yoloInference');
+  const handState = document.getElementById('handState');
+  const handCount = document.getElementById('handCount');
+  const handInference = document.getElementById('handInference');
   const thermalCanvas = document.getElementById('thermalCanvas');
   const thermalCtx    = thermalCanvas.getContext('2d');
   let rgbFrameWidth = 0;
   let rgbFrameHeight = 0;
   const PERCEPTION_POLL_MS = 1000;
   const PERCEPTION_MAX_DISPLAY_AGE_MS = 3000;
+  const HAND_POLL_MS = 333;
+  const HAND_MAX_DISPLAY_AGE_MS = 1500;
   let objectsEnabled = true;
+  let handsEnabled = true;
   let latestPerception = null;
   let perceptionReceivedAt = 0;
+  let latestHands = null;
+  let handsReceivedAt = 0;
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -251,7 +262,7 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
   let cameraGeneration = 0;
   let freshnessTimer, backendFreshnessTimer, audioFreshnessTimer;
-  let perceptionPollTimer, perceptionRenderTimer;
+  let perceptionPollTimer, handPollTimer, perceptionRenderTimer;
 
   function setAudioState(snapshot){
     const badge = audioBadgePresentation(snapshot);
@@ -312,6 +323,19 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
         {width: rect.width, height: rect.height},
       );
     }
+    const handElapsed = handsReceivedAt ? performance.now() - handsReceivedAt : 0;
+    const handsFresh = isHandResultFresh(
+      latestHands,
+      handElapsed,
+      HAND_MAX_DISPLAY_AGE_MS,
+    );
+    if (handsEnabled && handsFresh) {
+      drawHandLandmarks(
+        overlayCtx,
+        latestHands.hands,
+        {width: rect.width, height: rect.height},
+      );
+    }
 
     const enabled = latestPerception ? latestPerception.enabled : true;
     const healthy = latestPerception && latestPerception.service_healthy;
@@ -323,6 +347,17 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     yoloInference.textContent = fresh
       ? `Inference: ${Math.round(latestPerception.inference_ms)} ms`
       : 'Inference: --';
+
+    const handFeatureEnabled = latestHands ? latestHands.enabled : true;
+    const handHealthy = latestHands && latestHands.service_healthy;
+    handState.textContent = !handFeatureEnabled
+      ? 'Hands: disabled'
+      : handsFresh ? (handHealthy === false ? 'Hands: degraded' : 'Hands: healthy')
+        : latestHands && latestHands.stale ? 'Hands: stale' : 'Hands: waiting';
+    handCount.textContent = `Hands: ${handsFresh ? latestHands.hands.length : 0}`;
+    handInference.textContent = handsFresh
+      ? `Hand inference: ${Math.round(latestHands.inference_ms)} ms`
+      : 'Hand inference: --';
   }
 
   async function refreshPerception(){
@@ -338,10 +373,30 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     renderPerception();
   }
 
+  async function refreshHands(){
+    try {
+      const response = await fetch('/api/perception/hands/latest', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      latestHands = await response.json();
+      handsReceivedAt = performance.now();
+    } catch (_error) {
+      latestHands = null;
+      handsReceivedAt = 0;
+    }
+    renderPerception();
+  }
+
   objectsToggle.onclick = ()=>{
     objectsEnabled = !objectsEnabled;
     objectsToggle.textContent = `Objects: ${objectsEnabled ? 'ON' : 'OFF'}`;
     objectsToggle.classList.toggle('active', objectsEnabled);
+    renderPerception();
+  };
+
+  handsToggle.onclick = ()=>{
+    handsEnabled = !handsEnabled;
+    handsToggle.textContent = `Hands: ${handsEnabled ? 'ON' : 'OFF'}`;
+    handsToggle.classList.toggle('active', handsEnabled);
     renderPerception();
   };
 
@@ -531,6 +586,7 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     clearInterval(backendFreshnessTimer);
     clearInterval(audioFreshnessTimer);
     clearInterval(perceptionPollTimer);
+    clearInterval(handPollTimer);
     clearInterval(perceptionRenderTimer);
     clearTimeout(thermalReconnectTimer);
     window.removeEventListener('resize', fitCanvas);
@@ -554,12 +610,14 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   connectASR();
   connectThermal();
   refreshPerception();
+  refreshHands();
   refreshCameraBackendFreshness();
   refreshAudioFreshness();
   freshnessTimer = setInterval(()=>rgbFreshness.tick(), RGB_FRESHNESS_CHECK_MS);
   backendFreshnessTimer = setInterval(refreshCameraBackendFreshness, RGB_BACKEND_CHECK_MS);
   audioFreshnessTimer = setInterval(refreshAudioFreshness, 1000);
   perceptionPollTimer = setInterval(refreshPerception, PERCEPTION_POLL_MS);
+  handPollTimer = setInterval(refreshHands, HAND_POLL_MS);
   perceptionRenderTimer = setInterval(renderPerception, 250);
   window.addEventListener('pagehide', cleanupViewer);
 })();
