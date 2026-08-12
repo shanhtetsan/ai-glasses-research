@@ -17,6 +17,7 @@ struct WavFmt;
 #include "esp_timer.h"
 #include "esp_system.h"
 using namespace websockets;
+struct AudioChunk;  // Arduino auto-generated prototypes reference this type.
 
 // Strict hardware-integration mode: keep required sensor/audio paths and
 // disable runtime camera mutation and experimental networking.
@@ -53,6 +54,8 @@ constexpr uint32_t CAMERA_MIN_FRAME_INTERVAL_MS = 250;  // <= 4 FPS
 constexpr uint32_t THERMAL_MIN_FRAME_INTERVAL_MS = 300; // <= 3.3 FPS
 constexpr uint32_t CAMERA_SEND_UNHEALTHY_MS = 2000;
 constexpr uint32_t MAX_RECONNECT_BACKOFF_MS = 30000;
+constexpr uint32_t AUDIO_MAX_RECONNECT_BACKOFF_MS = 5000;
+constexpr uint32_t AUDIO_FIRST_RECONNECT_BACKOFF_MS = 250;
 constexpr uint32_t CONNECTION_STABLE_RESET_MS = 30000;
 constexpr size_t CRITICAL_INTERNAL_BLOCK_BYTES = 6 * 1024;
 constexpr uint8_t CRITICAL_MEMORY_INTERVALS = 6;
@@ -268,6 +271,26 @@ const int CHUNK_MS        = 20;
 const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
+// Two 20 ms queue elements per WebSocket frame cuts the write cadence from
+// ~50/s to ~25/s. Disable at compile time for an immediate 640-byte rollback.
+#ifndef ENABLE_AUDIO_40MS_AGGREGATION
+#define ENABLE_AUDIO_40MS_AGGREGATION 0
+#endif
+
+// There is no acoustic echo canceller or calibrated speaker-to-microphone
+// transfer model on this hardware. Keep the entire experimental detector,
+// continuous TTS-time capture, and pre-roll storage compiled out by default;
+// enable only for supervised threshold/echo validation on the physical glasses.
+#ifndef ENABLE_LOCAL_BARGE_IN
+#define ENABLE_LOCAL_BARGE_IN 0
+#endif
+#if ENABLE_LOCAL_BARGE_IN
+constexpr uint32_t BARGE_IN_WARMUP_MS = 250;
+constexpr uint32_t BARGE_IN_MIN_RMS = 1400;
+constexpr uint16_t BARGE_IN_SUSTAINED_CHUNKS = 6;  // 120 ms
+constexpr uint16_t BARGE_IN_PREROLL_CHUNKS = 6;
+#endif
+
 // ===== Speaker (I2S TX → MAX98357A) =====
 #define I2S_SPK_BCLK D7
 #define I2S_SPK_LRC D8
@@ -328,10 +351,10 @@ static uint8_t* camThermalTxBuf = nullptr;
 typedef camera_fb_t* fb_ptr_t;
 QueueHandle_t qFrames;
 
-typedef struct {
+struct AudioChunk {
   size_t n;
   uint8_t data[BYTES_PER_CHUNK];
-} AudioChunk;
+};
 QueueHandle_t qAudio;
 
 #define TTS_QUEUE_DEPTH 64
@@ -391,8 +414,19 @@ volatile uint32_t imuSentPackets = 0;
 volatile uint32_t imuDroppedPackets = 0;
 volatile uint32_t micCapturedChunks = 0;
 volatile uint32_t micSentChunks = 0;
+volatile uint32_t micSentMessages = 0;
 volatile uint32_t speakerQueuedChunks = 0;
 volatile uint32_t speakerPlayedChunks = 0;
+volatile uint32_t audioConnectionGeneration = 0;
+volatile uint32_t lastAudPollMs = 0;
+volatile UBaseType_t ttsQueueHighWaterDepth = 0;
+volatile UBaseType_t ttsQueueLowWaterDepth = TTS_QUEUE_DEPTH;
+volatile uint32_t ttsStarvationEpisodes = 0;
+volatile uint32_t ttsStarvationDurationMs = 0;
+volatile uint32_t ttsStarvationMaxMs = 0;
+volatile uint32_t ttsStarvationStartedMs = 0;
+volatile uint32_t ttsStartedMs = 0;
+volatile bool ttsFirstI2SDiagnosticPending = false;
 constexpr size_t SEND_LATENCY_BUCKET_COUNT = 6;
 volatile uint32_t camSlowSuccessfulSendCount = 0;
 volatile uint32_t camMaxSuccessfulSendMs = 0;
@@ -418,6 +452,54 @@ AudioSocketOperationMaxima audioSocketOperationMaxima = {};
 volatile bool audioStartPending = false;
 volatile bool controlledRestartRequested = false;
 volatile bool setupComplete = false;
+#if ENABLE_LOCAL_BARGE_IN
+volatile bool bargeInControlPending = false;
+#endif
+
+portMUX_TYPE micLossMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t micLossEpoch = 0;
+volatile uint32_t micLossChunks = 0;
+volatile uint32_t micLossDurationEstimateMs = 0;
+volatile uint32_t micLossLastMs = 0;
+volatile bool micLossActive = false;
+const char* volatile micLossReason = "unknown";
+
+static uint32_t safeElapsedMs(uint32_t now, uint32_t timestamp) {
+  if (timestamp == 0) return 0;
+  uint32_t elapsed = now - timestamp;
+  // Normal millis() wrap remains valid for intervals shorter than 2^31 ms.
+  // A negative signed delta instead means another task published a timestamp
+  // just after this caller captured its `now` snapshot.
+  return (int32_t)elapsed < 0 ? 0 : elapsed;
+}
+
+static void recordMicLoss(uint32_t chunks, const char* reason) {
+  if (chunks == 0) return;
+  uint32_t now = millis();
+  portENTER_CRITICAL(&micLossMux);
+  if (!micLossActive || now - micLossLastMs > 200) {
+    micLossEpoch++;
+    if (micLossEpoch == 0) micLossEpoch = 1;
+    micLossChunks = 0;
+    micLossDurationEstimateMs = 0;
+    micLossActive = true;
+  }
+  micLossChunks += chunks;
+  micLossDurationEstimateMs = micLossChunks * CHUNK_MS;
+  micLossLastMs = now;
+  micLossReason = reason;
+  portEXIT_CRITICAL(&micLossMux);
+}
+
+static void resetMicQueue(const char* reason, bool countAsLoss) {
+  if (!qAudio) return;
+  UBaseType_t depth = uxQueueMessagesWaiting(qAudio);
+  if (depth && countAsLoss) {
+    micDroppedChunks += depth;
+    recordMicLoss(depth, reason);
+  }
+  xQueueReset(qAudio);
+}
 
 static size_t successfulSendLatencyBucket(uint32_t elapsedMs) {
   if (elapsedMs < 100) return 0;
@@ -600,7 +682,17 @@ static void recordLatencyPong(uint32_t sequence, uint64_t echoedEspUs) {
 }
 
 static void recordFirstSuccessfulTtsWrite(size_t wrote) {
-  if (wrote == 0 || !latencyFirstI2SPending) return;
+  if (wrote == 0) return;
+  if (ttsFirstI2SDiagnosticPending) {
+    ttsFirstI2SDiagnosticPending = false;
+    Serial.printf(
+        "[TTS-DIAG] event=first_i2s elapsed_ms=%lu queue_depth=%u "
+        "since_ws_poll_ms=%lu\n",
+        (unsigned long)safeElapsedMs(millis(), ttsStartedMs),
+        qTTS ? (unsigned)uxQueueMessagesWaiting(qTTS) : 0,
+        (unsigned long)safeElapsedMs(millis(), lastAudPollMs));
+  }
+  if (!latencyFirstI2SPending) return;
   int64_t firstWriteUs = esp_timer_get_time();
   uint32_t turnId = 0;
   uint32_t latencyMs = 0;
@@ -752,6 +844,15 @@ static uint32_t reconnectDelayMs(uint32_t attempt) {
   uint32_t shift = min(attempt, (uint32_t)5);
   uint32_t base = min(1000UL << shift, MAX_RECONNECT_BACKOFF_MS);
   return min(base + (uint32_t)random(0, 251), MAX_RECONNECT_BACKOFF_MS);
+}
+
+static uint32_t audioReconnectDelayMs(uint32_t attempt) {
+  uint32_t shift = min(attempt, (uint32_t)5);
+  uint32_t base = AUDIO_FIRST_RECONNECT_BACKOFF_MS << shift;
+  base = min(base, AUDIO_MAX_RECONNECT_BACKOFF_MS);
+  return min(
+      base + (uint32_t)random(0, 126),
+      AUDIO_MAX_RECONNECT_BACKOFF_MS);
 }
 
 static void closeCamSocket(const char* reason) {
@@ -1036,6 +1137,108 @@ static void updateLatencySpeechDetector(const uint8_t* data, size_t byteCount) {
   silenceStartedUs = 0;
 }
 
+#if ENABLE_LOCAL_BARGE_IN
+static uint32_t centeredPcmRms(const uint8_t* data, size_t byteCount) {
+  const int16_t* samples = reinterpret_cast<const int16_t*>(data);
+  size_t sampleCount = byteCount / sizeof(int16_t);
+  if (sampleCount == 0) return 0;
+  int64_t sum = 0;
+  uint64_t squares = 0;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    int32_t sample = samples[i];
+    sum += sample;
+    squares += (uint64_t)((int64_t)sample * sample);
+  }
+  int64_t centered = (int64_t)squares - (sum * sum) / (int64_t)sampleCount;
+  if (centered <= 0) return 0;
+  return (uint32_t)sqrt((double)centered / sampleCount);
+}
+
+static void observeTtsMicForBargeIn(const AudioChunk& chunk) {
+  static AudioChunk preRoll[BARGE_IN_PREROLL_CHUNKS];
+  static uint16_t preRollNext = 0;
+  static uint16_t preRollCount = 0;
+  static uint16_t candidateChunks = 0;
+  static uint32_t observedTtsStartMs = 0;
+  static uint32_t echoBaselineRms = 0;
+  static uint32_t lastRejectLogMs = 0;
+
+  if (observedTtsStartMs != ttsStartedMs) {
+    observedTtsStartMs = ttsStartedMs;
+    preRollNext = 0;
+    preRollCount = 0;
+    candidateChunks = 0;
+    echoBaselineRms = 0;
+  }
+
+  preRoll[preRollNext] = chunk;
+  preRollNext = (preRollNext + 1) % BARGE_IN_PREROLL_CHUNKS;
+  if (preRollCount < BARGE_IN_PREROLL_CHUNKS) preRollCount++;
+
+  uint32_t rms = centeredPcmRms(chunk.data, chunk.n);
+  uint32_t ttsAgeMs = millis() - observedTtsStartMs;
+  if (echoBaselineRms == 0) echoBaselineRms = rms;
+  uint32_t threshold = max(BARGE_IN_MIN_RMS, (echoBaselineRms * 5) / 2);
+
+  if (ttsAgeMs < BARGE_IN_WARMUP_MS) {
+    echoBaselineRms = (echoBaselineRms * 7 + rms) / 8;
+    candidateChunks = 0;
+    return;
+  }
+
+  if (rms >= threshold) {
+    candidateChunks++;
+  } else {
+    if (candidateChunks && millis() - lastRejectLogMs >= 1000) {
+      Serial.printf(
+          "[BARGE-IN] event=rejected reason=too_short energy=%lu duration_ms=%u "
+          "echo_baseline=%lu threshold=%lu tts_playing=1\n",
+          (unsigned long)rms,
+          (unsigned)(candidateChunks * CHUNK_MS),
+          (unsigned long)echoBaselineRms,
+          (unsigned long)threshold);
+      lastRejectLogMs = millis();
+    }
+    candidateChunks = 0;
+    // Adapt only below the candidate threshold so speech does not teach the
+    // echo guard to reject itself.
+    echoBaselineRms = (echoBaselineRms * 15 + rms) / 16;
+    return;
+  }
+
+  if (candidateChunks < BARGE_IN_SUSTAINED_CHUNKS) return;
+
+  resetMicQueue("barge_in", false);
+  UBaseType_t discardedTts = qTTS ? uxQueueMessagesWaiting(qTTS) : 0;
+  if (qTTS) xQueueReset(qTTS);
+  Serial.printf(
+      "[TTS-DIAG] event=queue_reset reason=local_barge_in discarded=%u\n",
+      (unsigned)discardedTts);
+  uint16_t first = (preRollNext + BARGE_IN_PREROLL_CHUNKS - preRollCount)
+                   % BARGE_IN_PREROLL_CHUNKS;
+  for (uint16_t i = 0; i < preRollCount; ++i) {
+    AudioChunk& buffered = preRoll[(first + i) % BARGE_IN_PREROLL_CHUNKS];
+    updateLatencySpeechDetector(buffered.data, buffered.n);
+    if (xQueueSend(qAudio, &buffered, 0) != pdPASS) {
+      micDroppedChunks++;
+      recordMicLoss(1, "barge_preroll");
+    }
+  }
+  bargeInControlPending = true;
+  tts_playing = false;
+  run_audio_stream = true;
+  Serial.printf(
+      "[BARGE-IN] event=detected energy=%lu duration_ms=%u echo_baseline=%lu "
+      "threshold=%lu tts_playing=1 action=interrupt preroll_chunks=%u\n",
+      (unsigned long)rms,
+      (unsigned)(candidateChunks * CHUNK_MS),
+      (unsigned long)echoBaselineRms,
+      (unsigned long)threshold,
+      (unsigned)preRollCount);
+  candidateChunks = 0;
+}
+#endif  // ENABLE_LOCAL_BARGE_IN
+
 void taskMicCapture(void*) {
   const int samplesPerChunk = BYTES_PER_CHUNK / 2;
 
@@ -1045,8 +1248,16 @@ void taskMicCapture(void*) {
   static AudioChunk discarded;
 
   for (;;) {
-    // Capture only while the audio WebSocket is ready and TTS is not playing.
+#if ENABLE_LOCAL_BARGE_IN
+    // PDM remains captured during TTS for bounded local interruption
+    // detection. Those samples are never uploaded unless the guarded barge-in
+    // state machine explicitly interrupts playback.
+    if (!run_audio_stream || !aud_ws_ready) {
+#else
+    // Conservative baseline: suspend PDM capture throughout TTS so microphone
+    // processing cannot contend with the lower-priority speaker task.
     if (!run_audio_stream || !aud_ws_ready || tts_playing) {
+#endif
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -1056,8 +1267,13 @@ void taskMicCapture(void*) {
     int sampleIndex = 0;
 
     while (sampleIndex < samplesPerChunk) {
-      // Stop promptly if the socket closes or speaker playback begins.
+#if ENABLE_LOCAL_BARGE_IN
+      // Stop promptly only if the audio transport itself closes.
+      if (!run_audio_stream || !aud_ws_ready) {
+#else
+      // Stop promptly if the transport closes or TTS begins.
       if (!run_audio_stream || !aud_ws_ready || tts_playing) {
+#endif
         sampleIndex = 0;
         break;
       }
@@ -1074,6 +1290,15 @@ void taskMicCapture(void*) {
     if (sampleIndex != samplesPerChunk) continue;
 
     micCapturedChunks++;
+
+#if ENABLE_LOCAL_BARGE_IN
+    if (tts_playing) {
+      observeTtsMicForBargeIn(chunk);
+      taskYIELD();
+      continue;
+    }
+#endif
+
     updateLatencySpeechDetector(chunk.data, chunk.n);
 
     static bool firstChunkLogged = false;
@@ -1089,9 +1314,11 @@ void taskMicCapture(void*) {
       recordMicQueueDepth(AUDIO_QUEUE_DEPTH);
       if (xQueueReceive(qAudio, &discarded, 0) == pdPASS) {
         micDroppedChunks++;
+        recordMicLoss(1, "queue_full");
       }
       if (xQueueSend(qAudio, &chunk, 0) != pdPASS) {
         micDroppedChunks++;
+        recordMicLoss(1, "queue_full");
       }
       if ((micDroppedChunks % 50) == 1) {
         Serial.printf("[MIC] queue full; dropped_oldest total=%lu\n",
@@ -1109,9 +1336,15 @@ void taskMicUpload(void*) {
   uint32_t connectedSinceMs = 0;
   uint32_t nextPingMs = 0;
   int64_t nextLatencyPingUs = 0;
+  bool audioGenerationQueueReset = false;
 
-  // Keep the 640-byte queue receive buffer out of aud_net's stack.
+  // Fixed queue receive buffer; experimental aggregation storage is absent
+  // from conservative builds.
   static AudioChunk chunk;
+#if ENABLE_AUDIO_40MS_AGGREGATION
+  static AudioChunk secondChunk;
+  static uint8_t aggregate[BYTES_PER_CHUNK * 2];
+#endif
 
   for (;;) {
     if (!setupComplete) {
@@ -1122,7 +1355,7 @@ void taskMicUpload(void*) {
     if (controlledRestartRequested) {
       run_audio_stream = false;
       audioStartPending = false;
-      if (qAudio) xQueueReset(qAudio);
+      resetMicQueue("controlled_restart", false);
 
       if (aud_ws_ready) {
         aud_ws_ready = false;
@@ -1138,29 +1371,34 @@ void taskMicUpload(void*) {
     if (!aud_ws_ready) {
       run_audio_stream = false;
       audioStartPending = false;
-      if (qAudio) xQueueReset(qAudio);
+      if (!audioGenerationQueueReset) {
+        resetMicQueue("disconnect_reset", true);
+        audioGenerationQueueReset = true;
+      }
 
       if (aud_ws_closed_pending_reconnect) {
         aud_ws_closed_pending_reconnect = false;
-        audReconnectAttempts++;
-        nextReconnectMs = now + reconnectDelayMs(audReconnectAttempts - 1);
+        nextReconnectMs = now + audioReconnectDelayMs(0);
       }
 
       if ((int32_t)(now - nextReconnectMs) >= 0) {
-        Serial.printf("[WS-AUD] reconnect attempt=%lu heap=%u max=%u stack=%u\n",
-                      (unsigned long)(audReconnectAttempts + 1),
-                      ESP.getFreeHeap(),
-                      ESP.getMaxAllocHeap(),
-                      uxTaskGetStackHighWaterMark(nullptr));
+        uint32_t attempt = audReconnectAttempts + 1;
+        if (WiFi.status() != WL_CONNECTED) {
+          uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
+          Serial.printf(
+              "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=wifi elapsed_ms=0 "
+              "result=wait backoff_ms=%lu\n",
+              (unsigned long)attempt, WiFi.RSSI(), (unsigned long)waitMs);
+          WiFi.reconnect();
+          audReconnectAttempts++;
+          nextReconnectMs = millis() + waitMs;
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
 
         uint32_t started = millis();
         bool ok = wsAud.connectSecure(SERVER_HOST, SERVER_PORT, AUD_WS_PATH);
         uint32_t elapsed = millis() - started;
-
-        Serial.printf("[WS-AUD] connect returned=%d elapsed=%lu stack=%u\n",
-                      ok ? 1 : 0,
-                      (unsigned long)elapsed,
-                      uxTaskGetStackHighWaterMark(nullptr));
 
         if (ok) {
           connectedSinceMs = millis();
@@ -1169,24 +1407,31 @@ void taskMicUpload(void*) {
           nextLatencyPingUs =
               esp_timer_get_time() + LATENCY_PING_INTERVAL_US;
           audioStartPending = true;
-          Serial.printf("[WS-AUD] connected in %lu ms\n",
-                        (unsigned long)elapsed);
+          Serial.printf(
+              "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=websocket "
+              "elapsed_ms=%lu result=connected backoff_ms=0\n",
+              (unsigned long)attempt, WiFi.RSSI(), (unsigned long)elapsed);
         } else {
           audReconnectAttempts++;
-          uint32_t waitMs = reconnectDelayMs(audReconnectAttempts - 1);
+          uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
           nextReconnectMs = millis() + waitMs;
-          Serial.printf("[WS-AUD] reconnect failed; retry_ms=%lu\n",
-                        (unsigned long)waitMs);
+          Serial.printf(
+              "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=websocket "
+              "elapsed_ms=%lu result=failed backoff_ms=%lu\n",
+              (unsigned long)attempt, WiFi.RSSI(), (unsigned long)elapsed,
+              (unsigned long)waitMs);
         }
       }
 
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
+    audioGenerationQueueReset = false;
 
     // This task is the sole owner of wsAud.
     uint32_t pollStarted = millis();
     wsAud.poll();
+    lastAudPollMs = millis();
     recordAudioSocketOperationMax(
         &audioSocketOperationMaxima.pollMs, millis() - pollStarted);
 
@@ -1194,7 +1439,7 @@ void taskMicUpload(void*) {
     if (!aud_ws_ready) {
       run_audio_stream = false;
       audioStartPending = false;
-      if (qAudio) xQueueReset(qAudio);
+      resetMicQueue("poll_disconnect", true);
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -1214,13 +1459,17 @@ void taskMicUpload(void*) {
           &audioSocketOperationMaxima.controlMs, startElapsed);
 
       if (!startOk) {
-        Serial.printf("[WS-AUD] START send failed elapsed_ms=%lu\n",
-                      (unsigned long)startElapsed);
+        uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
+        Serial.printf(
+            "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=start/control "
+            "elapsed_ms=%lu result=failed backoff_ms=%lu\n",
+            (unsigned long)(audReconnectAttempts + 1), WiFi.RSSI(),
+            (unsigned long)startElapsed, (unsigned long)waitMs);
         run_audio_stream = false;
         audioStartPending = false;
         aud_ws_ready = false;
         wsAud.close();
-        if (qAudio) xQueueReset(qAudio);
+        resetMicQueue("start_failed", true);
         continue;
       }
       recordAudSuccessfulSend(startElapsed);
@@ -1232,9 +1481,20 @@ void taskMicUpload(void*) {
       run_audio_stream = true;
       audLastTrafficMs = millis();
       nextPingMs = audLastTrafficMs + HEARTBEAT_INTERVAL_MS;
-      Serial.println("[WS-AUD] START sent; microphone enabled");
+      Serial.printf(
+          "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=start/control "
+          "elapsed_ms=%lu result=started backoff_ms=0 generation=%lu\n",
+          (unsigned long)(audReconnectAttempts + 1), WiFi.RSSI(),
+          (unsigned long)startElapsed,
+          (unsigned long)audioConnectionGeneration);
     }
 
+#if ENABLE_LOCAL_BARGE_IN
+    if (bargeInControlPending) {
+      if (sendAudioTextTimed("BARGE_IN", AUDIO_SOCKET_OPERATION_CONTROL))
+        bargeInControlPending = false;
+    }
+#endif
     uint32_t speechStartTurnId = 0;
     bool sendSpeechStart = false;
     portENTER_CRITICAL(&latencyMux);
@@ -1342,7 +1602,7 @@ void taskMicUpload(void*) {
         audioStartPending = false;
         aud_ws_ready = false;
         wsAud.close();
-        if (qAudio) xQueueReset(qAudio);
+        resetMicQueue("heartbeat_failed", true);
         continue;
       }
       nextPingMs = millis() + HEARTBEAT_INTERVAL_MS;
@@ -1369,6 +1629,7 @@ void taskMicUpload(void*) {
                  (unsigned long)lateSpeechStartTurnId);
         if (!sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
           micDroppedChunks++;
+          recordMicLoss(1, "speech_marker");
           continue;
         }
         portENTER_CRITICAL(&latencyMux);
@@ -1389,6 +1650,7 @@ void taskMicUpload(void*) {
                  (unsigned long)lateSpeechEndTurnId);
         if (!sendAudioTextTimed(message, AUDIO_SOCKET_OPERATION_SPEECH_MARKER)) {
           micDroppedChunks++;
+          recordMicLoss(1, "speech_marker");
           continue;
         }
         portENTER_CRITICAL(&latencyMux);
@@ -1397,6 +1659,27 @@ void taskMicUpload(void*) {
         portEXIT_CRITICAL(&latencyMux);
       }
 
+      const uint8_t* sendData = chunk.data;
+      size_t sendBytes = chunk.n;
+#if ENABLE_AUDIO_40MS_AGGREGATION
+      memcpy(aggregate, chunk.data, chunk.n);
+      if (run_audio_stream && !tts_playing && aud_ws_ready &&
+          xQueueReceive(qAudio, &secondChunk, pdMS_TO_TICKS(CHUNK_MS)) == pdPASS) {
+        if (run_audio_stream && !tts_playing && aud_ws_ready &&
+            chunk.n + secondChunk.n <= sizeof(aggregate)) {
+          memcpy(aggregate + chunk.n, secondChunk.data, secondChunk.n);
+          sendBytes += secondChunk.n;
+        } else {
+          // A gate/connection transition owns the boundary. Never carry a
+          // partial aggregate into the next TTS or socket generation.
+          continue;
+        }
+      }
+      sendData = aggregate;
+#endif
+
+      if (!run_audio_stream || tts_playing || !aud_ws_ready) continue;
+
       uint32_t heapBefore = ESP.getFreeHeap();
       size_t largestBefore = heap_caps_get_largest_free_block(
           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1404,19 +1687,21 @@ void taskMicUpload(void*) {
       uint32_t capturedBefore = micCapturedChunks;
       uint32_t droppedBefore = micDroppedChunks;
       uint32_t audioStarted = millis();
-      bool audioOk = wsAud.sendBinary((const char*)chunk.data, chunk.n);
+      bool audioOk = wsAud.sendBinary((const char*)sendData, sendBytes);
       uint32_t audioElapsed = millis() - audioStarted;
 
       if (!audioOk) {
         Serial.printf("[MIC] upload failed bytes=%u elapsed_ms=%lu; reconnecting\n",
-                      (unsigned)chunk.n,
+                      (unsigned)sendBytes,
                       (unsigned long)audioElapsed);
-        micDroppedChunks++;
+        uint32_t lostChunks = max((size_t)1, sendBytes / BYTES_PER_CHUNK);
+        micDroppedChunks += lostChunks;
+        recordMicLoss(lostChunks, "send_failed");
         run_audio_stream = false;
         audioStartPending = false;
         aud_ws_ready = false;
         wsAud.close();
-        if (qAudio) xQueueReset(qAudio);
+        resetMicQueue("send_failed", true);
         continue;
       }
       recordMicPcmSuccessfulSend(audioElapsed);
@@ -1426,30 +1711,38 @@ void taskMicUpload(void*) {
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         UBaseType_t queueAfter = uxQueueMessagesWaiting(qAudio);
         Serial.printf(
-            "[MIC-SLOW] bytes=%u elapsed_ms=%lu q=%u/%u qHigh=%u "
-            "heap=%u/%u largest=%u/%u rssi=%d capturedDuring=%lu droppedDuring=%lu\n",
-                      (unsigned)chunk.n,
+            "[MIC-SLOW] bytes=%u elapsed_ms=%lu rssi=%d capturedDuring=%lu "
+            "sentDuring=%lu droppedDuring=%lu q=%u/%u qHWM=%u tts_playing=%d "
+            "wsAud_connected=%d free_heap=%u/%u largest_internal_block=%u/%u "
+            "since_poll_ms=%lu\n",
+                      (unsigned)sendBytes,
                       (unsigned long)audioElapsed,
+                      WiFi.RSSI(),
+                      (unsigned long)(micCapturedChunks - capturedBefore),
+                      (unsigned long)max((size_t)1, sendBytes / BYTES_PER_CHUNK),
+                      (unsigned long)(micDroppedChunks - droppedBefore),
                       (unsigned)queueBefore,
                       (unsigned)queueAfter,
                       (unsigned)readMicQueueHighWaterDepth(),
+                      tts_playing ? 1 : 0,
+                      aud_ws_ready ? 1 : 0,
                       (unsigned)heapBefore,
                       (unsigned)heapAfter,
                       (unsigned)largestBefore,
                       (unsigned)largestAfter,
-                      WiFi.RSSI(),
-                      (unsigned long)(micCapturedChunks - capturedBefore),
-                      (unsigned long)(micDroppedChunks - droppedBefore));
+                      (unsigned long)safeElapsedMs(millis(), lastAudPollMs));
       }
 
       lastMicSendMs = millis();
       audLastTrafficMs = lastMicSendMs;
-      micSentChunks++;
+      uint32_t chunksInMessage = max((size_t)1, sendBytes / BYTES_PER_CHUNK);
+      micSentChunks += chunksInMessage;
+      micSentMessages++;
 
       static bool firstAudioChunkSent = false;
       if (!firstAudioChunkSent) {
         Serial.printf("[MIC] first chunk sent bytes=%u elapsed=%lu\n",
-                      (unsigned)chunk.n,
+                      (unsigned)sendBytes,
                       (unsigned long)audioElapsed);
         firstAudioChunkSent = true;
       }
@@ -1872,10 +2165,30 @@ void taskTTSPlay(void*){
     if (!tts_playing){ vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     TTSChunk ch;
     if (xQueueReceive(qTTS, &ch, pdMS_TO_TICKS(50)) == pdPASS){
+      if (ttsStarvationStartedMs) {
+        uint32_t duration = millis() - ttsStarvationStartedMs;
+        ttsStarvationDurationMs += duration;
+        if (duration > ttsStarvationMaxMs) ttsStarvationMaxMs = duration;
+        Serial.printf(
+            "[TTS-DIAG] event=starvation_end duration_ms=%lu queue_depth=%u\n",
+            (unsigned long)duration,
+            qTTS ? (unsigned)uxQueueMessagesWaiting(qTTS) : 0);
+        ttsStarvationStartedMs = 0;
+      }
+      UBaseType_t remaining = qTTS ? uxQueueMessagesWaiting(qTTS) : 0;
+      if (remaining < ttsQueueLowWaterDepth) ttsQueueLowWaterDepth = remaining;
       if (ch.n == 0) {                     // TTS:END sentinel from server
-        Serial.println("[TTS] playback complete");
+        Serial.printf(
+            "[TTS-DIAG] event=end elapsed_ms=%lu queue_hwm=%u queue_low=%u "
+            "starvation_episodes=%lu starvation_ms=%lu starvation_max_ms=%lu\n",
+            (unsigned long)safeElapsedMs(millis(), ttsStartedMs),
+            (unsigned)ttsQueueHighWaterDepth,
+            (unsigned)ttsQueueLowWaterDepth,
+            (unsigned long)ttsStarvationEpisodes,
+            (unsigned long)ttsStarvationDurationMs,
+            (unsigned long)ttsStarvationMaxMs);
         tts_playing = false;
-        run_audio_stream = true;           // playback truly finished — un-mute the mic
+        run_audio_stream = true;
         first_chunk_pending = true;        // next session should log its first chunk again
         continue;
       }
@@ -1926,11 +2239,25 @@ void taskTTSPlay(void*){
       }
     } else if (tts_playing) {
       ttsStarveEvents++;
+      if (!ttsStarvationStartedMs) {
+        ttsStarvationStartedMs = millis();
+        ttsStarvationEpisodes++;
+        Serial.printf(
+            "[TTS-DIAG] event=starvation_start queue_depth=0 since_ws_poll_ms=%lu\n",
+            (unsigned long)safeElapsedMs(millis(), lastAudPollMs));
+      }
     }
   }
 }
 
-inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
+inline void tts_reset_queue(const char* reason){
+  UBaseType_t depth = qTTS ? uxQueueMessagesWaiting(qTTS) : 0;
+  if (qTTS) xQueueReset(qTTS);
+  Serial.printf(
+      "[TTS-DIAG] event=queue_reset reason=%s discarded=%u since_ws_poll_ms=%lu\n",
+      reason, (unsigned)depth,
+      (unsigned long)safeElapsedMs(millis(), lastAudPollMs));
+}
 
 // ====================================================================
 // IMU (MPU-6050 over I2C, bare Wire) 50 Hz via UDP
@@ -2473,15 +2800,22 @@ void setup() {
   wsAud.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  {
       aud_ws_ready = true;
+      audioConnectionGeneration++;
+      resetMicQueue("connection_generation", false);
+      portENTER_CRITICAL(&micLossMux);
+      micLossActive = false;
+      portEXIT_CRITICAL(&micLossMux);
       audLastTrafficMs = millis();
-      Serial.println("[WS-AUD] open");
+      Serial.printf("[WS-AUD] open generation=%lu\n",
+                    (unsigned long)audioConnectionGeneration);
     }
     if (ev == WebsocketsEvent::ConnectionClosed)  {
       aud_ws_ready = false;
       aud_ws_closed_pending_reconnect = true;
       Serial.println("[WS-AUD] closed");
-      tts_reset_queue();   // orphaned audio from a turn whose socket is gone
+      tts_reset_queue("socket_closed");
       tts_playing = false;
+      run_audio_stream = false;
       stopStreamWav();
     }
     if (ev == WebsocketsEvent::GotPing || ev == WebsocketsEvent::GotPong)
@@ -2505,7 +2839,7 @@ void setup() {
             millis() - latencyPongStarted);
       } else if (s == "RESTART"){
         run_audio_stream = false;
-        xQueueReset(qAudio);
+        resetMicQueue("server_restart", false);
         audioStartPending = true; // owner task sends START after callback returns
       } else if (s == "TTS:START" || s.startsWith("TTS:START:")) {
         uint32_t turnId = 0;
@@ -2517,11 +2851,27 @@ void setup() {
         latencyFirstI2SPending =
             latencySpeechEndUs > 0 && turnId == latencySpeechEndTurnId;
         portEXIT_CRITICAL(&latencyMux);
-        run_audio_stream = false;   // mute mic during playback: no echo, no wsAud contention
-        xQueueReset(qAudio);        // drop any mic frames already captured
+#if ENABLE_LOCAL_BARGE_IN
+        // Experimental mode keeps PDM capture alive for local interruption.
+        resetMicQueue("tts_gate", false);
+#else
+        // Conservative baseline: stop capture before clearing queued speech.
+        run_audio_stream = false;
+        resetMicQueue("tts_gate", false);
+#endif
         tts_playing = true;
-        Serial.printf("[TTS] START received turn_id=%lu tts_playing=true\n",
-                      (unsigned long)turnId);
+        ttsStartedMs = millis();
+        ttsFirstI2SDiagnosticPending = true;
+        ttsQueueHighWaterDepth = qTTS ? uxQueueMessagesWaiting(qTTS) : 0;
+        ttsQueueLowWaterDepth = TTS_QUEUE_DEPTH;
+        ttsStarvationStartedMs = 0;
+        Serial.printf(
+            "[TTS-DIAG] event=start turn_id=%lu queue_depth=%u "
+            "barge_in_enabled=%d since_ws_poll_ms=%lu\n",
+            (unsigned long)turnId,
+            qTTS ? (unsigned)uxQueueMessagesWaiting(qTTS) : 0,
+            ENABLE_LOCAL_BARGE_IN,
+            (unsigned long)safeElapsedMs(millis(), lastAudPollMs));
       } else if (s == "TTS:END" || s.startsWith("TTS:END:")) {
         Serial.println("[TTS] END received, sentinel queued");
         if (!qTTS) {
@@ -2548,10 +2898,10 @@ void setup() {
         // Genuine barge-in / reset — the one case where discarding queued
         // audio is correct. TTS:START must not do this: it would wipe the
         // tail of the previous response on a fast follow-up.
-        tts_reset_queue();
+        tts_reset_queue("server_reset");
         tts_playing = false;
-        run_audio_stream = true;   // no sentinel will run, so un-mute here
-        Serial.println("[TTS] RESET received — queue cleared");
+        run_audio_stream = true;
+        Serial.println("[TTS-DIAG] event=reset source=server");
       }
     } else if (msg.isBinary()) {
       if (!tts_playing) { ttsDroppedNotPlaying++; return; }
@@ -2569,6 +2919,8 @@ void setup() {
       lastSpeakerPacketMs = millis();
       if (queued_ok) {
         speakerQueuedChunks++;
+        UBaseType_t depth = uxQueueMessagesWaiting(qTTS);
+        if (depth > ttsQueueHighWaterDepth) ttsQueueHighWaterDepth = depth;
         if ((speakerQueuedChunks % 25) == 1)
           Serial.printf("[TTS] queued=%lu depth=%u\n",
                         (unsigned long)speakerQueuedChunks,
@@ -2800,12 +3152,12 @@ void loop() {
       (unsigned long)ttsDroppedChunks,
       (unsigned long)ttsStarveEvents, (unsigned long)ttsDroppedNotPlaying,
       (unsigned long)camReconnectAttempts, (unsigned long)audReconnectAttempts,
-      lastCameraSendMs ? (unsigned long)(now - lastCameraSendMs) : 0UL,
-      lastThermalSendMs ? (unsigned long)(now - lastThermalSendMs) : 0UL,
-      lastMicSendMs ? (unsigned long)(now - lastMicSendMs) : 0UL,
-      lastSpeakerPacketMs ? (unsigned long)(now - lastSpeakerPacketMs) : 0UL,
-      camLastTrafficMs ? (unsigned long)(now - camLastTrafficMs) : 0UL,
-      audLastTrafficMs ? (unsigned long)(now - audLastTrafficMs) : 0UL,
+      (unsigned long)safeElapsedMs(now, lastCameraSendMs),
+      (unsigned long)safeElapsedMs(now, lastThermalSendMs),
+      (unsigned long)safeElapsedMs(now, lastMicSendMs),
+      (unsigned long)safeElapsedMs(now, lastSpeakerPacketMs),
+      (unsigned long)safeElapsedMs(now, camLastTrafficMs),
+      (unsigned long)safeElapsedMs(now, audLastTrafficMs),
       (unsigned)swCamCap, (unsigned)swCamNet, (unsigned)swMicCap, (unsigned)swAudNet,
       (unsigned)swThermal, (unsigned)swTts, (unsigned)swImu, (unsigned)swHttp);
 
@@ -2851,6 +3203,29 @@ void loop() {
       (unsigned long)audioOperationMaxima.controlMs,
       (unsigned long)audioOperationMaxima.latencyMs,
       (unsigned long)audioOperationMaxima.speechMarkerMs);
+
+  Serial.printf(
+      "[AUDIO-RELIABILITY] generation=%lu sentMessages=%lu sentPcmChunks=%lu "
+      "lossEpoch=%lu lossChunks=%lu lossDurationMs=%lu lossReason=%s "
+      "tts=%d ttsQHWM=%u ttsQLow=%u speakerStarvationEpisodes=%lu "
+      "speakerStarvationMs=%lu speakerStarvationMaxMs=%lu sinceWsPollMs=%lu "
+      "aggregate40ms=%d bargeInEnabled=%d\n",
+      (unsigned long)audioConnectionGeneration,
+      (unsigned long)micSentMessages,
+      (unsigned long)micSentChunks,
+      (unsigned long)micLossEpoch,
+      (unsigned long)micLossChunks,
+      (unsigned long)micLossDurationEstimateMs,
+      micLossReason,
+      tts_playing ? 1 : 0,
+      (unsigned)ttsQueueHighWaterDepth,
+      (unsigned)ttsQueueLowWaterDepth,
+      (unsigned long)ttsStarvationEpisodes,
+      (unsigned long)ttsStarvationDurationMs,
+      (unsigned long)ttsStarvationMaxMs,
+      (unsigned long)safeElapsedMs(now, lastAudPollMs),
+      ENABLE_AUDIO_40MS_AGGREGATION,
+      ENABLE_LOCAL_BARGE_IN);
 
   if (internalLargest < CRITICAL_INTERNAL_BLOCK_BYTES) criticalMemoryCount++;
   else criticalMemoryCount = 0;

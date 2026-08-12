@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import json
 import math
+import re
 import struct
 import threading
 import time
@@ -20,6 +22,187 @@ THERMAL_PAYLOAD_BYTES = 24 * 32 * 4
 MAX_JPEG_PAYLOAD_BYTES = 300 * 1024
 IMU_STRUCT = struct.Struct("<IIffffff")
 STATUS_STRUCT = struct.Struct("<IIII")
+PCM_20MS_BYTES_16K_MONO = 640
+
+
+def parse_mic_loss_message(raw: str) -> dict | None:
+    """Validate the compact, credential-free device MIC_LOSS control frame."""
+    if not raw.startswith("{") or len(raw) > 384:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "MIC_LOSS":
+        return None
+    try:
+        epoch = int(payload["epoch"])
+        chunks = int(payload["chunks"])
+        duration_ms = int(payload["duration_ms"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (1 <= epoch <= 0xFFFFFFFF):
+        return None
+    if not (1 <= chunks <= 1_000_000):
+        return None
+    if not (0 <= duration_ms <= 86_400_000):
+        return None
+    reason = str(payload.get("reason") or "unknown")
+    if not re.fullmatch(r"[a-z0-9_-]{1,32}", reason):
+        reason = "invalid"
+    return {
+        "epoch": epoch,
+        "chunks": chunks,
+        "duration_ms": duration_ms,
+        "reason": reason,
+    }
+
+
+def append_transcription_delta(buffer: list[str], text: str) -> str:
+    """Append incremental or cumulative transcription without echoing overlap."""
+    current = "".join(buffer)
+    if not current:
+        buffer.append(text)
+        return text
+    if text.startswith(current):
+        buffer[:] = [text]
+        return text
+    if len(text) >= 8 and (text == current or current.endswith(text)):
+        return current
+    max_overlap = min(len(current), len(text))
+    overlap = 0
+    for size in range(max_overlap, 0, -1):
+        if current.endswith(text[:size]):
+            overlap = size
+            break
+    buffer.append(text[overlap:])
+    return current + text[overlap:]
+
+
+class AudioFreshnessTracker:
+    """Thread-safe, monotonic audio transport state for diagnostics.
+
+    WebSocket connectivity and PCM freshness are deliberately independent:
+    an open socket with no recent PCM is stale only while the device says the
+    microphone is expected to be uploading. TTS and startup gates are exposed
+    as intentional suppression instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        stale_after_ms: float = 500.0,
+        recent_window_sec: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if stale_after_ms <= 0 or recent_window_sec <= 0:
+            raise ValueError("audio freshness thresholds must be positive")
+        self.stale_after_ms = float(stale_after_ms)
+        self.recent_window_sec = float(recent_window_sec)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._connected = False
+        self._connected_at: float | None = None
+        self._last_pcm: float | None = None
+        self._generation = 0
+        self._expected_streaming = False
+        self._gate_reason = "disconnected"
+        self._recent_pcm: deque[tuple[float, int]] = deque()
+        self._last_loss: dict | None = None
+
+    def connect(self) -> int:
+        now = self.clock()
+        with self._lock:
+            self._generation += 1
+            self._connected = True
+            self._connected_at = now
+            self._last_pcm = None
+            self._expected_streaming = False
+            self._gate_reason = "socket_starting"
+            self._recent_pcm.clear()
+            self._last_loss = None
+            return self._generation
+
+    def disconnect(self) -> None:
+        with self._lock:
+            self._connected = False
+            self._connected_at = None
+            self._expected_streaming = False
+            self._gate_reason = "disconnected"
+            self._recent_pcm.clear()
+
+    def set_gate(self, *, expected_streaming: bool, reason: str) -> None:
+        with self._lock:
+            if not self._connected:
+                return
+            self._expected_streaming = bool(expected_streaming)
+            self._gate_reason = reason or (
+                "streaming" if expected_streaming else "suppressed"
+            )
+
+    def record_pcm(self, byte_count: int) -> None:
+        now = self.clock()
+        pcm_chunks = max(
+            1,
+            (max(0, int(byte_count)) + PCM_20MS_BYTES_16K_MONO - 1)
+            // PCM_20MS_BYTES_16K_MONO,
+        )
+        with self._lock:
+            if not self._connected:
+                return
+            self._last_pcm = now
+            self._recent_pcm.append((now, pcm_chunks))
+            self._prune_locked(now)
+
+    def record_loss(self, loss: dict) -> None:
+        with self._lock:
+            if not self._connected:
+                return
+            self._last_loss = {
+                "epoch": int(loss["epoch"]),
+                "chunks": int(loss["chunks"]),
+                "duration_ms": int(loss["duration_ms"]),
+                "reason": str(loss.get("reason") or "unknown"),
+                "connection_generation": self._generation,
+            }
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - self.recent_window_sec
+        while self._recent_pcm and self._recent_pcm[0][0] < cutoff:
+            self._recent_pcm.popleft()
+
+    def snapshot(self) -> dict:
+        now = self.clock()
+        with self._lock:
+            self._prune_locked(now)
+            pcm_age_ms = (
+                None
+                if self._last_pcm is None
+                else round(max(0.0, now - self._last_pcm) * 1000.0, 1)
+            )
+            if not self._connected:
+                state = "disconnected"
+            elif not self._expected_streaming:
+                state = "suppressed"
+            elif pcm_age_ms is not None and pcm_age_ms <= self.stale_after_ms:
+                state = "fresh"
+            else:
+                state = "stale"
+            return {
+                "state": state,
+                "audio_socket_connected": self._connected,
+                "audio_last_pcm_monotonic": self._last_pcm,
+                "audio_pcm_age_ms": pcm_age_ms,
+                "audio_connection_generation": self._generation,
+                "audio_recent_chunk_count": sum(
+                    count for _timestamp, count in self._recent_pcm
+                ),
+                "audio_expected_streaming": self._expected_streaming,
+                "audio_gate_reason": self._gate_reason,
+                "stale_after_ms": self.stale_after_ms,
+                "recent_window_ms": round(self.recent_window_sec * 1000.0),
+                "last_mic_loss": copy.deepcopy(self._last_loss),
+            }
 
 
 @dataclass(frozen=True)
@@ -67,11 +250,18 @@ class LatencyTracker:
         self,
         history_size: int = 200,
         clock: Callable[[], int] = time.monotonic_ns,
+        on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
         if history_size < 1:
             raise ValueError("history_size must be at least 1")
         self.history_size = history_size
         self.clock = clock
+        # Optional fire-and-forget hook for external event export (e.g. the
+        # research platform's research_exporter.publish_event). Injected
+        # rather than imported so this module stays dependency-free — see
+        # the module docstring. Never awaited, always guarded so a broken
+        # hook can never affect turn tracking itself.
+        self._on_event = on_event
         self._lock = threading.Lock()
         self._history: deque[dict] = deque(maxlen=history_size)
         self._active: dict | None = None
@@ -86,6 +276,14 @@ class LatencyTracker:
             "p95_ms": None,
         }
         self._latest_device_metrics: dict | None = None
+
+    def _emit_event(self, event_type: str, fields: dict) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event_type, fields)
+        except Exception:
+            pass
 
     @property
     def active_turn_id(self) -> int | None:
@@ -103,6 +301,8 @@ class LatencyTracker:
             "tts_bytes": 0,
             "max_queue_depth": 0,
             "device_metrics": None,
+            "audio_integrity_degraded": False,
+            "mic_loss": None,
         }
 
     def start_turn(
@@ -111,14 +311,19 @@ class LatencyTracker:
         now_ns: int | None = None,
     ) -> int:
         now = self.clock() if now_ns is None else now_ns
+        created = False
         with self._lock:
             if self._active is not None:
-                return self._active["turn_id"]
-            if turn_id is None or turn_id <= 0:
-                turn_id = self._next_turn_id
-            self._next_turn_id = max(self._next_turn_id, turn_id + 1)
-            self._active = self._new_turn(turn_id, now)
-            return turn_id
+                turn_id = self._active["turn_id"]
+            else:
+                if turn_id is None or turn_id <= 0:
+                    turn_id = self._next_turn_id
+                self._next_turn_id = max(self._next_turn_id, turn_id + 1)
+                self._active = self._new_turn(turn_id, now)
+                created = True
+        if created:
+            self._emit_event("USER_TURN", {"turn_id": turn_id})
+        return turn_id
 
     def ensure_turn(self, now_ns: int | None = None) -> int:
         active = self.active_turn_id
@@ -178,6 +383,22 @@ class LatencyTracker:
                 self._active["max_queue_depth"], queue_depth
             )
             return True
+
+    def mark_audio_integrity_degraded(
+        self,
+        loss: dict,
+        turn_id: int | None = None,
+    ) -> bool:
+        with self._lock:
+            if self._active is None:
+                return False
+            if turn_id is not None and self._active["turn_id"] != turn_id:
+                return False
+            self._active["audio_integrity_degraded"] = True
+            self._active["mic_loss"] = copy.deepcopy(loss)
+            active_turn_id = self._active["turn_id"]
+        self._emit_event("MIC_LOSS", {"turn_id": active_turn_id, "mic_loss": loss})
+        return True
 
     def mark_tts_sent(self, byte_count: int, turn_id: int | None = None) -> bool:
         now = self.clock()
@@ -252,7 +473,9 @@ class LatencyTracker:
                 self._completed_count += 1
             else:
                 self._interrupted_count += 1
-            return self._with_derived(finished)
+            result = self._with_derived(finished)
+        self._emit_event("AI_RESPONSE", {"turn_id": finished["turn_id"], "status": status})
+        return result
 
     def update_device_latency(self, turn_id: int, latency_ms: float) -> bool:
         metrics = {

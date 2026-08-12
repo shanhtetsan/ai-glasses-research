@@ -36,6 +36,7 @@
   .chip.ok{color:var(--ok); border-color:rgba(126,231,135,.4); background:rgba(126,231,135,.08)}
   .chip.err{color:var(--err); border-color:rgba(255,128,128,.4); background:rgba(255,128,128,.08)}
   .chip.warn{color:var(--warn); border-color:rgba(255,215,105,.4); background:rgba(255,215,105,.08)}
+  .chip.neutral{color:#8bb9ff; border-color:rgba(139,185,255,.4); background:rgba(31,111,235,.1)}
   .chip.mono{font-family:var(--mono)}
   .topbtns{display:flex; gap:6px}
   button{
@@ -484,7 +485,8 @@
 
       // main.js owns the three-state camera badge because backend socket
       // connectivity alone does not prove browser frames are rendering.
-      setChip(q('asrStatus'), !!h.sockets.audio, 'audio');
+      // static/main.js owns the four-state audio badge. Health refreshes must
+      // not overwrite intentional TTS suppression or upstream PCM staleness.
       const tAge = h.latest_age_sec && h.latest_age_sec.thermal;
       setChip(q('chipThermal'), tAge !== null && tAge !== undefined && tAge < 5, 'thermal');
 

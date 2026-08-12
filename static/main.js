@@ -9,6 +9,7 @@ import {
   RGB_VIEWER_STATE,
   RgbViewerFreshness,
 } from './rgb_viewer_freshness.mjs';
+import {audioBadgePresentation} from './audio_freshness.mjs';
 
 // ================= Camera + ASR =================
 (() => {
@@ -213,11 +214,6 @@ import {
     container.scrollTop = container.scrollHeight;
   }
 
-  function setBadge(el, ok, text){
-    el.textContent = text;
-    el.className = 'badge ' + (ok? 'ok' : 'err');
-  }
-
   function navLabelAndText(raw) {
     const t = raw.startsWith('[NAV]') ? raw.substring(5).trim() : raw;
     const crossHints = ['crosswalk', 'crossing', 'red light', 'green light', 'traffic light', 'zebra'];
@@ -254,7 +250,24 @@ import {
   const RGB_BACKEND_CHECK_MS = 1000;
   let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
   let cameraGeneration = 0;
-  let freshnessTimer, backendFreshnessTimer, perceptionPollTimer, perceptionRenderTimer;
+  let freshnessTimer, backendFreshnessTimer, audioFreshnessTimer;
+  let perceptionPollTimer, perceptionRenderTimer;
+
+  function setAudioState(snapshot){
+    const badge = audioBadgePresentation(snapshot);
+    $asrStatus.className = badge.className;
+    $asrStatus.textContent = badge.text;
+  }
+
+  async function refreshAudioFreshness(){
+    try {
+      const response = await fetch('/api/audio-freshness', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      setAudioState(await response.json());
+    } catch (_error) {
+      setAudioState({state: 'recovering'});
+    }
+  }
 
   function setCameraState(snapshot){
     if (snapshot.state === RGB_VIEWER_STATE.FRESH) {
@@ -454,10 +467,8 @@ import {
     try{ if (wsUI) wsUI.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsUI = new WebSocket(`${proto}://${location.host}/ws_ui`);
-    setBadge($asrStatus, false, 'ASR: connecting…');
-    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'ASR: connected');
-    wsUI.onclose = ()=> setBadge($asrStatus, false, 'ASR: disconnected');
-    wsUI.onerror = ()=> setBadge($asrStatus, false, 'ASR: error');
+    // /ws_ui carries transcript text, not microphone health. The compact
+    // audio-freshness poll exclusively owns the audio badge.
     wsUI.onmessage = (ev)=>{
       const s = ev.data || '';
       if (s.startsWith('INIT:')){
@@ -518,6 +529,7 @@ import {
   function cleanupViewer(){
     clearInterval(freshnessTimer);
     clearInterval(backendFreshnessTimer);
+    clearInterval(audioFreshnessTimer);
     clearInterval(perceptionPollTimer);
     clearInterval(perceptionRenderTimer);
     clearTimeout(thermalReconnectTimer);
@@ -543,8 +555,10 @@ import {
   connectThermal();
   refreshPerception();
   refreshCameraBackendFreshness();
+  refreshAudioFreshness();
   freshnessTimer = setInterval(()=>rgbFreshness.tick(), RGB_FRESHNESS_CHECK_MS);
   backendFreshnessTimer = setInterval(refreshCameraBackendFreshness, RGB_BACKEND_CHECK_MS);
+  audioFreshnessTimer = setInterval(refreshAudioFreshness, 1000);
   perceptionPollTimer = setInterval(refreshPerception, PERCEPTION_POLL_MS);
   perceptionRenderTimer = setInterval(renderPerception, 250);
   window.addEventListener('pagehide', cleanupViewer);

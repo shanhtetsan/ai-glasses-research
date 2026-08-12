@@ -167,10 +167,17 @@ class YoloShadowClient:
         settings: YoloClientSettings,
         frames: Any,
         rotation_provider: Callable[[], int] = lambda: 0,
+        on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
         self.settings = settings
         self.frames = frames
         self.rotation_provider = rotation_provider
+        # Optional fire-and-forget hook for external event export (e.g. the
+        # research platform's research_exporter.publish_event). Injected
+        # rather than imported to keep this module's only external
+        # dependency the perception service itself. Never awaited, always
+        # guarded so a broken hook can never affect detection polling.
+        self._on_event = on_event
         self.cache = DetectionCache()
         self._task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
@@ -362,6 +369,16 @@ class YoloShadowClient:
             self._last_detection_log_at is None
             or logged_at - self._last_detection_log_at >= _DETECTION_LOG_INTERVAL_SEC
         )
+        if changed and self._on_event is not None:
+            try:
+                self._on_event("YOLO_CHANGE", {
+                    "frame_id": result["frame_id"],
+                    "object_count": len(objects),
+                    "objects": objects,
+                    "inference_ms": result["inference_ms"],
+                })
+            except Exception:
+                pass
         if not changed and not interval_elapsed:
             return
 

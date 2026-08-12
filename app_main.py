@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, csv, tempfile, wave
+import os, sys, time, json, asyncio, base64, csv, tempfile, wave, hmac
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -123,7 +123,7 @@ except Exception:
 
 import os
 _gk = os.getenv("GEMINI_API_KEY") or ""
-print("Gemini Key =", (_gk[:6] + "..." + _gk[-4:]) if len(_gk) > 12 else "(not set)")
+print("Gemini Key =", "(configured)" if _gk else "(not set)")
 
 # ---- Active AI backend selection (for comparing regular Gemini / Gemini Live / Qwen) ----
 # Set via env var, e.g.:  AI_BACKEND=gemini_regular python app_main.py
@@ -405,12 +405,15 @@ async def _paced_tts_sender() -> None:
     owner_ws: Optional[WebSocket] = None
     owner_turn_id = 0
     playback_clock = 0.0
+    gate_reopen_handle: Optional[asyncio.TimerHandle] = None
+    gate_generation = 0
 
     while True:
         item = await _tts_send_queue.get()
         try:
             if item.terminal_status is not None:
                 terminal_turn_id = item.turn_id or owner_turn_id
+                terminal_ws = owner_ws
                 if (_esp32_tts_started and owner_ws and
                         owner_ws.client_state == WebSocketState.CONNECTED):
                     try:
@@ -425,6 +428,42 @@ async def _paced_tts_sender() -> None:
                     except Exception:
                         pass
                 _esp32_tts_started = False
+                gate_generation += 1
+                if gate_reopen_handle is not None:
+                    gate_reopen_handle.cancel()
+                    gate_reopen_handle = None
+                if terminal_ws is not None:
+                    # END is ordered after all PCM. Keep freshness suppressed
+                    # until the existing virtual playback clock says that PCM
+                    # has drained; RESET discards it and can reopen immediately.
+                    reopen_delay = (
+                        0.0
+                        if item.terminal_status == "interrupted"
+                        else max(0.0, playback_clock - time.monotonic())
+                    )
+                    reopen_generation = gate_generation
+
+                    def _reopen_audio_freshness(
+                        expected_generation: int = reopen_generation,
+                        expected_ws: Optional[WebSocket] = terminal_ws,
+                    ) -> None:
+                        if (
+                            expected_generation == gate_generation
+                            and esp32_audio_ws is expected_ws
+                            and not _esp32_tts_started
+                        ):
+                            audio_freshness_tracker.set_gate(
+                                expected_streaming=True,
+                                reason="streaming",
+                            )
+
+                    if reopen_delay == 0.0:
+                        _reopen_audio_freshness()
+                    else:
+                        gate_reopen_handle = asyncio.get_running_loop().call_later(
+                            reopen_delay,
+                            _reopen_audio_freshness,
+                        )
                 owner_ws = None
                 owner_turn_id = 0
                 playback_clock = 0.0
@@ -443,8 +482,16 @@ async def _paced_tts_sender() -> None:
 
             if (owner_ws is not ws or owner_turn_id != item.turn_id
                     or not _esp32_tts_started):
+                gate_generation += 1
+                if gate_reopen_handle is not None:
+                    gate_reopen_handle.cancel()
+                    gate_reopen_handle = None
                 await _send_esp32_audio_text(
                     ws, f"TTS:START:{item.turn_id}"
+                )
+                audio_freshness_tracker.set_gate(
+                    expected_streaming=False,
+                    reason="tts",
                 )
                 owner_ws = ws
                 owner_turn_id = item.turn_id
@@ -513,15 +560,14 @@ async def _on_input_transcription(text: str):
         return
     turn_id = latency_tracker.ensure_turn()
     latency_tracker.mark("first_input_transcription", turn_id)
-    _input_text_buf.append(text)
+    combined = append_transcription_delta(_input_text_buf, text)
     try:
         # Tagged so the UI can tell this apart from the AI's partial text —
         # see the note in _on_turn_complete about why this also needs a
         # ui_broadcast_final once the turn ends.
-        await ui_broadcast_partial("(user) " + "".join(_input_text_buf))
+        await ui_broadcast_partial("(user) " + combined)
     except Exception:
         pass
-    combined = "".join(_input_text_buf)
     wants_vision = is_explicit_vision_request(combined)
     wants_thermal = is_thermal_request(combined)
     if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
@@ -618,6 +664,23 @@ async def _on_turn_complete():
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
 
     turn_id = latency_tracker.ensure_turn()
+    active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
+    integrity_degraded = bool(active_turn.get("audio_integrity_degraded"))
+    if integrity_degraded:
+        loss = active_turn.get("mic_loss") or {}
+        print(
+            f"[AUDIO-INTEGRITY] turn_id={turn_id} status=degraded "
+            f"epoch={loss.get('epoch', 0)} chunks={loss.get('chunks', 0)} "
+            f"duration_ms={loss.get('duration_ms', 0)} "
+            f"reason={loss.get('reason', 'unknown')}",
+            flush=True,
+        )
+        try:
+            await ui_broadcast_final(
+                "[Audio integrity degraded — repeat the question if the response seems wrong.]"
+            )
+        except Exception:
+            pass
     latency_tracker.mark("turn_complete", turn_id)
     _enqueue_tts_terminal("completed", turn_id)
     await _finalize_latency_turn("completed", turn_id)
@@ -779,10 +842,15 @@ import signal
 import atexit
 from stability_runtime import (
     MSG_TYPE_CAM, MSG_TYPE_THERMAL, MSG_TYPE_IMU, MSG_TYPE_STATUS,
-    LatencyTracker, LatestFrameStore, RecordingPipeline, VisionController,
-    parse_sensor_message,
+    AudioFreshnessTracker, LatencyTracker, LatestFrameStore,
+    PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
+    append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
 from yolo_client import YoloClientSettings, YoloShadowClient
+from research_exporter import (
+    DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
+    ResearchExporter, ResearchExporterSettings, SessionGate,
+)
 
 # ---- IMU UDP ----
 UDP_IP   = "0.0.0.0"
@@ -803,13 +871,32 @@ last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=1 if STABILITY_MODE else 
 latest_rgb = LatestFrameStore()
 latest_thermal = LatestFrameStore()
 rgb_canonicalizer_telemetry = RgbCanonicalizerTelemetry()
+
+# Research platform integration: bounded, best-effort, off by default. See
+# research_exporter.py's module docstring for the full safety contract —
+# nothing here can block or slow the camera/audio/Gemini hot paths.
+research_session_gate = SessionGate(
+    state_path=os.getenv("RESEARCH_SESSION_STATE_PATH", DEFAULT_SESSION_STATE_PATH),
+    default_ttl_sec=float(os.getenv("RESEARCH_SESSION_DEFAULT_TTL_SEC", str(DEFAULT_SESSION_TTL_SEC))),
+)
+research_exporter = ResearchExporter(
+    ResearchExporterSettings.from_env(),
+    latest_rgb,
+    research_session_gate,
+)
+
 yolo_settings = YoloClientSettings.from_env()
 yolo_client = YoloShadowClient(
     yolo_settings,
     latest_rgb,
     rotation_provider=lambda: 0,
+    on_event=research_exporter.publish_event,
 )
-latency_tracker = LatencyTracker(history_size=200)
+latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
+audio_freshness_tracker = AudioFreshnessTracker(
+    stale_after_ms=float(os.getenv("AUDIO_STALE_AFTER_MS", "500")),
+    recent_window_sec=2.0,
+)
 _latency_csv_lock = threading.Lock()
 # Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
 latest_thermal_matrix: Optional[np.ndarray] = None
@@ -842,6 +929,16 @@ GEMINI_VIDEO_INTERVAL_SEC = max(
     0.25, float(os.getenv("GEMINI_VIDEO_INTERVAL_SEC", "0.75"))
 )
 _last_gemini_video_submit = 0.0
+
+# Same drop-to-latest / rate-limited shape as the Gemini video pump above,
+# decoupled to its own interval so research sampling never competes with
+# Gemini's cadence. research_exporter.publish_event() is itself a no-op
+# unless ENABLE_RESEARCH_EXPORT is set AND a research session is active, so
+# this call is free (one attribute read) the rest of the time.
+RESEARCH_FRAME_SAMPLE_INTERVAL_SEC = max(
+    1.0, float(os.getenv("RESEARCH_FRAME_SAMPLE_INTERVAL_SEC", "5.0"))
+)
+_last_research_frame_sample = 0.0
 
 # Bounded ingest hand-offs keep ESP32 receive loops independent of Gemini,
 # OpenCV, and slow browser viewers. Drop-oldest preserves real-time behavior.
@@ -1691,7 +1788,9 @@ def health():
         },
         "vision": dict(vision_controller.metrics),
         "yolo": yolo_client.health(),
+        "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
+        "audio_freshness": audio_freshness_tracker.snapshot(),
         "connections": dict(backend_metrics),
     })
 
@@ -1709,6 +1808,12 @@ def camera_freshness():
         ),
         "canonical_frame_sequence": rgb.sequence,
     })
+
+
+@app.get("/api/audio-freshness")
+def audio_freshness():
+    """Compact read-only socket/gate/PCM freshness state for the browser."""
+    return JSONResponse(audio_freshness_tracker.snapshot())
 
 
 @app.get("/latency/metrics")
@@ -1774,6 +1879,47 @@ async def vision_request(request: Request, payload: VisionRequest):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     result = await request_gemini_vision(f"api:{payload.reason[:80]}")
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+class ResearchSessionCommand(BaseModel):
+    active: bool
+    session_id: Optional[str] = None
+    token: Optional[str] = None
+    ttl_sec: Optional[float] = None
+
+
+@app.post("/internal/research-session")
+async def research_session_handshake(request: Request, command: ResearchSessionCommand):
+    """Session-state handshake for the standalone research platform.
+
+    The realtime app only ever RECEIVES session state here — it never polls
+    the research platform. That direction of dependency is what keeps the
+    realtime app's uptime independent of the research platform's uptime
+    (§14 of the research-platform architecture plan): if the research
+    platform disappears, it simply stops calling this endpoint, the durable
+    SessionGate's expires_at lapses on its own (auto-expiry safety net, see
+    research_exporter.py), and research_exporter.publish_event() quietly
+    goes back to being a no-op. Nothing here is on any camera/audio/Gemini
+    hot path.
+
+    Auth is a separate shared secret from the per-session bearer token the
+    exporter sends outbound (research_exporter.py's SessionGate.token) —
+    this one only ever guards this inbound handshake.
+    """
+    expected = os.getenv("RESEARCH_SESSION_SHARED_SECRET", "")
+    supplied = request.headers.get("x-research-shared-secret", "")
+    if not expected or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if command.active:
+        if not command.session_id or not command.token:
+            return JSONResponse(
+                {"error": "session_id and token are required to activate"},
+                status_code=400,
+            )
+        research_session_gate.activate(command.session_id, command.token, ttl_sec=command.ttl_sec)
+    else:
+        research_session_gate.deactivate()
+    return JSONResponse(research_session_gate.snapshot())
 
 
 class ThermalDisplaySettings(BaseModel):
@@ -2078,10 +2224,15 @@ async def ws_audio(ws: WebSocket):
     esp32_audio_ws = ws
     await ws.accept()
     _esp32_audio_send_lock = asyncio.Lock()
+    connection_generation = audio_freshness_tracker.connect()
     device_id = _device_id(ws)
     connected_at = time.monotonic()
     backend_metrics["audio_connects"] += 1
-    print(f"[WS-INGEST] device={device_id} socket=audio event=connect", flush=True)
+    print(
+        f"[WS-INGEST] device={device_id} socket=audio event=connect "
+        f"generation={connection_generation}",
+        flush=True,
+    )
 
     audio_ingest_q: asyncio.Queue[bytes] = asyncio.Queue(
         maxsize=ESP_AUDIO_INGEST_QUEUE_MAX
@@ -2091,15 +2242,17 @@ async def ws_audio(ws: WebSocket):
     audio_queue_high_water = 0
     audio_last_receive_at: Optional[float] = None
     audio_receive_count_interval = 0
+    audio_pcm_chunk_count_interval = 0
     audio_receive_gap_max_ms = 0.0
     audio_receive_gap_buckets = [
         0 for _ in range(len(ESP_AUDIO_GAP_BUCKET_LIMITS_MS) + 1)
     ]
     audio_health_started_at = time.monotonic()
 
-    def _record_audio_receive(now: float) -> None:
+    def _record_audio_receive(now: float, byte_count: int) -> None:
         nonlocal audio_last_receive_at
-        nonlocal audio_receive_count_interval, audio_receive_gap_max_ms
+        nonlocal audio_receive_count_interval, audio_pcm_chunk_count_interval
+        nonlocal audio_receive_gap_max_ms
         if audio_last_receive_at is not None:
             gap_ms = (now - audio_last_receive_at) * 1000
             audio_receive_gap_max_ms = max(audio_receive_gap_max_ms, gap_ms)
@@ -2111,10 +2264,16 @@ async def ws_audio(ws: WebSocket):
             audio_receive_gap_buckets[bucket] += 1
         audio_last_receive_at = now
         audio_receive_count_interval += 1
+        audio_pcm_chunk_count_interval += max(
+            1,
+            (byte_count + PCM_20MS_BYTES_16K_MONO - 1)
+            // PCM_20MS_BYTES_16K_MONO,
+        )
 
     def _emit_audio_health(*, force: bool = False) -> None:
         nonlocal audio_dropped_interval, audio_queue_high_water
-        nonlocal audio_receive_count_interval, audio_receive_gap_max_ms
+        nonlocal audio_receive_count_interval, audio_pcm_chunk_count_interval
+        nonlocal audio_receive_gap_max_ms
         nonlocal audio_receive_gap_buckets, audio_health_started_at
         now = time.monotonic()
         interval_sec = now - audio_health_started_at
@@ -2122,7 +2281,8 @@ async def ws_audio(ws: WebSocket):
             return
         print(
             f"[AUDIO-HEALTH] device={device_id} interval_s={interval_sec:.1f} "
-            f"received={audio_receive_count_interval} "
+            f"received_messages={audio_receive_count_interval} "
+            f"received_pcm_chunks={audio_pcm_chunk_count_interval} "
             f"receive_gap_max_ms={audio_receive_gap_max_ms:.1f} "
             "receive_gap_limits_ms=30/50/100/250/500/1000 "
             f"receive_gap_buckets={'/'.join(map(str, audio_receive_gap_buckets))} "
@@ -2133,6 +2293,7 @@ async def ws_audio(ws: WebSocket):
         audio_dropped_interval = 0
         audio_queue_high_water = audio_ingest_q.qsize()
         audio_receive_count_interval = 0
+        audio_pcm_chunk_count_interval = 0
         audio_receive_gap_max_ms = 0.0
         audio_receive_gap_buckets = [
             0 for _ in range(len(ESP_AUDIO_GAP_BUCKET_LIMITS_MS) + 1)
@@ -2190,6 +2351,43 @@ async def ws_audio(ws: WebSocket):
             if "text" in msg and msg["text"] is not None:
                 raw = (msg["text"] or "").strip()
                 cmd = raw.upper()
+
+                mic_loss = parse_mic_loss_message(raw)
+                if mic_loss is not None:
+                    audio_freshness_tracker.record_loss(mic_loss)
+                    latency_tracker.mark_audio_integrity_degraded(mic_loss)
+                    print(
+                        f"[MIC-LOSS] device={device_id} "
+                        f"generation={connection_generation} "
+                        f"epoch={mic_loss['epoch']} chunks={mic_loss['chunks']} "
+                        f"duration_ms={mic_loss['duration_ms']} "
+                        f"reason={mic_loss['reason']} "
+                        f"turn_id={latency_tracker.active_turn_id or 0}",
+                        flush=True,
+                    )
+                    continue
+
+                if cmd == "MIC_GATE:TTS":
+                    audio_freshness_tracker.set_gate(
+                        expected_streaming=False, reason="tts"
+                    )
+                    continue
+                if cmd == "MIC_GATE:OPEN":
+                    audio_freshness_tracker.set_gate(
+                        expected_streaming=True, reason="streaming"
+                    )
+                    continue
+                if cmd == "BARGE_IN":
+                    print(
+                        f"[BARGE-IN] device={device_id} event=received "
+                        f"generation={connection_generation}",
+                        flush=True,
+                    )
+                    audio_freshness_tracker.set_gate(
+                        expected_streaming=True, reason="barge_in"
+                    )
+                    await _on_interrupted()
+                    continue
 
                 if raw.startswith("LATENCY:PING:"):
                     parts = raw.split(":")
@@ -2255,6 +2453,9 @@ async def ws_audio(ws: WebSocket):
                     vad_silent_chunks    = 0
                     vad_speech_chunks    = 0
                     vad_speech_detected  = False
+                    audio_freshness_tracker.set_gate(
+                        expected_streaming=True, reason="streaming"
+                    )
                     await ui_broadcast_partial("（Recording…）")
                     await _send_esp32_audio_text(ws, "OK:STARTED")
 
@@ -2286,8 +2487,16 @@ async def ws_audio(ws: WebSocket):
 
             elif "bytes" in msg and msg["bytes"] is not None:
                 chunk = msg["bytes"]
+                if not chunk or len(chunk) % 2:
+                    print(
+                        f"[WS-INGEST] device={device_id} socket=audio "
+                        f"event=invalid_pcm bytes={len(chunk)}",
+                        flush=True,
+                    )
+                    continue
                 audio_receive_now = time.monotonic()
-                _record_audio_receive(audio_receive_now)
+                _record_audio_receive(audio_receive_now, len(chunk))
+                audio_freshness_tracker.record_pcm(len(chunk))
                 latency_tracker.mark_microphone_chunk(
                     now_ns=time.monotonic_ns()
                 )
@@ -2300,21 +2509,26 @@ async def ws_audio(ws: WebSocket):
                     # of the way (it would otherwise fire its own transcription
                     # off the same audio and double-dispatch commands).
                     if streaming and not is_playing_now():
-                        if audio_ingest_q.full():
+                        # Firmware may aggregate two 20 ms chunks into one
+                        # WebSocket frame. Normalize at ingress so queue age,
+                        # Gemini pacing, and drop counters retain 20 ms units.
+                        for offset in range(0, len(chunk), PCM_20MS_BYTES_16K_MONO):
+                            pcm_chunk = chunk[offset:offset + PCM_20MS_BYTES_16K_MONO]
+                            if audio_ingest_q.full():
+                                try:
+                                    audio_ingest_q.get_nowait()
+                                    audio_dropped += 1
+                                    audio_dropped_interval += 1
+                                except asyncio.QueueEmpty:
+                                    pass
                             try:
-                                audio_ingest_q.get_nowait()
+                                audio_ingest_q.put_nowait(pcm_chunk)
+                            except asyncio.QueueFull:
                                 audio_dropped += 1
                                 audio_dropped_interval += 1
-                            except asyncio.QueueEmpty:
-                                pass
-                        try:
-                            audio_ingest_q.put_nowait(chunk)
-                        except asyncio.QueueFull:
-                            audio_dropped += 1
-                            audio_dropped_interval += 1
-                        audio_queue_high_water = max(
-                            audio_queue_high_water, audio_ingest_q.qsize()
-                        )
+                            audio_queue_high_water = max(
+                                audio_queue_high_water, audio_ingest_q.qsize()
+                            )
                         if audio_dropped and audio_dropped % 50 == 1:
                             print(
                                 f"[WS-INGEST] device={device_id} socket=audio "
@@ -2362,13 +2576,17 @@ async def ws_audio(ws: WebSocket):
 
                 if rms >= VAD_SILENCE_RMS:
                     vad_silent_chunks  = 0
-                    vad_speech_chunks += 1
+                    vad_speech_chunks += max(
+                        1, len(chunk) // PCM_20MS_BYTES_16K_MONO
+                    )
                     if not vad_speech_detected and vad_speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
                         vad_speech_detected = True
                         print("[MIC] Speech detected", flush=True)
                 else:
                     if vad_speech_detected:
-                        vad_silent_chunks += 1
+                        vad_silent_chunks += max(
+                            1, len(chunk) // PCM_20MS_BYTES_16K_MONO
+                        )
                         if vad_silent_chunks >= VAD_SILENCE_CHUNKS:
                             print("[MIC] Transcribing...", flush=True)
                             buf = bytes(pcm_buffer)
@@ -2404,6 +2622,7 @@ async def ws_audio(ws: WebSocket):
             _enqueue_tts_terminal("interrupted")
             esp32_audio_ws = None
             _esp32_audio_send_lock = None
+            audio_freshness_tracker.disconnect()
         backend_metrics["audio_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=audio event=disconnect "
@@ -2515,6 +2734,14 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
             _last_gemini_video_submit = now
             gemini_frame_holder["data"] = data
             gemini_frame_event.set()
+
+    global _last_research_frame_sample
+    now_mono = time.monotonic()
+    if now_mono - _last_research_frame_sample >= RESEARCH_FRAME_SAMPLE_INTERVAL_SEC:
+        _last_research_frame_sample = now_mono
+        research_exporter.publish_event(
+            "CAMERA_FRAME_SAMPLE", {"frame_sequence": frame_counter}
+        )
 
     return frame_counter
 
@@ -3372,6 +3599,11 @@ async def startup_yolo_shadow():
 
 
 @app.on_event("startup")
+async def startup_research_exporter():
+    await research_exporter.start()
+
+
+@app.on_event("startup")
 async def on_startup_register_bridge_sender():
     # Save the main thread's event loop
     main_loop = asyncio.get_event_loop()
@@ -3494,6 +3726,7 @@ async def on_shutdown():
     global _tts_sender_task
     print("[SHUTDOWN] Starting resource cleanup...")
     await yolo_client.stop()
+    await research_exporter.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
     

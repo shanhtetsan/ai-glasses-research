@@ -5,6 +5,10 @@ __pycache__/
 recordings/
 *.wav
 *.avi
+
+# Research-platform session gate: holds a live bearer token on disk
+# (research_exporter.py's SessionGate) — never commit it.
+research_session_state.json*
 .DS_Store
 .vscode/
 
