@@ -12,6 +12,7 @@ from perception_orientation import (
     RgbCanonicalizerTelemetry,
     canonicalize_rgb_jpeg,
     canonicalize_thermal_payload,
+    map_thermal_to_rgb_normalized,
     queue_latest_raw_rgb,
     run_latest_rgb_canonicalizer,
     summarize_thermal_grid,
@@ -198,6 +199,34 @@ class RgbLatestOnlyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ThermalOrientationTests(unittest.TestCase):
+    def test_neutral_coarse_calibration_preserves_normalized_coordinates(self):
+        self.assertEqual(map_thermal_to_rgb_normalized(0.5, 0.5), (0.5, 0.5))
+        mapped = map_thermal_to_rgb_normalized(0.1, 0.9)
+        self.assertAlmostEqual(mapped[0], 0.1)
+        self.assertAlmostEqual(mapped[1], 0.9)
+
+    def test_calibration_offsets_and_scales_are_axis_specific(self):
+        self.assertEqual(
+            map_thermal_to_rgb_normalized(0.5, 0.5, offset_x=0.1),
+            (0.6, 0.5),
+        )
+        self.assertEqual(
+            map_thermal_to_rgb_normalized(0.5, 0.5, offset_y=-0.2),
+            (0.5, 0.3),
+        )
+        self.assertEqual(
+            map_thermal_to_rgb_normalized(0.25, 0.75, scale_x=2, scale_y=0.5),
+            (0.0, 0.625),
+        )
+
+    def test_calibration_clamps_only_when_explicitly_requested_for_display(self):
+        raw = map_thermal_to_rgb_normalized(1.0, 0.0, offset_x=0.25, offset_y=-0.25)
+        display = map_thermal_to_rgb_normalized(
+            1.0, 0.0, offset_x=0.25, offset_y=-0.25, clamp_for_display=True
+        )
+        self.assertEqual(raw, (1.25, -0.25))
+        self.assertEqual(display, (1.0, 0.0))
+
     def test_physical_corners_map_to_same_canonical_corners(self):
         raw = np.zeros((24, 32), dtype=np.float32)
         # Physical testing establishes this raw-corner correspondence after
@@ -249,6 +278,25 @@ class ThermalOrientationTests(unittest.TestCase):
         browser = Path("templates/index.html").read_text(encoding="utf-8")
         self.assertNotIn("scaleX(-1)", browser)
 
+    def test_calibration_settings_are_neutral_and_do_not_enter_colorizer(self):
+        source = Path("app_main.py").read_text(encoding="utf-8")
+        config = source.split("thermal_display_config", 1)[1].split(
+            "VISION_FRAME_MAX_AGE_SEC", 1
+        )[0]
+        self.assertIn('"calibration_offset_x": 0.0', config)
+        self.assertIn('"calibration_offset_y": 0.0', config)
+        self.assertIn('"calibration_scale_x": 1.0', config)
+        self.assertIn('"calibration_scale_y": 1.0', config)
+        colorizer = source.split("def _colorize_thermal", 1)[1].split(
+            '@app.websocket("/ws/thermal")', 1
+        )[0]
+        self.assertNotIn("map_thermal_to_rgb_normalized", colorizer)
+        self.assertNotIn("calibration_offset", colorizer)
+
+        browser = Path("templates/index.html").read_text(encoding="utf-8")
+        self.assertIn("Session uses normal RGB with thermal as a small inset", browser)
+        self.assertIn('id="thermalAlignRgb"', browser)
+
     def test_shared_canonical_matrix_feeds_retention_facts_and_heatmap(self):
         source = Path("app_main.py").read_text(encoding="utf-8")
         retain = source.split("def _retain_latest_thermal", 1)[1].split(
@@ -256,7 +304,7 @@ class ThermalOrientationTests(unittest.TestCase):
         )[0]
         self.assertIn("latest_thermal_matrix = canonical", retain)
         self.assertIn("latest_thermal.update(canonical.astype", retain)
-        self.assertIn("return summarize_thermal_grid(matrix", source)
+        self.assertIn("facts = summarize_thermal_grid(matrix", source)
         processor = source.split("async def _thermal_processor", 1)[1].split(
             "thermal_processor_task", 1
         )[0]

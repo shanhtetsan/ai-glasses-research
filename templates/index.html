@@ -182,6 +182,20 @@
   }
   #overlayCanvas{display:block !important;}
 
+  /* Optional coarse alignment preview. The default remains the separate
+     thermal inset. Values are computed in canonical RGB coordinates. */
+  body.thermal-align-rgb #thermalCanvas{
+    inset:auto !important;
+    left:var(--thermal-aligned-left) !important;
+    top:var(--thermal-aligned-top) !important;
+    width:var(--thermal-aligned-width) !important;
+    height:var(--thermal-aligned-height) !important;
+    opacity:.45 !important;
+    border:0 !important;
+    border-radius:0 !important;
+    box-shadow:none !important;
+  }
+
   /* Keep full transcript visible and independently scrollable. */
   .rightcol{
     min-height:0;
@@ -383,9 +397,15 @@
       <label><input id="thermalLabels" type="checkbox" checked> labels</label>
       <label>min °C <input id="thermalMinInput" type="number" value="15" step="0.5" style="width:70px"></label>
       <label>max °C <input id="thermalMaxInput" type="number" value="40" step="0.5" style="width:70px"></label>
+      <label>offset X <input id="thermalOffsetX" type="number" value="0" step="0.01" min="-1" max="1" style="width:70px"></label>
+      <label>offset Y <input id="thermalOffsetY" type="number" value="0" step="0.01" min="-1" max="1" style="width:70px"></label>
+      <label>scale X <input id="thermalScaleX" type="number" value="1" step="0.01" min="0.1" max="3" style="width:70px"></label>
+      <label>scale Y <input id="thermalScaleY" type="number" value="1" step="0.01" min="0.1" max="3" style="width:70px"></label>
+      <label><input id="thermalAlignRgb" type="checkbox"> align over RGB</label>
       <button id="applyThermal">Apply</button>
       <button id="toggleRecording">Stop recording</button>
       <span class="chip" id="recordingState">recording: checking…</span>
+      <span class="note" id="thermalCalibrationDiagnostic">alignment: neutral; hotspot: --</span>
     </div>
   </details>
 
@@ -493,6 +513,15 @@
       // not overwrite intentional TTS suppression or upstream PCM staleness.
       const tAge = h.latest_age_sec && h.latest_age_sec.thermal;
       setChip(q('chipThermal'), tAge !== null && tAge !== undefined && tAge < 5, 'thermal');
+      const tc = h.thermal_calibration;
+      if (tc) {
+        const hot = tc.hotspot_thermal_norm ? tc.hotspot_thermal_norm.join(',') : '--';
+        const mapped = tc.hotspot_rgb_norm_unclamped ? tc.hotspot_rgb_norm_unclamped.join(',') : '--';
+        q('thermalCalibrationDiagnostic').textContent =
+          `alignment: offset(${tc.calibration_offset_x},${tc.calibration_offset_y}) ` +
+          `scale(${tc.calibration_scale_x},${tc.calibration_scale_y}); ` +
+          `hotspot thermal(${hot}) → RGB(${mapped})`;
+      }
 
       const st = h.device_status && h.device_status.data;
       if (st){
@@ -513,13 +542,22 @@
   }
 
   q('applyThermal').onclick = async ()=>{
-    await fetch('/api/thermal-display',{method:'POST',headers:{'Content-Type':'application/json'},
+    const response = await fetch('/api/thermal-display',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         palette:q('thermalPalette').value, interpolation:q('thermalInterpolation').value,
         auto_range:q('thermalAuto').checked, hotspot:q('thermalHotspot').checked,
         labels:q('thermalLabels').checked,
-        min_c:Number(q('thermalMinInput').value), max_c:Number(q('thermalMaxInput').value)
+        min_c:Number(q('thermalMinInput').value), max_c:Number(q('thermalMaxInput').value),
+        calibration_offset_x:Number(q('thermalOffsetX').value),
+        calibration_offset_y:Number(q('thermalOffsetY').value),
+        calibration_scale_x:Number(q('thermalScaleX').value),
+        calibration_scale_y:Number(q('thermalScaleY').value)
       })});
+    const updated = await response.json();
+    if (response.ok) {
+      window.dispatchEvent(new CustomEvent('thermalcalibrationchange', {detail:updated}));
+      refreshHealth();
+    }
   };
   q('toggleRecording').onclick = async ()=>{
     await fetch('/api/recording',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -532,6 +570,11 @@
     q('thermalAuto').checked=c.auto_range; q('thermalHotspot').checked=c.hotspot;
     q('thermalLabels').checked=c.labels;
     q('thermalMinInput').value=c.min_c; q('thermalMaxInput').value=c.max_c;
+    q('thermalOffsetX').value=c.calibration_offset_x;
+    q('thermalOffsetY').value=c.calibration_offset_y;
+    q('thermalScaleX').value=c.calibration_scale_x;
+    q('thermalScaleY').value=c.calibration_scale_y;
+    window.dispatchEvent(new CustomEvent('thermalcalibrationchange', {detail:c}));
   }).catch(()=>{});
 
   const btnRestart = document.getElementById('btnRestart');

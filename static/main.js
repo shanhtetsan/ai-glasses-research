@@ -6,6 +6,7 @@ import {
   isHandResultFresh,
   isPerceptionFresh,
   resizeOverlayCanvas,
+  thermalCalibrationRect,
 } from './perception_overlay.mjs';
 import {
   RGB_VIEWER_STATE,
@@ -36,6 +37,7 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   const handInference = document.getElementById('handInference');
   const thermalCanvas = document.getElementById('thermalCanvas');
   const thermalCtx    = thermalCanvas.getContext('2d');
+  const thermalAlignToggle = document.getElementById('thermalAlignRgb');
   let rgbFrameWidth = 0;
   let rgbFrameHeight = 0;
   const PERCEPTION_POLL_MS = 1000;
@@ -48,6 +50,37 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   let perceptionReceivedAt = 0;
   let latestHands = null;
   let handsReceivedAt = 0;
+  let thermalCalibration = {
+    calibration_offset_x: 0,
+    calibration_offset_y: 0,
+    calibration_scale_x: 1,
+    calibration_scale_y: 1,
+  };
+
+  function applyThermalAlignment(fitted) {
+    const rect = thermalCalibrationRect(thermalCalibration);
+    if (!rect || !thermalAlignToggle?.checked) {
+      document.body.classList.remove('thermal-align-rgb');
+      return;
+    }
+    const stage = canvas.parentElement;
+    stage.style.setProperty('--thermal-aligned-left', `${fitted.left + rect.left * fitted.width}px`);
+    stage.style.setProperty('--thermal-aligned-top', `${fitted.top + rect.top * fitted.height}px`);
+    stage.style.setProperty('--thermal-aligned-width', `${rect.width * fitted.width}px`);
+    stage.style.setProperty('--thermal-aligned-height', `${rect.height * fitted.height}px`);
+    document.body.classList.add('thermal-align-rgb');
+  }
+
+  function updateThermalCalibration(next) {
+    if (!next || typeof next !== 'object') return;
+    thermalCalibration = {
+      calibration_offset_x: Number(next.calibration_offset_x ?? 0),
+      calibration_offset_y: Number(next.calibration_offset_y ?? 0),
+      calibration_scale_x: Number(next.calibration_scale_x ?? 1),
+      calibration_scale_y: Number(next.calibration_scale_y ?? 1),
+    };
+    fitCanvas();
+  }
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -252,9 +285,20 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     if (canvas.width !== backingWidth) canvas.width = backingWidth;
     if (canvas.height !== backingHeight) canvas.height = backingHeight;
     resizeOverlayCanvas(overlayCanvas, fitted.width, fitted.height, dpr);
+    applyThermalAlignment(fitted);
     renderPerception();
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
+  window.addEventListener('thermalcalibrationchange', event => {
+    updateThermalCalibration(event.detail);
+  });
+  if (thermalAlignToggle) {
+    thermalAlignToggle.addEventListener('change', ()=>fitCanvas());
+  }
+  fetch('/api/thermal-display', {cache: 'no-store'})
+    .then(response => response.ok ? response.json() : null)
+    .then(updateThermalCalibration)
+    .catch(()=>{});
 
   const RGB_STALE_AFTER_MS = 2500;
   const RGB_FRESHNESS_CHECK_MS = 250;
@@ -590,6 +634,7 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     clearInterval(perceptionRenderTimer);
     clearTimeout(thermalReconnectTimer);
     window.removeEventListener('resize', fitCanvas);
+    document.body.classList.remove('thermal-align-rgb');
     window.removeEventListener('pagehide', cleanupViewer);
     rgbFreshness.dispose();
     closeSocket(wsCam);

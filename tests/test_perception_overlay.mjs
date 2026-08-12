@@ -7,9 +7,11 @@ import {
   HAND_CONNECTIONS,
   isHandResultFresh,
   isPerceptionFresh,
+  mapThermalToRgbNormalized,
   resizeOverlayCanvas,
   transformNormalizedBox,
   transformNormalizedLandmark,
+  thermalCalibrationRect,
 } from '../static/perception_overlay.mjs';
 
 test('canonical portrait boxes map directly at top-left, bottom-right, and full frame', () => {
@@ -38,6 +40,41 @@ test('portrait thermal geometry remains 3:4 and DPR scales only backing pixels',
   const canvas = {width: 0, height: 0};
   assert.equal(resizeOverlayCanvas(canvas, 240, 320, 2), 2);
   assert.deepEqual(canvas, {width: 480, height: 640});
+});
+
+test('thermal calibration is neutral by default and maps in canonical space', () => {
+  assert.deepEqual(mapThermalToRgbNormalized([0.5, 0.5]), [0.5, 0.5]);
+  const mapped = mapThermalToRgbNormalized([0.1, 0.9]);
+  assert.ok(Math.abs(mapped[0] - 0.1) < 1e-12);
+  assert.ok(Math.abs(mapped[1] - 0.9) < 1e-12);
+  assert.deepEqual(thermalCalibrationRect({}), {
+    left: 0, top: 0, width: 1, height: 1,
+  });
+});
+
+test('thermal calibration offsets axes and scales around center', () => {
+  assert.deepEqual(mapThermalToRgbNormalized([0.5, 0.5], {
+    calibration_offset_x: 0.1,
+  }), [0.6, 0.5]);
+  assert.deepEqual(mapThermalToRgbNormalized([0.5, 0.5], {
+    calibration_offset_y: -0.2,
+  }), [0.5, 0.3]);
+  assert.deepEqual(mapThermalToRgbNormalized([0.25, 0.75], {
+    calibration_scale_x: 2,
+    calibration_scale_y: 0.5,
+  }), [0, 0.625]);
+});
+
+test('thermal coordinates clamp only for explicit display markers', () => {
+  const calibration = {calibration_offset_x: 0.25, calibration_offset_y: -0.25};
+  assert.deepEqual(
+    mapThermalToRgbNormalized([1, 0], calibration),
+    [1.25, -0.25],
+  );
+  assert.deepEqual(
+    mapThermalToRgbNormalized([1, 0], calibration, {clampForDisplay: true}),
+    [1, 0],
+  );
 });
 
 test('freshness includes server age and clears stale or unavailable results', () => {

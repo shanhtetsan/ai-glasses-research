@@ -233,6 +233,34 @@ def describe_grid_position(row: int, col: int, rows: int, cols: int) -> str:
     return f"{vertical} {horizontal}"
 
 
+def map_thermal_to_rgb_normalized(
+    thermal_x: float,
+    thermal_y: float,
+    *,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    clamp_for_display: bool = False,
+) -> tuple[float, float]:
+    """Map canonical thermal coordinates into canonical RGB coordinates.
+
+    This is a coarse normalized 2D alignment only. It does not alter the
+    canonical thermal matrix or temperature values. Unclamped coordinates are
+    returned by default so calibration diagnostics retain out-of-frame values;
+    callers may explicitly clamp a display coordinate.
+    """
+    values = (thermal_x, thermal_y, offset_x, offset_y, scale_x, scale_y)
+    if not all(np.isfinite(float(value)) for value in values):
+        raise ValueError("thermal calibration values must be finite")
+    mapped_x = 0.5 + (float(thermal_x) - 0.5) * float(scale_x) + float(offset_x)
+    mapped_y = 0.5 + (float(thermal_y) - 0.5) * float(scale_y) + float(offset_y)
+    if clamp_for_display:
+        mapped_x = max(0.0, min(1.0, mapped_x))
+        mapped_y = max(0.0, min(1.0, mapped_y))
+    return mapped_x, mapped_y
+
+
 def summarize_thermal_grid(
     matrix: np.ndarray,
     age_sec: float,
@@ -246,6 +274,10 @@ def summarize_thermal_grid(
     ambient = float(np.percentile(grid, 20))
     scene_max = float(grid.max())
     hot_row, hot_col = np.unravel_index(int(np.argmax(grid)), grid.shape)
+    hotspot_norm = [
+        round((float(hot_col) + 0.5) / cols, 6),
+        round((float(hot_row) + 0.5) / rows, 6),
+    ]
     half = center_fraction / 2
     r0, r1 = int(rows * (0.5 - half)), int(rows * (0.5 + half))
     c0, c1 = int(cols * (0.5 - half)), int(cols * (0.5 + half))
@@ -269,6 +301,7 @@ def summarize_thermal_grid(
         "hotspot": {
             "temperature_c": round(scene_max, 1),
             "position": describe_grid_position(int(hot_row), int(hot_col), rows, cols),
+            "thermal_norm": hotspot_norm,
             "above_ambient_c": round(scene_max - ambient, 1),
         },
         "region_mean_c": regions,

@@ -18,6 +18,16 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from perception_fusion import (
+    GUIDANCE_RELATION_DEADBAND,
+    GUIDANCE_TARGET_IOU_THRESHOLD,
+    GUIDANCE_TARGET_MAX_MISSED_FRAMES,
+    GUIDANCE_TARGET_MIN_CONFIDENCE,
+    GUIDANCE_TARGET_PERSISTENCE_FRAMES,
+    TargetStabilityTracker,
+    canonical_yolo_label,
+)
+
 
 _DETECTION_LOG_INTERVAL_SEC = 5.0
 
@@ -45,6 +55,14 @@ def _env_float(
     return value if maximum is None else min(maximum, value)
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 @dataclass(frozen=True)
 class YoloClientSettings:
     enabled: bool = False
@@ -55,6 +73,11 @@ class YoloClientSettings:
     confidence: float = 0.25
     stale_after_sec: float = 3.0
     health_interval_sec: float = 30.0
+    guidance_min_confidence: float = GUIDANCE_TARGET_MIN_CONFIDENCE
+    guidance_persistence_frames: int = GUIDANCE_TARGET_PERSISTENCE_FRAMES
+    guidance_iou_threshold: float = GUIDANCE_TARGET_IOU_THRESHOLD
+    guidance_max_missed_frames: int = GUIDANCE_TARGET_MAX_MISSED_FRAMES
+    guidance_deadband: float = GUIDANCE_RELATION_DEADBAND
 
     @classmethod
     def from_env(cls) -> "YoloClientSettings":
@@ -70,6 +93,27 @@ class YoloClientSettings:
             confidence=_env_float("YOLO_CONFIDENCE", 0.25, 0.0, 1.0),
             stale_after_sec=_env_float("YOLO_CACHE_STALE_SEC", 3.0, 0.1),
             health_interval_sec=_env_float("YOLO_HEALTH_INTERVAL_SEC", 30.0, 5.0),
+            guidance_min_confidence=_env_float(
+                "GUIDANCE_TARGET_MIN_CONFIDENCE", GUIDANCE_TARGET_MIN_CONFIDENCE, 0.0, 1.0
+            ),
+            guidance_persistence_frames=_env_int(
+                "GUIDANCE_TARGET_PERSISTENCE_FRAMES",
+                GUIDANCE_TARGET_PERSISTENCE_FRAMES,
+                1,
+                10,
+            ),
+            guidance_iou_threshold=_env_float(
+                "GUIDANCE_TARGET_IOU_THRESHOLD", GUIDANCE_TARGET_IOU_THRESHOLD, 0.0, 1.0
+            ),
+            guidance_max_missed_frames=_env_int(
+                "GUIDANCE_TARGET_MAX_MISSED_FRAMES",
+                GUIDANCE_TARGET_MAX_MISSED_FRAMES,
+                0,
+                10,
+            ),
+            guidance_deadband=_env_float(
+                "GUIDANCE_RELATION_DEADBAND", GUIDANCE_RELATION_DEADBAND, 0.0, 0.5
+            ),
         )
 
 
@@ -179,6 +223,14 @@ class YoloShadowClient:
         # guarded so a broken hook can never affect detection polling.
         self._on_event = on_event
         self.cache = DetectionCache()
+        self._target_tracker = TargetStabilityTracker(
+            min_confidence=settings.guidance_min_confidence,
+            persistence_frames=settings.guidance_persistence_frames,
+            iou_threshold=settings.guidance_iou_threshold,
+            max_missed_frames=settings.guidance_max_missed_frames,
+        )
+        self._target_trackers: dict[str, TargetStabilityTracker] = {}
+        self._target_trackers_lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._http_client: Any = None
@@ -319,6 +371,7 @@ class YoloShadowClient:
                 **validated,
             }
             self.cache.replace(cached, {"inference_rotation_deg": rotation})
+            self._update_target_stability(validated["objects"], validated["frame_id"])
             self._maybe_log_detection_state(validated)
             with self._lock:
                 self._metrics["requests_completed"] += 1
@@ -448,6 +501,13 @@ class YoloShadowClient:
             "runtime_disabled": self._runtime_disabled,
             "service_healthy": self._service_healthy,
             "unavailable_reason": self._unavailable_reason,
+            "guidance_settings": {
+                "minimum_confidence": self.settings.guidance_min_confidence,
+                "persistence_frames": self.settings.guidance_persistence_frames,
+                "overlap_iou_threshold": self.settings.guidance_iou_threshold,
+                "max_missed_frames": self.settings.guidance_max_missed_frames,
+                "relation_deadband_norm": self.settings.guidance_deadband,
+            },
             **metrics,
             "average_http_ms": None if not request_latencies else round(statistics.fmean(request_latencies), 3),
             "p95_http_ms": self._p95(request_latencies),
@@ -461,7 +521,69 @@ class YoloShadowClient:
     def latest_detections(self) -> dict:
         return self.cache.read(self.settings.stale_after_sec)
 
-    def latest_perception(self, display_rotation_deg: int = 0) -> dict:
+    def _new_target_tracker(self) -> TargetStabilityTracker:
+        return TargetStabilityTracker(
+            min_confidence=self.settings.guidance_min_confidence,
+            persistence_frames=self.settings.guidance_persistence_frames,
+            iou_threshold=self.settings.guidance_iou_threshold,
+            max_missed_frames=self.settings.guidance_max_missed_frames,
+        )
+
+    def _update_target_stability(self, objects: list[dict], frame_id: Any) -> None:
+        self._target_tracker.update(objects, frame_id)
+        by_label: dict[str, list[dict]] = {}
+        for item in objects:
+            canonical = canonical_yolo_label(item.get("label"))
+            if canonical is not None:
+                by_label.setdefault(canonical, []).append(item)
+        with self._target_trackers_lock:
+            for label in by_label:
+                self._target_trackers.setdefault(label, self._new_target_tracker())
+            for label, tracker in self._target_trackers.items():
+                tracker.update(by_label.get(label, []), frame_id)
+
+    def _guidance_target(self, requested_target: Optional[str]) -> dict:
+        canonical = canonical_yolo_label(requested_target) if requested_target else None
+        if canonical is None:
+            return {
+                **self._target_tracker.latest(),
+                "requested_target": None,
+                "target_binding": "generic",
+            }
+        with self._target_trackers_lock:
+            tracker = self._target_trackers.get(canonical)
+        if tracker is None:
+            return {
+                "target_state": "not_found",
+                "stable": False,
+                "requested_target": canonical,
+                "target": canonical,
+                "target_label": canonical,
+                "target_confidence": None,
+                "target_binding": "explicit",
+                "persistence_count": 0,
+                "persistence_required": self.settings.guidance_persistence_frames,
+                "minimum_confidence": self.settings.guidance_min_confidence,
+                "overlap_iou_threshold": self.settings.guidance_iou_threshold,
+                "missed_frames": 0,
+                "max_missed_frames": self.settings.guidance_max_missed_frames,
+                "held_through_miss": False,
+                "frame_id": None,
+            }
+        state = tracker.latest()
+        state.update({
+            "requested_target": canonical,
+            "target_binding": "explicit",
+        })
+        state.setdefault("target", canonical)
+        state.setdefault("target_label", canonical)
+        return state
+
+    def latest_perception(
+        self,
+        display_rotation_deg: int = 0,
+        requested_target: Optional[str] = None,
+    ) -> dict:
         cache, metadata = self.cache.read_with_metadata(self.settings.stale_after_sec)
         with self._lock:
             service_healthy = self._service_healthy
@@ -479,6 +601,20 @@ class YoloShadowClient:
             "display_rotation_deg": display_rotation_deg,
             "mirrored": False,
             "objects": [],
+            "guidance_target": {
+                "target_state": "uncertain",
+                "stable": False,
+                "persistence_count": 0,
+                "persistence_required": self.settings.guidance_persistence_frames,
+                "minimum_confidence": self.settings.guidance_min_confidence,
+                "overlap_iou_threshold": self.settings.guidance_iou_threshold,
+                "missed_frames": 0,
+                "max_missed_frames": self.settings.guidance_max_missed_frames,
+                "held_through_miss": False,
+                "requested_target": requested_target,
+                "target_binding": "explicit" if requested_target else "generic",
+                "frame_id": None,
+            },
         }
         result = cache["result"]
         if result is not None:
@@ -488,5 +624,7 @@ class YoloShadowClient:
                 "image_width": result["image_width"],
                 "image_height": result["image_height"],
                 "objects": copy.deepcopy(result["objects"]),
+                "guidance_target": self._guidance_target(requested_target),
             })
+            response["guidance_target"]["age_ms"] = cache["age_ms"]
         return response

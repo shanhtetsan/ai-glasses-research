@@ -75,9 +75,23 @@ from perception_orientation import (
     RgbCanonicalizerTelemetry,
     canonicalize_thermal_payload,
     log_rgb_canonicalizer_health,
+    map_thermal_to_rgb_normalized,
     queue_latest_raw_rgb,
     run_latest_rgb_canonicalizer,
     summarize_thermal_grid,
+)
+from perception_fusion import (
+    HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
+    HandTargetGuidanceTracker,
+    build_hand_fusion_fact,
+    compact_guidance_for_log,
+    compact_hand_facts_for_log,
+    extract_requested_target,
+    guidance_anchor_for_utterance,
+    guidance_anchor_reason,
+    is_hand_perception_request,
+    is_target_directed_request,
+    should_wait_for_explicit_target,
 )
 try:
     import audioop
@@ -556,9 +570,15 @@ async def _on_audio(pcm24k: bytes):
                 )
 
 
-def build_perception_state() -> Optional[dict]:
+def build_perception_state(utterance: str = "") -> Optional[dict]:
     """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates."""
-    yolo = yolo_client.latest_perception(display_rotation_deg=0)
+    requested_target = extract_requested_target(utterance)
+    guidance_anchor = guidance_anchor_for_utterance(utterance)
+    anchor_reason = guidance_anchor_reason(utterance)
+    yolo = yolo_client.latest_perception(
+        display_rotation_deg=0,
+        requested_target=requested_target,
+    )
     hand_state = hand_client.latest_hands()
 
     yolo_fresh = bool(
@@ -587,26 +607,54 @@ def build_perception_state() -> Optional[dict]:
     hands = []
     if hands_fresh:
         for hand in (hand_state.get("hands") or [])[:2]:
-            if not isinstance(hand, dict):
-                continue
+            compact = build_hand_fusion_fact(hand)
+            if compact is not None:
+                hands.append(compact)
 
-            compact = {}
-            for key in (
-                "hand_index",
-                "handedness",
-                "handedness_score",
-                "index_tip_norm",
-                "wrist_norm",
-                "hand_center_norm",
-                "bbox_norm",
-            ):
-                if key in hand and hand[key] is not None:
-                    compact[key] = hand[key]
+    target_selection = (
+        dict(yolo.get("guidance_target") or {})
+        if yolo_fresh
+        else {
+            "target_state": "uncertain",
+            "stable": False,
+            "requested_target": requested_target,
+        }
+    )
+    selected_hand = None
+    if hands:
+        def _hand_priority(item: dict) -> tuple:
+            try:
+                handedness_score = float(item.get("handedness_score", 0.0))
+            except (TypeError, ValueError):
+                handedness_score = 0.0
+            return (
+                bool(item.get("gesture_authoritative") and item.get("gesture") == "pointing"),
+                bool(item.get("gesture_authoritative")),
+                bool(item.get("handedness_authoritative")),
+                handedness_score,
+                -int(item.get("hand_index", 0)),
+            )
+        selected_hand = max(hands, key=_hand_priority)
 
-            hands.append(compact)
+    guidance = None
+    if selected_hand is not None and yolo_fresh:
+        guidance = hand_target_guidance.build(
+            target_selection,
+            selected_hand,
+            guidance_anchor=guidance_anchor,
+            anchor_reason=anchor_reason,
+            requested_target=requested_target,
+            objects_age_ms=yolo.get("age_ms"),
+            hands_age_ms=hand_state.get("age_ms"),
+            object_frame_id=yolo.get("frame_id"),
+            hand_frame_id=hand_state.get("frame_id"),
+        )
 
     return {
         "coordinate_space": "canonical_rgb_normalized_2d",
+        "requested_target": requested_target,
+        "guidance_anchor": guidance_anchor,
+        "guidance_anchor_reason": anchor_reason,
         "objects_fresh": yolo_fresh,
         "objects_age_ms": yolo.get("age_ms") if yolo_fresh else None,
         "object_frame_id": yolo.get("frame_id") if yolo_fresh else None,
@@ -614,7 +662,16 @@ def build_perception_state() -> Optional[dict]:
         "hands_fresh": hands_fresh,
         "hands_age_ms": hand_state.get("age_ms") if hands_fresh else None,
         "hand_frame_id": hand_state.get("frame_id") if hands_fresh else None,
+        "handedness_semantics": {
+            "tracker_label": "anatomical_handedness",
+            "image_position": "independent canonical RGB left/center/right fact",
+            "authoritative_score_threshold": HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
+            "gesture_source": "landmark_geometry",
+            "gesture_authoritative_only_when_flagged": True,
+        },
         "hands": hands,
+        "target_selection": target_selection,
+        "guidance": guidance,
     }
 
 
@@ -668,7 +725,7 @@ async def _on_input_transcription(text: str):
 
     # Send fresh specialized perception with the same RGB vision turn.
     if _vision_submitted_for_turn and not _perception_submitted_for_turn:
-        perception = build_perception_state()
+        perception = build_perception_state(combined)
 
         if perception is None:
             print(
@@ -680,9 +737,30 @@ async def _on_input_transcription(text: str):
                 "PERCEPTION_STATE "
                 + json.dumps(perception, separators=(",", ":"))
                 + " Use these fresh detector results as supplemental visual evidence. "
-                  "For handedness, prefer a high-confidence hand-tracker result over "
-                  "guessing from pixels. Object detections may be incomplete. "
-                  "Normalized 2D coordinates do not provide physical distance."
+                  "MediaPipe handedness is ANATOMICAL handedness. When "
+                  "handedness_authoritative is true, you MUST use that anatomical "
+                  "Left/Right label and MUST NOT override it by visually guessing from "
+                  "image position. A Right hand can appear at image_left and a Left "
+                  "hand can appear at image_right; image position and anatomical "
+                  "handedness are different facts. Gesture labels such as fist or open "
+                  "palm are backend landmark-geometry facts; when gesture_authoritative "
+                  "is true, you MUST use that gesture and MUST NOT override it from the "
+                  "image. When target_state is uncertain, do not guess or give directional "
+                  "guidance. When target_state is not_found, say the requested target was "
+                  "not found and NEVER substitute another detected object. The requested_target "
+                  "and guidance_anchor fields are deterministic current-turn backend facts. "
+                  "Use the selected anchor and do not substitute a different hand landmark. "
+                  "When held_through_miss is true, the bbox is the last validated fresh cached "
+                  "position held for one temporary miss, not a new visual observation. "
+                  "When target_state is stable, guidance.horizontal_relation and "
+                  "guidance.vertical_relation are deterministic backend-computed facts in "
+                  "canonical RGB coordinates: do not reverse or reinterpret them from the "
+                  "image. Convert stable relations into concise instructions such as "
+                  "'Move your right hand left.' Object detections may be incomplete. "
+                  "Normalized offsets are 2D image coordinates only; NEVER describe dx_norm "
+                  "or dy_norm as meters, inches, physical depth, forward/backward movement, "
+                  "or physical distance such as '8 inches forward'. Depth and contact are "
+                  "unavailable."
             )
 
             _perception_submitted_for_turn = await gemini_live.send_text(
@@ -696,9 +774,15 @@ async def _on_input_transcription(text: str):
                 f"turn_id={turn_id} "
                 f"objects={len(perception['objects'])} "
                 f"hands={len(perception['hands'])} "
+                f"hand_facts={compact_hand_facts_for_log(perception['hands'])} "
                 f"submitted={_perception_submitted_for_turn}",
                 flush=True,
             )
+            if _perception_submitted_for_turn and perception.get("guidance") is not None:
+                print(
+                    "[GUIDANCE] " + compact_guidance_for_log(perception["guidance"]),
+                    flush=True,
+                )
 
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
@@ -994,6 +1078,9 @@ yolo_client = YoloShadowClient(
     rotation_provider=lambda: 0,
     on_event=research_exporter.publish_event,
 )
+hand_target_guidance = HandTargetGuidanceTracker(
+    deadband=yolo_settings.guidance_deadband,
+)
 hand_settings = HandClientSettings.from_env()
 hand_client = HandTrackingClient(hand_settings, latest_rgb)
 latency_tracker = LatencyTracker(history_size=200)
@@ -1015,6 +1102,12 @@ thermal_display_config: Dict[str, Any] = {
     "hotspot": True,
     "labels": True,
     "interpolation": "cubic",
+    # Neutral coarse 2D alignment. These map canonical thermal normalized
+    # coordinates into canonical RGB; they never change temperature data.
+    "calibration_offset_x": 0.0,
+    "calibration_offset_y": 0.0,
+    "calibration_scale_x": 1.0,
+    "calibration_scale_y": 1.0,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
@@ -1132,17 +1225,25 @@ _VISION_PHRASES = (
 
 def is_explicit_vision_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
-    return any(phrase in normalized for phrase in _VISION_PHRASES)
+    if should_wait_for_explicit_target(normalized):
+        return False
+    return (
+        any(phrase in normalized for phrase in _VISION_PHRASES)
+        or is_hand_perception_request(normalized)
+        or (
+            is_target_directed_request(normalized)
+            and extract_requested_target(normalized) is not None
+        )
+    )
 
 # ---- Thermal facts for Gemini ----
 # Gemini receives measurements, never the colorized heatmap: palette and
 # auto-range change every frame, so color-reading is unrepeatable. These come
 # straight off the canonical float32 grid in latest_thermal_matrix.
 THERMAL_FACT_MAX_AGE_SEC = float(os.getenv("THERMAL_FACT_MAX_AGE_SEC", "3.0"))
-# Fraction of the grid treated as "directly ahead". The MLX90640 and OV2640 are
-# rigidly co-mounted a few cm apart, so beyond ~1m parallax is under one thermal
-# pixel and the grid centre is the RGB centre. Deliberately avoids claiming
-# pixel-accurate correspondence, which would need a real calibration pass.
+# Fraction of the canonical thermal grid treated as "directly ahead" for raw
+# temperature summaries. RGB alignment is separately represented by the coarse
+# tunable 2D mapping below; neither path claims depth or removes parallax.
 THERMAL_CENTER_FRACTION = 0.4
 
 _THERMAL_PHRASES = (
@@ -1173,7 +1274,26 @@ def build_thermal_facts() -> Optional[dict]:
     age = time.monotonic() - snapshot.timestamp
     if age > THERMAL_FACT_MAX_AGE_SEC:
         return None
-    return summarize_thermal_grid(matrix, age, THERMAL_CENTER_FRACTION)
+    facts = summarize_thermal_grid(matrix, age, THERMAL_CENTER_FRACTION)
+    if facts is None:
+        return None
+    hotspot_norm = facts.get("hotspot", {}).get("thermal_norm")
+    if isinstance(hotspot_norm, list) and len(hotspot_norm) == 2:
+        mapped = map_thermal_to_rgb_normalized(
+            hotspot_norm[0],
+            hotspot_norm[1],
+            offset_x=thermal_display_config["calibration_offset_x"],
+            offset_y=thermal_display_config["calibration_offset_y"],
+            scale_x=thermal_display_config["calibration_scale_x"],
+            scale_y=thermal_display_config["calibration_scale_y"],
+        )
+        facts["hotspot"]["rgb_norm_coarse"] = [round(value, 6) for value in mapped]
+    facts["spatial_alignment_note"] = (
+        "Canonical thermal coordinates mapped to canonical RGB by a coarse "
+        "tunable 2D affine alignment. This is not depth, distance, or 3D "
+        "calibration and remains subject to parallax. Temperatures are unwarped."
+    )
+    return facts
 
 
 async def request_gemini_vision(reason: str) -> dict:
@@ -1894,6 +2014,7 @@ def health():
         "vision": dict(vision_controller.metrics),
         "yolo": yolo_client.health(),
         "hands": hand_client.health(),
+        "thermal_calibration": thermal_calibration_diagnostics(),
         "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "audio_freshness": audio_freshness_tracker.snapshot(),
@@ -2042,11 +2163,65 @@ class ThermalDisplaySettings(BaseModel):
     hotspot: Optional[bool] = None
     labels: Optional[bool] = None
     interpolation: Optional[str] = None
+    calibration_offset_x: Optional[float] = None
+    calibration_offset_y: Optional[float] = None
+    calibration_scale_x: Optional[float] = None
+    calibration_scale_y: Optional[float] = None
+
+
+def thermal_calibration_diagnostics() -> dict:
+    calibration = {
+        key: thermal_display_config[key]
+        for key in (
+            "calibration_offset_x",
+            "calibration_offset_y",
+            "calibration_scale_x",
+            "calibration_scale_y",
+        )
+    }
+    state = {
+        "canonical_orientation": (
+            "portrait_32x24_rows_by_cols; native_24x32 rotated_90ccw_then_flipped_horizontal"
+        ),
+        **calibration,
+        "hotspot_thermal_norm": None,
+        "hotspot_rgb_norm_unclamped": None,
+        "hotspot_rgb_norm_display": None,
+        "mapping_limitations": "coarse_2d_only; parallax_and_depth_not_calibrated",
+    }
+    matrix = latest_thermal_matrix
+    if matrix is None or matrix.shape != (32, 24) or not np.isfinite(matrix).all():
+        return state
+    row, col = np.unravel_index(int(np.argmax(matrix)), matrix.shape)
+    thermal_norm = [(float(col) + 0.5) / matrix.shape[1], (float(row) + 0.5) / matrix.shape[0]]
+    mapping_args = {
+        "offset_x": calibration["calibration_offset_x"],
+        "offset_y": calibration["calibration_offset_y"],
+        "scale_x": calibration["calibration_scale_x"],
+        "scale_y": calibration["calibration_scale_y"],
+    }
+    mapped = map_thermal_to_rgb_normalized(*thermal_norm, **mapping_args)
+    display = map_thermal_to_rgb_normalized(
+        *thermal_norm, **mapping_args, clamp_for_display=True
+    )
+    state.update({
+        "hotspot_thermal_norm": [round(value, 6) for value in thermal_norm],
+        "hotspot_rgb_norm_unclamped": [round(value, 6) for value in mapped],
+        "hotspot_rgb_norm_display": [round(value, 6) for value in display],
+    })
+    return state
+
+
+def thermal_display_state() -> dict:
+    return {
+        **thermal_display_config,
+        "calibration_diagnostics": thermal_calibration_diagnostics(),
+    }
 
 
 @app.get("/api/thermal-display")
 def get_thermal_display():
-    return JSONResponse(dict(thermal_display_config))
+    return JSONResponse(thermal_display_state())
 
 
 @app.post("/api/thermal-display")
@@ -2060,8 +2235,30 @@ def update_thermal_display(settings: ThermalDisplaySettings):
     next_max = float(values.get("max_c", thermal_display_config["max_c"]))
     if next_min >= next_max:
         return JSONResponse({"error": "min_c must be less than max_c"}, status_code=400)
+    for key in ("calibration_offset_x", "calibration_offset_y"):
+        if key in values:
+            value = float(values[key])
+            if not np.isfinite(value) or not -1.0 <= value <= 1.0:
+                return JSONResponse({"error": f"{key} must be finite and between -1 and 1"}, status_code=400)
+    for key in ("calibration_scale_x", "calibration_scale_y"):
+        if key in values:
+            value = float(values[key])
+            if not np.isfinite(value) or not 0.1 <= value <= 3.0:
+                return JSONResponse({"error": f"{key} must be finite and between 0.1 and 3"}, status_code=400)
     thermal_display_config.update(values)
-    return JSONResponse(dict(thermal_display_config))
+    if any(key.startswith("calibration_") for key in values):
+        calibration = thermal_calibration_diagnostics()
+        print(
+            "[THERMAL-CAL] "
+            f"offset=({calibration['calibration_offset_x']},"
+            f"{calibration['calibration_offset_y']}) "
+            f"scale=({calibration['calibration_scale_x']},"
+            f"{calibration['calibration_scale_y']}) "
+            f"hotspot_thermal={calibration['hotspot_thermal_norm']} "
+            f"hotspot_rgb={calibration['hotspot_rgb_norm_unclamped']}",
+            flush=True,
+        )
+    return JSONResponse(thermal_display_state())
    
 
 

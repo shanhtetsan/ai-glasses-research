@@ -25,6 +25,44 @@ export function transformNormalizedLandmark(landmark) {
   return [clamp01(landmark.x), clamp01(landmark.y)];
 }
 
+export function mapThermalToRgbNormalized(
+  point,
+  calibration = {},
+  {clampForDisplay = false} = {},
+) {
+  if (!Array.isArray(point) || point.length !== 2) return null;
+  const thermalX = Number(point[0]);
+  const thermalY = Number(point[1]);
+  const offsetX = Number(calibration.calibration_offset_x ?? 0);
+  const offsetY = Number(calibration.calibration_offset_y ?? 0);
+  const scaleX = Number(calibration.calibration_scale_x ?? 1);
+  const scaleY = Number(calibration.calibration_scale_y ?? 1);
+  if (![thermalX, thermalY, offsetX, offsetY, scaleX, scaleY].every(Number.isFinite)) {
+    return null;
+  }
+  let rgbX = 0.5 + (thermalX - 0.5) * scaleX + offsetX;
+  let rgbY = 0.5 + (thermalY - 0.5) * scaleY + offsetY;
+  // Preserve out-of-frame calibration coordinates unless a display marker
+  // explicitly requests clamping. Raw measurement coordinates are untouched.
+  if (clampForDisplay) {
+    rgbX = clamp01(rgbX);
+    rgbY = clamp01(rgbY);
+  }
+  return [rgbX, rgbY];
+}
+
+export function thermalCalibrationRect(calibration = {}) {
+  const topLeft = mapThermalToRgbNormalized([0, 0], calibration);
+  const bottomRight = mapThermalToRgbNormalized([1, 1], calibration);
+  if (!topLeft || !bottomRight) return null;
+  return {
+    left: topLeft[0],
+    top: topLeft[1],
+    width: bottomRight[0] - topLeft[0],
+    height: bottomRight[1] - topLeft[1],
+  };
+}
+
 export function containRect(containerWidth, containerHeight, contentWidth, contentHeight) {
   const cw = Math.max(0, Number(containerWidth) || 0);
   const ch = Math.max(0, Number(containerHeight) || 0);

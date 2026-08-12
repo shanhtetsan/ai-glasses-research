@@ -86,6 +86,14 @@ class _SlowLatestOnlyClient:
 
 
 class YoloClientContractTests(unittest.TestCase):
+    @staticmethod
+    def _guidance_object(label, confidence, bbox):
+        return {
+            "label": label,
+            "confidence": confidence,
+            "bbox_norm": bbox,
+        }
+
     def test_service_response_is_clamped_and_validated(self):
         payload = _service_result()
         payload["objects"][0]["bbox_norm"] = [-1, 0.2, 2, 0.9]
@@ -162,6 +170,91 @@ class YoloClientContractTests(unittest.TestCase):
         health = client.health()
         self.assertEqual(health["frames_skipped"], 3)
         self.assertEqual(health["frames_replaced"], 3)
+
+    def test_requested_target_beats_higher_confidence_unrelated_object(self):
+        client = YoloShadowClient(
+            YoloClientSettings(
+                guidance_persistence_frames=2,
+                guidance_max_missed_frames=1,
+            ),
+            LatestFrameStore(),
+        )
+        objects = [
+            self._guidance_object("keyboard", 0.82, [0.05, 0.1, 0.4, 0.4]),
+            self._guidance_object("cup", 0.71, [0.55, 0.35, 0.75, 0.65]),
+            self._guidance_object("book", 0.65, [0.1, 0.6, 0.5, 0.9]),
+        ]
+        client._update_target_stability(objects, 1)
+        client._update_target_stability(objects, 2)
+        requested = client._guidance_target("cup")
+        generic = client._guidance_target(None)
+        self.assertEqual(requested["target_state"], "stable")
+        self.assertEqual(requested["target"], "cup")
+        self.assertEqual(requested["requested_target"], "cup")
+        self.assertEqual(generic["target"], "keyboard")
+
+    def test_requested_target_absent_or_below_threshold_never_substitutes(self):
+        client = YoloShadowClient(
+            YoloClientSettings(guidance_persistence_frames=2),
+            LatestFrameStore(),
+        )
+        keyboard = self._guidance_object(
+            "keyboard", 0.90, [0.05, 0.1, 0.4, 0.4]
+        )
+        client._update_target_stability([keyboard], 1)
+        client._update_target_stability([keyboard], 2)
+        absent = client._guidance_target("bottle")
+        self.assertEqual(absent["target_state"], "not_found")
+        self.assertEqual(absent["target"], "bottle")
+
+        low_cup = self._guidance_object("cup", 0.49, [0.5, 0.3, 0.7, 0.7])
+        client._update_target_stability([keyboard, low_cup], 3)
+        client._update_target_stability([keyboard, low_cup], 4)
+        below = client._guidance_target("cup")
+        self.assertEqual(below["target_state"], "uncertain")
+        self.assertEqual(below["target"], "cup")
+        self.assertNotEqual(below.get("target"), "keyboard")
+
+    def test_requested_target_is_per_call_and_resets_for_unrelated_turn(self):
+        client = YoloShadowClient(
+            YoloClientSettings(guidance_persistence_frames=1),
+            LatestFrameStore(),
+        )
+        objects = [
+            self._guidance_object("keyboard", 0.82, [0.05, 0.1, 0.4, 0.4]),
+            self._guidance_object("cup", 0.71, [0.55, 0.35, 0.75, 0.65]),
+        ]
+        client._update_target_stability(objects, 1)
+        requested_turn = client._guidance_target("cup")
+        unrelated_turn = client._guidance_target(None)
+        self.assertEqual(requested_turn["requested_target"], "cup")
+        self.assertIsNone(unrelated_turn["requested_target"])
+        self.assertEqual(unrelated_turn["target_binding"], "generic")
+        self.assertEqual(unrelated_turn["target"], "keyboard")
+
+    def test_requested_target_miss_grace_ignores_competing_object(self):
+        client = YoloShadowClient(
+            YoloClientSettings(
+                guidance_persistence_frames=2,
+                guidance_max_missed_frames=1,
+            ),
+            LatestFrameStore(),
+        )
+        cup = self._guidance_object("cup", 0.80, [0.5, 0.3, 0.7, 0.7])
+        keyboard = self._guidance_object(
+            "keyboard", 0.99, [0.05, 0.1, 0.4, 0.4]
+        )
+        client._update_target_stability([cup], 1)
+        client._update_target_stability([cup], 2)
+        client._update_target_stability([keyboard], 3)
+        held = client._guidance_target("cup")
+        client._update_target_stability([keyboard], 4)
+        expired = client._guidance_target("cup")
+        self.assertEqual(held["target_state"], "stable")
+        self.assertTrue(held["held_through_miss"])
+        self.assertEqual(held["target_bbox"], [0.5, 0.3, 0.7, 0.7])
+        self.assertEqual(expired["target_state"], "uncertain")
+        self.assertEqual(expired["target"], "cup")
 
     def test_detection_log_is_change_triggered_and_rate_limited(self):
         client = YoloShadowClient(YoloClientSettings(), LatestFrameStore())
