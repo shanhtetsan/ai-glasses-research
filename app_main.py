@@ -278,6 +278,7 @@ _tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
 _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
+_perception_submitted_for_turn: bool = False
 _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
@@ -299,7 +300,7 @@ def _log_gemini_timing(event: str, turn_id: Optional[int], **fields) -> None:
 
 def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
     had_state = bool(
         _input_text_buf
         or _output_text_buf
@@ -310,6 +311,7 @@ def _clear_gemini_turn_state(reason: str) -> None:
     _output_text_buf.clear()
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
+    _perception_submitted_for_turn = False
     if had_state:
         print(
             f"[GEMINI-TURN] state_cleared reason={reason} "
@@ -553,9 +555,72 @@ async def _on_audio(pcm24k: bytes):
                     queue_depth=_tts_send_queue.qsize(),
                 )
 
+
+def build_perception_state() -> Optional[dict]:
+    """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates."""
+    yolo = yolo_client.latest_perception(display_rotation_deg=0)
+    hand_state = hand_client.latest_hands()
+
+    yolo_fresh = bool(
+        yolo.get("enabled")
+        and yolo.get("available")
+        and not yolo.get("stale")
+        and yolo.get("service_healthy") is not False
+    )
+
+    hands_fresh = bool(
+        hand_state.get("enabled")
+        and hand_state.get("available")
+        and not hand_state.get("stale")
+        and hand_state.get("service_healthy") is not False
+    )
+
+    if not yolo_fresh and not hands_fresh:
+        return None
+
+    objects = []
+    if yolo_fresh:
+        for obj in (yolo.get("objects") or [])[:8]:
+            if isinstance(obj, dict):
+                objects.append(dict(obj))
+
+    hands = []
+    if hands_fresh:
+        for hand in (hand_state.get("hands") or [])[:2]:
+            if not isinstance(hand, dict):
+                continue
+
+            compact = {}
+            for key in (
+                "hand_index",
+                "handedness",
+                "handedness_score",
+                "index_tip_norm",
+                "wrist_norm",
+                "hand_center_norm",
+                "bbox_norm",
+            ):
+                if key in hand and hand[key] is not None:
+                    compact[key] = hand[key]
+
+            hands.append(compact)
+
+    return {
+        "coordinate_space": "canonical_rgb_normalized_2d",
+        "objects_fresh": yolo_fresh,
+        "objects_age_ms": yolo.get("age_ms") if yolo_fresh else None,
+        "object_frame_id": yolo.get("frame_id") if yolo_fresh else None,
+        "objects": objects,
+        "hands_fresh": hands_fresh,
+        "hands_age_ms": hand_state.get("age_ms") if hands_fresh else None,
+        "hand_frame_id": hand_state.get("frame_id") if hands_fresh else None,
+        "hands": hands,
+    }
+
+
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
     if not text:
         return
     turn_id = latency_tracker.ensure_turn()
@@ -600,6 +665,41 @@ async def _on_input_transcription(text: str):
                 f"submitted={_vision_submitted_for_turn}",
                 flush=True,
             )
+
+    # Send fresh specialized perception with the same RGB vision turn.
+    if _vision_submitted_for_turn and not _perception_submitted_for_turn:
+        perception = build_perception_state()
+
+        if perception is None:
+            print(
+                f"[PERCEPTION] turn_id={turn_id} no fresh detector state; not submitted",
+                flush=True,
+            )
+        else:
+            perception_payload = (
+                "PERCEPTION_STATE "
+                + json.dumps(perception, separators=(",", ":"))
+                + " Use these fresh detector results as supplemental visual evidence. "
+                  "For handedness, prefer a high-confidence hand-tracker result over "
+                  "guessing from pixels. Object detections may be incomplete. "
+                  "Normalized 2D coordinates do not provide physical distance."
+            )
+
+            _perception_submitted_for_turn = await gemini_live.send_text(
+                perception_payload,
+                turn_id=turn_id,
+                source="perception_facts",
+            )
+
+            print(
+                f"[PERCEPTION] generation={gemini_live.session_generation} "
+                f"turn_id={turn_id} "
+                f"objects={len(perception['objects'])} "
+                f"hands={len(perception['hands'])} "
+                f"submitted={_perception_submitted_for_turn}",
+                flush=True,
+            )
+
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
         build_started_ns = time.monotonic_ns()
@@ -661,7 +761,7 @@ async def _on_turn_complete():
     Gemini at all while in a restrictive navigation state.
     """
     global omni_conversation_active, omni_previous_nav_state
-    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
 
     turn_id = latency_tracker.ensure_turn()
     active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
@@ -688,6 +788,7 @@ async def _on_turn_complete():
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
+    _perception_submitted_for_turn = False
 
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
