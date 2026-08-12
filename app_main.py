@@ -783,6 +783,7 @@ from stability_runtime import (
     parse_sensor_message,
 )
 from yolo_client import YoloClientSettings, YoloShadowClient
+from hand_client import HandClientSettings, HandTrackingClient
 
 # ---- IMU UDP ----
 UDP_IP   = "0.0.0.0"
@@ -809,6 +810,8 @@ yolo_client = YoloShadowClient(
     latest_rgb,
     rotation_provider=lambda: 0,
 )
+hand_settings = HandClientSettings.from_env()
+hand_client = HandTrackingClient(hand_settings, latest_rgb)
 latency_tracker = LatencyTracker(history_size=200)
 _latency_csv_lock = threading.Lock()
 # Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
@@ -1691,6 +1694,7 @@ def health():
         },
         "vision": dict(vision_controller.metrics),
         "yolo": yolo_client.health(),
+        "hands": hand_client.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
         "connections": dict(backend_metrics),
     })
@@ -1729,6 +1733,12 @@ def yolo_detections():
 def latest_perception():
     """Read-only browser view of the latest YOLO shadow result."""
     return JSONResponse(yolo_client.latest_perception(display_rotation_deg=0))
+
+
+@app.get("/api/perception/hands/latest")
+def latest_hands():
+    """Read-only hand cache in the canonical RGB source coordinate space."""
+    return JSONResponse(hand_client.latest_hands())
 
 
 class RecordingCommand(BaseModel):
@@ -3372,6 +3382,11 @@ async def startup_yolo_shadow():
 
 
 @app.on_event("startup")
+async def startup_hand_tracking():
+    await hand_client.start()
+
+
+@app.on_event("startup")
 async def on_startup_register_bridge_sender():
     # Save the main thread's event loop
     main_loop = asyncio.get_event_loop()
@@ -3493,6 +3508,7 @@ async def on_shutdown():
     """Clean up resources when the application shuts down."""
     global _tts_sender_task
     print("[SHUTDOWN] Starting resource cleanup...")
+    await hand_client.stop()
     await yolo_client.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
