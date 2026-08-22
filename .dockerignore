@@ -1,0 +1,40 @@
+# flyctl launch added from .gitignore
+**/.env
+**/venv
+**/__pycache__
+**/*.pyc
+**/recordings
+**/*.wav
+**/*.avi
+**/.DS_Store
+**/.vscode
+
+# Model files (download with scripts/download_models.sh)
+**/model/*.pt
+**/model/*.task
+
+# Ultralytics asset cache (auto-downloaded on first YOLOE load, ~571 MiB)
+**/mobileclip_blt.ts
+
+# Local caches
+**/.cache
+**/.config
+
+# Local agent memory / scratch
+**/.agent
+
+# Backend Gemini-vs-Qwen comparison research (local analysis, not for main)
+**/screenshots
+**/gemini_vs_qwen_comparison.csv
+**/gemini_vs_qwen_comparison copy.csv
+**/Untitled spreadsheet - Sheet1.csv
+**/dev_compare_backends.py
+**/scripts/build_comparison_csv.py
+**/scripts/run_qwen_on_screenshots.py
+**/scripts/fill_untitled_sheet.py
+**/test.md
+
+# flyctl launch added from venv/.gitignore
+# Created by venv; see https://docs.python.org/3/library/venv.html
+venv/**/*
+fly.toml

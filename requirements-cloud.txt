@@ -1,0 +1,45 @@
+# AI Glass System - Cloud (gemini_live-only) Dependencies
+# Python 3.9 - 3.11 supported
+#
+# Scoped to what gemini_live's code path actually needs: WS/HTTP server,
+# the Gemini Live SDK, and JPEG encode/decode for the camera pipeline.
+# Deliberately excludes torch/torchvision/ultralytics/mediapipe (blind-path
+# and cross-street navigation, obstacle/general-object detection) and
+# dashscope/openai/pyaudio/pydub/pygame (the old DashScope/local-TTS path) —
+# see app_main.py's try/except import guards for how those degrade to
+# navigation-disabled instead of crashing at startup when absent.
+
+# Core Web Framework
+# fastapi==0.104.1 / starlette==0.27.0 / websockets==12.0 were stale enough
+# to actively conflict with google-genai's own floors below (its websockets
+# floor alone is >=13.0, above the old ==12.0 pin here) — floored instead of
+# pinned so pip resolves versions that satisfy both. uvicorn and
+# python-multipart have no such conflict; left unpinned too since there's no
+# real compatibility floor tying them to a specific fastapi/starlette version
+# (python-multipart also isn't currently used anywhere in app_main.py — no
+# Form()/UploadFile/.form() call sites — kept for when it is).
+fastapi>=0.110
+starlette>=0.36
+uvicorn[standard]
+websockets
+python-multipart
+
+# Gemini Live SDK (gemini_live_client.py: `from google import genai`)
+# Pinned — the one version-sensitive package here. Declares its own floors
+# that matter more than anything above: pydantic>=2.12.5,<3.0.0,
+# websockets>=13.0.0,<17.0, anyio>=4.8.0,<5.0.0, httpx>=0.28.1,<1.0.0.
+google-genai==2.10.0
+
+# Camera pipeline (JPEG decode/encode) — headless build, no GUI libs
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+
+# gemini_client.py (vision_backend.py's default MODEL_BACKEND=gemini path,
+# imported unconditionally by app_main.py regardless of AI_BACKEND unless
+# MODEL_BACKEND is explicitly set to "qwen") decodes base64 image data-URLs
+# via PIL.Image before passing them to generate_content_stream(). No
+# torch/CUDA dependency — safe to include outright rather than guard.
+Pillow==10.1.0
+
+# Environment & Configuration
+python-dotenv==1.0.0

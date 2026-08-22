@@ -1,4 +1,18 @@
 // static/main.js
+import {
+  containRect,
+  drawHandLandmarks,
+  drawObjectDetections,
+  isHandResultFresh,
+  isPerceptionFresh,
+  resizeOverlayCanvas,
+  thermalCalibrationRect,
+} from './perception_overlay.mjs';
+import {
+  RGB_VIEWER_STATE,
+  RgbViewerFreshness,
+} from './rgb_viewer_freshness.mjs';
+import {audioBadgePresentation} from './audio_freshness.mjs';
 
 // ================= Camera + ASR =================
 (() => {
@@ -11,6 +25,62 @@
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
+  const overlayCanvas = document.getElementById('overlayCanvas');
+  const overlayCtx = overlayCanvas.getContext('2d');
+  const objectsToggle = document.getElementById('objectsToggle');
+  const handsToggle = document.getElementById('handsToggle');
+  const yoloState = document.getElementById('yoloState');
+  const yoloObjects = document.getElementById('yoloObjects');
+  const yoloInference = document.getElementById('yoloInference');
+  const handState = document.getElementById('handState');
+  const handCount = document.getElementById('handCount');
+  const handInference = document.getElementById('handInference');
+  const thermalCanvas = document.getElementById('thermalCanvas');
+  const thermalCtx    = thermalCanvas.getContext('2d');
+  const thermalAlignToggle = document.getElementById('thermalAlignRgb');
+  let rgbFrameWidth = 0;
+  let rgbFrameHeight = 0;
+  const PERCEPTION_POLL_MS = 1000;
+  const PERCEPTION_MAX_DISPLAY_AGE_MS = 3000;
+  const HAND_POLL_MS = 333;
+  const HAND_MAX_DISPLAY_AGE_MS = 1500;
+  let objectsEnabled = true;
+  let handsEnabled = true;
+  let latestPerception = null;
+  let perceptionReceivedAt = 0;
+  let latestHands = null;
+  let handsReceivedAt = 0;
+  let thermalCalibration = {
+    calibration_offset_x: 0,
+    calibration_offset_y: 0,
+    calibration_scale_x: 1,
+    calibration_scale_y: 1,
+  };
+
+  function applyThermalAlignment(fitted) {
+    const rect = thermalCalibrationRect(thermalCalibration);
+    if (!rect || !thermalAlignToggle?.checked) {
+      document.body.classList.remove('thermal-align-rgb');
+      return;
+    }
+    const stage = canvas.parentElement;
+    stage.style.setProperty('--thermal-aligned-left', `${fitted.left + rect.left * fitted.width}px`);
+    stage.style.setProperty('--thermal-aligned-top', `${fitted.top + rect.top * fitted.height}px`);
+    stage.style.setProperty('--thermal-aligned-width', `${rect.width * fitted.width}px`);
+    stage.style.setProperty('--thermal-aligned-height', `${rect.height * fitted.height}px`);
+    document.body.classList.add('thermal-align-rgb');
+  }
+
+  function updateThermalCalibration(next) {
+    if (!next || typeof next !== 'object') return;
+    thermalCalibration = {
+      calibration_offset_x: Number(next.calibration_offset_x ?? 0),
+      calibration_offset_y: Number(next.calibration_offset_y ?? 0),
+      calibration_scale_x: Number(next.calibration_scale_x ?? 1),
+      calibration_scale_y: Number(next.calibration_scale_y ?? 1),
+    };
+    fitCanvas();
+  }
 
   // === get/create chat container ===
   let chatContainer = document.getElementById('chatContainer');
@@ -188,11 +258,6 @@
     container.scrollTop = container.scrollHeight;
   }
 
-  function setBadge(el, ok, text){
-    el.textContent = text;
-    el.className = 'badge ' + (ok? 'ok' : 'err');
-  }
-
   function navLabelAndText(raw) {
     const t = raw.startsWith('[NAV]') ? raw.substring(5).trim() : raw;
     const crossHints = ['crosswalk', 'crossing', 'red light', 'green light', 'traffic light', 'zebra'];
@@ -201,30 +266,186 @@
     return { label, text: `${label} ${t}` };
   }
 
-  function fitCanvas(){
-    const rect = canvas.getBoundingClientRect();
-    const w = Math.max(320, Math.floor(rect.width));
-    const h = Math.max(240, Math.floor(rect.width * 3/4)); // 4:3
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w; canvas.height = h;
+  function fitCanvas(frameWidth = rgbFrameWidth, frameHeight = rgbFrameHeight){
+    if (!frameWidth || !frameHeight) return;
+    rgbFrameWidth = frameWidth;
+    rgbFrameHeight = frameHeight;
+    const stage = canvas.parentElement;
+    const fitted = containRect(stage.clientWidth, stage.clientHeight, frameWidth, frameHeight);
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    for (const layer of [canvas, overlayCanvas]) {
+      layer.style.inset = 'auto';
+      layer.style.left = `${fitted.left}px`;
+      layer.style.top = `${fitted.top}px`;
+      layer.style.width = `${fitted.width}px`;
+      layer.style.height = `${fitted.height}px`;
     }
+    const backingWidth = Math.max(1, Math.round(fitted.width * dpr));
+    const backingHeight = Math.max(1, Math.round(fitted.height * dpr));
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+    resizeOverlayCanvas(overlayCanvas, fitted.width, fitted.height, dpr);
+    applyThermalAlignment(fitted);
+    renderPerception();
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
+  window.addEventListener('thermalcalibrationchange', event => {
+    updateThermalCalibration(event.detail);
+  });
+  if (thermalAlignToggle) {
+    thermalAlignToggle.addEventListener('change', ()=>fitCanvas());
+  }
+  fetch('/api/thermal-display', {cache: 'no-store'})
+    .then(response => response.ok ? response.json() : null)
+    .then(updateThermalCalibration)
+    .catch(()=>{});
 
-  let wsCam, wsUI, frames = 0, fpsTimer = 0;
+  const RGB_STALE_AFTER_MS = 2500;
+  const RGB_FRESHNESS_CHECK_MS = 250;
+  const RGB_BACKEND_CHECK_MS = 1000;
+  let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
+  let cameraGeneration = 0;
+  let freshnessTimer, backendFreshnessTimer, audioFreshnessTimer;
+  let perceptionPollTimer, handPollTimer, perceptionRenderTimer;
 
-  function drawBlob(buf){
-    const blob = new Blob([buf], {type:'image/jpeg'});
-    if ('createImageBitmap' in window){
-      createImageBitmap(blob).then(bmp=>{
-        fitCanvas();
-        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-      }).catch(()=>{});
-    }else{
-      const img = new Image();
-      img.onload = ()=>{ fitCanvas(); ctx.drawImage(img,0,0,canvas.width,canvas.height); URL.revokeObjectURL(img.src); };
-      img.src = URL.createObjectURL(blob);
+  function setAudioState(snapshot){
+    const badge = audioBadgePresentation(snapshot);
+    $asrStatus.className = badge.className;
+    $asrStatus.textContent = badge.text;
+  }
+
+  async function refreshAudioFreshness(){
+    try {
+      const response = await fetch('/api/audio-freshness', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      setAudioState(await response.json());
+    } catch (_error) {
+      setAudioState({state: 'recovering'});
     }
+  }
+
+  function setCameraState(snapshot){
+    if (snapshot.state === RGB_VIEWER_STATE.FRESH) {
+      $camStatus.className = 'chip ok';
+      $camStatus.textContent = 'Camera: fresh';
+      return;
+    }
+    if (snapshot.state === RGB_VIEWER_STATE.DISCONNECTED) {
+      $camStatus.className = 'chip err';
+      $camStatus.textContent = snapshot.cause === 'backend_socket'
+        ? 'Camera: device disconnected'
+        : 'Camera: disconnected';
+      return;
+    }
+    $camStatus.className = 'chip warn';
+    $camStatus.textContent = snapshot.state === RGB_VIEWER_STATE.RECOVERING
+      ? 'Camera: recovering…'
+      : snapshot.cause === 'backend_frame'
+        ? 'Camera: upstream stale'
+        : 'Camera: stale';
+  }
+
+  let rgbFreshness;
+
+  function renderPerception(){
+    const rect = overlayCanvas.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const elapsed = perceptionReceivedAt ? performance.now() - perceptionReceivedAt : 0;
+    const fresh = isPerceptionFresh(
+      latestPerception,
+      elapsed,
+      PERCEPTION_MAX_DISPLAY_AGE_MS,
+    );
+    if (objectsEnabled && fresh) {
+      drawObjectDetections(
+        overlayCtx,
+        latestPerception.objects,
+        {width: rect.width, height: rect.height},
+      );
+    }
+    const handElapsed = handsReceivedAt ? performance.now() - handsReceivedAt : 0;
+    const handsFresh = isHandResultFresh(
+      latestHands,
+      handElapsed,
+      HAND_MAX_DISPLAY_AGE_MS,
+    );
+    if (handsEnabled && handsFresh) {
+      drawHandLandmarks(
+        overlayCtx,
+        latestHands.hands,
+        {width: rect.width, height: rect.height},
+      );
+    }
+
+    const enabled = latestPerception ? latestPerception.enabled : true;
+    const healthy = latestPerception && latestPerception.service_healthy;
+    yoloState.textContent = !enabled
+      ? 'YOLO: disabled'
+      : fresh ? (healthy === false ? 'YOLO: degraded' : 'YOLO: healthy')
+        : latestPerception && latestPerception.stale ? 'YOLO: stale' : 'YOLO: waiting';
+    yoloObjects.textContent = `Objects: ${fresh ? latestPerception.objects.length : 0}`;
+    yoloInference.textContent = fresh
+      ? `Inference: ${Math.round(latestPerception.inference_ms)} ms`
+      : 'Inference: --';
+
+    const handFeatureEnabled = latestHands ? latestHands.enabled : true;
+    const handHealthy = latestHands && latestHands.service_healthy;
+    handState.textContent = !handFeatureEnabled
+      ? 'Hands: disabled'
+      : handsFresh ? (handHealthy === false ? 'Hands: degraded' : 'Hands: healthy')
+        : latestHands && latestHands.stale ? 'Hands: stale' : 'Hands: waiting';
+    handCount.textContent = `Hands: ${handsFresh ? latestHands.hands.length : 0}`;
+    handInference.textContent = handsFresh
+      ? `Hand inference: ${Math.round(latestHands.inference_ms)} ms`
+      : 'Hand inference: --';
+  }
+
+  async function refreshPerception(){
+    try {
+      const response = await fetch('/api/perception/latest', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      latestPerception = await response.json();
+      perceptionReceivedAt = performance.now();
+    } catch (_error) {
+      latestPerception = null;
+      perceptionReceivedAt = 0;
+    }
+    renderPerception();
+  }
+
+  async function refreshHands(){
+    try {
+      const response = await fetch('/api/perception/hands/latest', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      latestHands = await response.json();
+      handsReceivedAt = performance.now();
+    } catch (_error) {
+      latestHands = null;
+      handsReceivedAt = 0;
+    }
+    renderPerception();
+  }
+
+  objectsToggle.onclick = ()=>{
+    objectsEnabled = !objectsEnabled;
+    objectsToggle.textContent = `Objects: ${objectsEnabled ? 'ON' : 'OFF'}`;
+    objectsToggle.classList.toggle('active', objectsEnabled);
+    renderPerception();
+  };
+
+  handsToggle.onclick = ()=>{
+    handsEnabled = !handsEnabled;
+    handsToggle.textContent = `Hands: ${handsEnabled ? 'ON' : 'OFF'}`;
+    handsToggle.classList.toggle('active', handsEnabled);
+    renderPerception();
+  };
+
+  function noteRenderedFrame(){
+    rgbFreshness.frameRendered();
     frames++;
     const now = performance.now();
     if (!fpsTimer) fpsTimer = now;
@@ -234,26 +455,119 @@
     }
   }
 
-  function connectCamera(){
-    try{ if (wsCam) wsCam.close(); }catch(e){}
+  function drawBlob(buf, generation){
+    const blob = new Blob([buf], {type:'image/jpeg'});
+    if ('createImageBitmap' in window){
+      createImageBitmap(blob).then(bmp=>{
+        if (generation !== cameraGeneration) { bmp.close(); return; }
+        fitCanvas(bmp.width, bmp.height);
+        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+        bmp.close();
+        noteRenderedFrame();
+      }).catch(()=>{});
+    }else{
+      const img = new Image();
+      img.onload = ()=>{
+        if (generation === cameraGeneration) {
+          fitCanvas(img.naturalWidth, img.naturalHeight);
+          ctx.drawImage(img,0,0,canvas.width,canvas.height);
+          noteRenderedFrame();
+        }
+        URL.revokeObjectURL(img.src);
+      };
+      img.src = URL.createObjectURL(blob);
+    }
+  }
+
+  function connectCamera({manual = false} = {}){
+    rgbFreshness.beginConnection({manual});
+    const generation = ++cameraGeneration;
+    if (wsCam) {
+      wsCam.onopen = null;
+      wsCam.onclose = null;
+      wsCam.onerror = null;
+      wsCam.onmessage = null;
+      try{ wsCam.close(); }catch(e){}
+    }
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
-    setBadge($camStatus, false, 'Camera: connecting…');
-    wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Camera: connected');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Camera: disconnected');
-    wsCam.onerror = ()=> setBadge($camStatus, false, 'Camera: error');
-    wsCam.onmessage = (ev)=> drawBlob(ev.data);
+    const socket = new WebSocket(`${proto}://${location.host}/ws/viewer`);
+    wsCam = socket;
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketOpened();
+    };
+    socket.onclose = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketClosed();
+    };
+    socket.onerror = ()=>{
+      if (socket === wsCam && generation === cameraGeneration) rgbFreshness.socketClosed();
+    };
+    socket.onmessage = (ev)=>{
+      if (socket === wsCam && generation === cameraGeneration) drawBlob(ev.data, generation);
+    };
+  }
+
+  async function refreshCameraBackendFreshness(){
+    try {
+      const response = await fetch('/api/camera-freshness', {cache: 'no-store'});
+      if (!response.ok) throw new Error(`http_${response.status}`);
+      const state = await response.json();
+      rgbFreshness.updateBackend({
+        socketConnected: state.camera_socket_connected,
+        canonicalFrameAgeMs: state.canonical_frame_age_ms,
+      });
+    } catch (_error) {
+      rgbFreshness.updateBackend({
+        socketConnected: null,
+        canonicalFrameAgeMs: null,
+        available: false,
+      });
+    }
+  }
+
+  function drawThermalBlob(buf){
+    const blob = new Blob([buf], {type:'image/jpeg'});
+    if ('createImageBitmap' in window){
+      createImageBitmap(blob).then(bmp=>{
+        thermalCanvas.width = bmp.width;
+        thermalCanvas.height = bmp.height;
+        thermalCanvas.style.aspectRatio = `${bmp.width}/${bmp.height}`;
+        thermalCtx.drawImage(bmp, 0, 0, thermalCanvas.width, thermalCanvas.height);
+        bmp.close();
+      }).catch(()=>{});
+    }else{
+      const img = new Image();
+      img.onload = ()=>{ thermalCanvas.width=img.naturalWidth; thermalCanvas.height=img.naturalHeight; thermalCanvas.style.aspectRatio=`${img.naturalWidth}/${img.naturalHeight}`; thermalCtx.drawImage(img,0,0,thermalCanvas.width,thermalCanvas.height); URL.revokeObjectURL(img.src); };
+      img.src = URL.createObjectURL(blob);
+    }
+  }
+
+  function connectThermal(){
+    clearTimeout(thermalReconnectTimer);
+    if (wsThermal) { wsThermal.onclose = null; try{ wsThermal.close(); }catch(e){} }
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    wsThermal = new WebSocket(`${proto}://${location.host}/ws/thermal_viewer`);
+    wsThermal.binaryType = 'arraybuffer';
+    wsThermal.onmessage = (ev)=>{
+      if (typeof ev.data === 'string'){
+        try{
+          const s = JSON.parse(ev.data);
+          document.getElementById('thermalMax').textContent = 'Max: ' + s.max.toFixed(1) + '°C';
+          document.getElementById('thermalMin').textContent = 'Min: ' + s.min.toFixed(1) + '°C';
+        }catch(e){}
+      } else {
+        drawThermalBlob(ev.data);
+      }
+    };
+    wsThermal.onclose = ()=>{ thermalReconnectTimer = setTimeout(connectThermal, 2000); };
   }
 
   function connectASR(){
     try{ if (wsUI) wsUI.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsUI = new WebSocket(`${proto}://${location.host}/ws_ui`);
-    setBadge($asrStatus, false, 'ASR: connecting…');
-    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'ASR: connected');
-    wsUI.onclose = ()=> setBadge($asrStatus, false, 'ASR: disconnected');
-    wsUI.onerror = ()=> setBadge($asrStatus, false, 'ASR: error');
+    // /ws_ui carries transcript text, not microphone health. The compact
+    // audio-freshness poll exclusively owns the audio badge.
     wsUI.onmessage = (ev)=>{
       const s = ev.data || '';
       if (s.startsWith('INIT:')){
@@ -302,10 +616,55 @@
     messages.forEach(msg => msg.remove());
     lastTimestamp = 0;
   };
-  $btnRe.onclick    = ()=> { connectCamera(); connectASR(); };
+  function closeSocket(socket){
+    if (!socket) return;
+    socket.onopen = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.onmessage = null;
+    try { socket.close(); } catch (_error) {}
+  }
+
+  function cleanupViewer(){
+    clearInterval(freshnessTimer);
+    clearInterval(backendFreshnessTimer);
+    clearInterval(audioFreshnessTimer);
+    clearInterval(perceptionPollTimer);
+    clearInterval(handPollTimer);
+    clearInterval(perceptionRenderTimer);
+    clearTimeout(thermalReconnectTimer);
+    window.removeEventListener('resize', fitCanvas);
+    document.body.classList.remove('thermal-align-rgb');
+    window.removeEventListener('pagehide', cleanupViewer);
+    rgbFreshness.dispose();
+    closeSocket(wsCam);
+    closeSocket(wsUI);
+    closeSocket(wsThermal);
+  }
+
+  rgbFreshness = new RgbViewerFreshness({
+    staleAfterMs: RGB_STALE_AFTER_MS,
+    recoveryBackoffMs: [2000, 4000, 8000, 15000],
+    onRecovery: ()=>connectCamera(),
+    onStateChange: setCameraState,
+  });
+
+  $btnRe.onclick = ()=> { connectCamera({manual: true}); connectASR(); connectThermal(); };
 
   connectCamera();
   connectASR();
+  connectThermal();
+  refreshPerception();
+  refreshHands();
+  refreshCameraBackendFreshness();
+  refreshAudioFreshness();
+  freshnessTimer = setInterval(()=>rgbFreshness.tick(), RGB_FRESHNESS_CHECK_MS);
+  backendFreshnessTimer = setInterval(refreshCameraBackendFreshness, RGB_BACKEND_CHECK_MS);
+  audioFreshnessTimer = setInterval(refreshAudioFreshness, 1000);
+  perceptionPollTimer = setInterval(refreshPerception, PERCEPTION_POLL_MS);
+  handPollTimer = setInterval(refreshHands, HAND_POLL_MS);
+  perceptionRenderTimer = setInterval(renderPerception, 250);
+  window.addEventListener('pagehide', cleanupViewer);
 })();
 
 
@@ -511,28 +870,28 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
         <div><div style="color:#9fb0c3;font-size:10px;">Roll</div>
-             <div id="panel-roll"  style="color:#ff6b6b;font-size:16px;font-weight:bold;">0.0°</div></div>
+             <div id="panel-roll"  style="color:#ff6b6b;font-size:16px;font-weight:bold;">--</div></div>
         <div><div style="color:#9fb0c3;font-size:10px;">Pitch</div>
-             <div id="panel-pitch" style="color:#4ecdc4;font-size:16px;font-weight:bold;">0.0°</div></div>
+             <div id="panel-pitch" style="color:#4ecdc4;font-size:16px;font-weight:bold;">--</div></div>
       </div>
       <div style="margin-bottom:12px;">
         <div style="color:#9fb0c3;font-size:10px;">Yaw</div>
-        <div id="panel-yaw" style="color:#45b7d1;font-size:16px;font-weight:bold;">0.0°</div>
+        <div id="panel-yaw" style="color:#45b7d1;font-size:16px;font-weight:bold;">--</div>
       </div>
       <div style="border-top:1px solid #2a3446;padding-top:8px;margin-top:8px;">
         <div style="color:#9fb0c3;font-size:10px;margin-bottom:6px;">Angular velocity (°/s)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">
-          <div><div style="color:#ff9999;font-size:9px;">gX</div><div id="panel-gx" style="color:#ff9999;font-size:11px;">0.0</div></div>
-          <div><div style="color:#99ff99;font-size:9px;">gY</div><div id="panel-gy" style="color:#99ff99;font-size:11px;">0.0</div></div>
-          <div><div style="color:#9999ff;font-size:9px;">gZ</div><div id="panel-gz" style="color:#9999ff;font-size:11px;">0.0</div></div>
+          <div><div style="color:#ff9999;font-size:9px;">gX</div><div id="panel-gx" style="color:#ff9999;font-size:11px;">--</div></div>
+          <div><div style="color:#99ff99;font-size:9px;">gY</div><div id="panel-gy" style="color:#99ff99;font-size:11px;">--</div></div>
+          <div><div style="color:#9999ff;font-size:9px;">gZ</div><div id="panel-gz" style="color:#9999ff;font-size:11px;">--</div></div>
         </div>
       </div>
       <div style="border-top:1px solid #2a3446;padding-top:8px;">
         <div style="color:#9fb0c3;font-size:10px;margin-bottom:6px;">Acceleration (m/s²)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
-          <div><div style="color:#ff9999;font-size:9px;">aX</div><div id="panel-ax" style="color:#ff9999;font-size:11px;">0.00</div></div>
-          <div><div style="color:#99ff99;font-size:9px;">aY</div><div id="panel-ay" style="color:#99ff99;font-size:11px;">0.00</div></div>
-          <div><div style="color:#9999ff;font-size:9px;">aZ</div><div id="panel-az" style="color:#9999ff;font-size:11px;">0.00</div></div>
+          <div><div style="color:#ff9999;font-size:9px;">aX</div><div id="panel-ax" style="color:#ff9999;font-size:11px;">--</div></div>
+          <div><div style="color:#99ff99;font-size:9px;">aY</div><div id="panel-ay" style="color:#99ff99;font-size:11px;">--</div></div>
+          <div><div style="color:#9999ff;font-size:9px;">aZ</div><div id="panel-az" style="color:#9999ff;font-size:11px;">--</div></div>
         </div>
       </div>
     `;
@@ -712,6 +1071,7 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   let lastGy = {x:0,y:0,z:0};
 
   const imu_ws_state = document.getElementById('imu_ws_state');
+  let lastImuWall = 0;
   function setImuBadge(ok, text){
     imu_ws_state.textContent = text;
     imu_ws_state.className = 'badge ' + (ok? 'ok' : 'err');
@@ -725,6 +1085,8 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   ws.onmessage = (ev)=>{
     try{
       const d = JSON.parse(ev.data);
+      lastImuWall = performance.now();
+      setImuBadge(true, `live seq ${d.sequence ?? '?'}`);
       const t = (typeof d.ts==='number') ? d.ts : performance.now();
       let dt = (!lastTS || (t-lastTS)<=0 || (t-lastTS)>300) ? 0.02 : (t-lastTS)/1000;
       lastTS = t;
@@ -813,7 +1175,57 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
       updateDataPanel(R, P, Y, wx, wy, wz, ax, ay, az);
     } catch(e){}
   };
+  setInterval(()=>{
+    if(!lastImuWall || performance.now()-lastImuWall > 1500){
+      setImuBadge(false, 'stale — no IMU packets');
+      ['roll','pitch','yaw','gx','gy','gz','ax','ay','az'].forEach(name=>{
+        const el=document.getElementById('panel-'+name); if(el) el.textContent='--';
+      });
+    }
+  }, 500);
 
-  window.addEventListener('resize', resize);
-  resize();
+  // requestSync is the existing IMU resize function.
+  // Using undefined resize() here stopped module execution before latency polling.
+  window.addEventListener('resize', requestSync);
+  requestSync();
+})();
+
+// ================= Latency dashboard =================
+(() => {
+  const fields = {
+    network_rtt: document.getElementById('latencyRtt'),
+    speech_end_to_gemini: document.getElementById('latencyGemini'),
+    speech_end_to_first_tts: document.getElementById('latencyTts'),
+    backend_total: document.getElementById('latencyBackend'),
+    device_end_to_end: document.getElementById('latencyDevice'),
+    median: document.getElementById('latencyMedian'),
+    p95: document.getElementById('latencyP95'),
+  };
+  const turn = document.getElementById('latencyTurn');
+  const status = document.getElementById('latencyStatus');
+
+  function renderMetric(element, metric) {
+    if (!element || !metric) return;
+    element.textContent = metric.text;
+    element.dataset.color = metric.color;
+  }
+
+  async function refreshLatency() {
+    try {
+      const response = await fetch('/latency/metrics', {cache: 'no-store'});
+      if (!response.ok) return;
+      const metrics = await response.json();
+      const display = metrics.display || {};
+      if (turn) turn.textContent = display.current_turn ?? '--';
+      if (status) status.textContent = display.status || 'idle';
+      Object.entries(fields).forEach(([name, element]) => {
+        renderMetric(element, display[name]);
+      });
+    } catch (_) {
+      if (status) status.textContent = 'unavailable';
+    }
+  }
+
+  refreshLatency();
+  setInterval(refreshLatency, 1000);
 })();

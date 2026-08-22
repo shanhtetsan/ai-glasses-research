@@ -98,7 +98,7 @@ class SyncRecorder:
         :param jpeg_data: JPEG image data
         """
         if not self.is_recording:
-            return
+            return False
 
         try:
             with self.lock:
@@ -108,7 +108,7 @@ class SyncRecorder:
 
                 if frame is None:
                     print(f"[RECORDER] Warning: frame decode failed")
-                    return
+                    return False
 
                 # First frame: initialize video writer
                 if self.video_writer is None:
@@ -125,7 +125,7 @@ class SyncRecorder:
                     if not self.video_writer.isOpened():
                         print(f"[RECORDER] Error: video writer initialization failed")
                         self.is_recording = False
-                        return
+                        return False
 
                     pass  # video writer ready
 
@@ -142,11 +142,13 @@ class SyncRecorder:
                 self._sync_audio_to_video(current_video_time)
 
                 self.last_log_time = time.time()  # suppress periodic status spam
+                return True
 
         except Exception as e:
             print(f"[RECORDER] Failed to add frame: {e}")
             import traceback
             traceback.print_exc()
+            return False
 
     def add_audio(self, pcm_data: bytes, text: str = ""):
         """
@@ -155,7 +157,7 @@ class SyncRecorder:
         :param text: voice text (for logging)
         """
         if not self.is_recording:
-            return
+            return False
 
         try:
             with self.lock:
@@ -172,9 +174,11 @@ class SyncRecorder:
                 self.audio_bytes_written += len(pcm_data)
 
                 pass  # audio recorded
+                return True
 
         except Exception as e:
             print(f"[RECORDER] Failed to add audio: {e}")
+            return False
 
     def _sync_audio_to_video(self, video_time: float):
         """
@@ -298,10 +302,12 @@ def record_frame(jpeg_data: bytes):
     """Record a frame (called externally)."""
     recorder = get_recorder()
     if recorder.is_recording:
-        recorder.add_frame(jpeg_data)
+        return recorder.add_frame(jpeg_data)
+    return False
 
 def record_audio(pcm_data: bytes, text: str = ""):
     """Record audio (called externally)."""
     recorder = get_recorder()
     if recorder.is_recording:
-        recorder.add_audio(pcm_data, text)
+        return recorder.add_audio(pcm_data, text)
+    return False

@@ -1,0 +1,17 @@
+# Service-only runtime. The Dockerfile installs Torch/TorchVision separately
+# from the selected CPU/GPU wheel index, then installs Ultralytics with
+# --no-deps so opencv-contrib-python remains the sole cv2 provider.
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+numpy==1.24.3
+Pillow==10.1.0
+matplotlib==3.7.5
+contourpy==1.2.1
+PyYAML==6.0.3
+requests==2.34.2
+scipy==1.10.1
+psutil==5.9.8
+polars==1.33.1
+ultralytics-thop==2.0.17

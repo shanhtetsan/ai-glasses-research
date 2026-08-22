@@ -1,0 +1,30 @@
+app = 'ai-glasses-yolo-perception'
+primary_region = 'ewr'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  YOLO_MODEL_PATH = '/app/yolov8n.pt'
+  YOLO_DEVICE = 'cpu'
+  YOLO_CONFIDENCE = '0.25'
+  YOLO_IMAGE_SIZE = '640'
+  YOLO_TORCH_THREADS = '1'
+  HAND_MODEL_PATH = '/app/hand_landmarker.task'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[http_service.concurrency]
+  type = 'requests'
+  soft_limit = 1
+  hard_limit = 2
+
+[[vm]]
+  memory = '2gb'
+  cpus = 2
+  memory_mb = 2048
