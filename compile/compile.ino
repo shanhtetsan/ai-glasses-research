@@ -1378,13 +1378,14 @@ void taskMicUpload(void*) {
 
       if (aud_ws_closed_pending_reconnect) {
         aud_ws_closed_pending_reconnect = false;
-        nextReconnectMs = now + audioReconnectDelayMs(0);
+        audReconnectAttempts++;
+        nextReconnectMs = now + reconnectDelayMs(audReconnectAttempts - 1);
       }
 
       if ((int32_t)(now - nextReconnectMs) >= 0) {
         uint32_t attempt = audReconnectAttempts + 1;
         if (WiFi.status() != WL_CONNECTED) {
-          uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
+          uint32_t waitMs = reconnectDelayMs(audReconnectAttempts);
           Serial.printf(
               "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=wifi elapsed_ms=0 "
               "result=wait backoff_ms=%lu\n",
@@ -1413,7 +1414,7 @@ void taskMicUpload(void*) {
               (unsigned long)attempt, WiFi.RSSI(), (unsigned long)elapsed);
         } else {
           audReconnectAttempts++;
-          uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
+          uint32_t waitMs = reconnectDelayMs(audReconnectAttempts - 1);
           nextReconnectMs = millis() + waitMs;
           Serial.printf(
               "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=websocket "
@@ -1459,7 +1460,7 @@ void taskMicUpload(void*) {
           &audioSocketOperationMaxima.controlMs, startElapsed);
 
       if (!startOk) {
-        uint32_t waitMs = audioReconnectDelayMs(audReconnectAttempts);
+        uint32_t waitMs = reconnectDelayMs(audReconnectAttempts);
         Serial.printf(
             "[WS-AUD-RECONNECT] attempt=%lu rssi=%d stage=start/control "
             "elapsed_ms=%lu result=failed backoff_ms=%lu\n",
