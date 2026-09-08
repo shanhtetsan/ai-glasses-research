@@ -64,6 +64,7 @@ except ImportError as e:
     YOLO = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
@@ -81,6 +82,14 @@ except ModuleNotFoundError:
                 raise RuntimeError("audioop fallback supports mono PCM16 integer downsampling only")
             samples = np.frombuffer(fragment, dtype="<i2")
             return samples[::inrate // outrate].astype("<i2", copy=False).tobytes(), None
+
+        @staticmethod
+        def mul(fragment, width, factor):
+            if width != 2:
+                raise RuntimeError("audioop fallback supports PCM16 gain only")
+            samples = np.frombuffer(fragment, dtype="<i2").astype(np.float32)
+            scaled = np.clip(samples * float(factor), -32768, 32767).astype("<i2")
+            return scaled.tobytes()
     audioop = _AudioopCompat()
 if not STABILITY_MODE:
     import general_detector  # prompt-free YOLOE general object detection (lazy-loaded)
@@ -242,6 +251,7 @@ from asr_core import (
     _normalize_cn,
 )
 from audio_player import initialize_audio_system, play_voice_text
+from mobile_control import MobileControlState
 
 from gemini_live_client import GeminiLiveClient
 gemini_live = GeminiLiveClient()
@@ -470,6 +480,7 @@ async def _on_audio(pcm24k: bytes):
         print(f"[Gemini Live] audio resample failed: {e}", flush=True)
         return
 
+    pcm8k = _apply_mobile_volume(pcm8k)
     if pcm8k:
         for i in range(0, len(pcm8k), _TTS_CHUNK):
             _enqueue_tts_chunk(pcm8k[i:i + _TTS_CHUNK], turn_id)
@@ -734,6 +745,19 @@ UDP_IP   = "0.0.0.0"
 UDP_PORT = 12345
 
 app = FastAPI()
+mobile_control_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("MOBILE_CONTROL_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if mobile_control_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=mobile_control_allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["content-type"],
+    )
 
 # ====== State and containers ======
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -764,6 +788,19 @@ thermal_display_config: Dict[str, Any] = {
     "interpolation": "cubic",
     "rotation_deg": 90,
 }
+mobile_control_state = MobileControlState(
+    default_volume=int(os.getenv("MOBILE_CONTROL_DEFAULT_VOLUME", "90"))
+)
+
+
+def _apply_mobile_volume(pcm16: bytes) -> bytes:
+    gain = mobile_control_state.gain
+    if not pcm16 or gain == 1.0:
+        return pcm16
+    if gain <= 0.0:
+        return b"\x00" * len(pcm16)
+    return audioop.mul(pcm16, 2, gain)
+
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
@@ -1558,7 +1595,7 @@ async def start_ai_with_text(user_text: str):
             full_text = "".join(txt_buf).strip()
             if full_text:
                 try:
-                    pcm8k = await _say_to_pcm8k(full_text)
+                    pcm8k = _apply_mobile_volume(await _say_to_pcm8k(full_text))
                     if pcm8k:
                         # Primary path: enqueue raw mono-16 PCM for the paced
                         # /ws_audio sender. Firmware taskTTSPlay consumes qTTS
@@ -1711,6 +1748,52 @@ async def recording_control(command: RecordingCommand):
     return JSONResponse({
         **recording_pipeline.health(),
         "audio": recording_audio_pipeline.health(),
+    })
+
+
+class MobileVolumePayload(BaseModel):
+    volume: int
+
+
+class MobileRecordingPayload(BaseModel):
+    recording: bool
+
+
+def _mobile_control_response() -> dict:
+    return {
+        **mobile_control_state.snapshot(),
+        "esp32_audio_connected": esp32_audio_ws is not None,
+        "ai_backend": AI_BACKEND,
+    }
+
+
+@app.get("/api/mobile-control")
+def get_mobile_control():
+    return JSONResponse(_mobile_control_response())
+
+
+@app.post("/api/mobile-control/volume")
+def set_mobile_volume(payload: MobileVolumePayload):
+    volume = mobile_control_state.set_volume(payload.volume)
+    return JSONResponse({"volume": volume})
+
+
+@app.post("/api/mobile-control/recording")
+def set_mobile_recording(payload: MobileRecordingPayload):
+    if esp32_audio_ws is None:
+        mobile_control_state.set_recording(False)
+        return JSONResponse(
+            {
+                "error": "esp32_audio_not_connected",
+                "recording": False,
+                "esp32_audio_connected": False,
+            },
+            status_code=409,
+        )
+    recording = mobile_control_state.set_recording(payload.recording)
+    return JSONResponse({
+        "recording": recording,
+        "esp32_audio_connected": True,
     })
 
 
@@ -2075,6 +2158,37 @@ async def ws_audio(ws: WebSocket):
     vad_speech_chunks: int   = 0      # speech chunks accumulated this utterance
     vad_speech_detected: bool = False  # True once VAD_MIN_SPEECH_CHUNKS of speech seen
 
+    async def _reset_utterance_for_mobile_start() -> None:
+        nonlocal streaming, pcm_buffer, vad_silent_chunks, vad_speech_chunks, vad_speech_detected
+        global mic_streaming
+        streaming = True
+        mic_streaming = AI_BACKEND == "gemini_live"
+        pcm_buffer = bytearray()
+        vad_silent_chunks = 0
+        vad_speech_chunks = 0
+        vad_speech_detected = False
+        await ui_broadcast_partial("（Recording…）")
+
+    async def _stop_utterance_for_mobile_stop() -> None:
+        nonlocal streaming, pcm_buffer, vad_silent_chunks, vad_speech_chunks, vad_speech_detected
+        global mic_streaming
+        streaming = False
+        mic_streaming = False
+        if AI_BACKEND == "gemini_live":
+            pcm_buffer = None
+            vad_silent_chunks = 0
+            vad_speech_chunks = 0
+            vad_speech_detected = False
+            return
+        buf = bytes(pcm_buffer) if pcm_buffer else b""
+        pcm_buffer = None
+        vad_silent_chunks = 0
+        vad_speech_chunks = 0
+        vad_speech_detected = False
+        if buf:
+            await ui_broadcast_partial("（Processing…）")
+            await _run_whisper_and_dispatch(buf)
+
     try:
         while True:
             if WebSocketState and ws.client_state != WebSocketState.CONNECTED:
@@ -2087,6 +2201,11 @@ async def ws_audio(ws: WebSocket):
                 if "Cannot call \"receive\"" in str(e):
                     break
                 raise
+
+            if mobile_control_state.consume_start_requested():
+                await _reset_utterance_for_mobile_start()
+            if mobile_control_state.consume_stop_requested():
+                await _stop_utterance_for_mobile_stop()
 
             if "text" in msg and msg["text"] is not None:
                 raw = (msg["text"] or "").strip()
@@ -2148,6 +2267,7 @@ async def ws_audio(ws: WebSocket):
 
                 if cmd == "START":
                     print("[MIC] Listening — waiting for speech...")
+                    mobile_control_state.set_recording(True)
                     streaming            = True
                     mic_streaming         = AI_BACKEND == "gemini_live"
                     pcm_buffer           = bytearray()
@@ -2158,6 +2278,7 @@ async def ws_audio(ws: WebSocket):
                     await _send_esp32_audio_text(ws, "OK:STARTED")
 
                 elif cmd == "STOP":
+                    mobile_control_state.set_recording(False)
                     streaming = False
                     if AI_BACKEND == "gemini_live":
                         print("[MIC] Stopped streaming")
@@ -2196,7 +2317,7 @@ async def ws_audio(ws: WebSocket):
                     # so the local RMS-VAD/Whisper pipeline below must stay out
                     # of the way (it would otherwise fire its own transcription
                     # off the same audio and double-dispatch commands).
-                    if streaming and not is_playing_now():
+                    if streaming and mobile_control_state.recording and not is_playing_now():
                         if audio_ingest_q.full():
                             try:
                                 audio_ingest_q.get_nowait()
@@ -2216,7 +2337,7 @@ async def ws_audio(ws: WebSocket):
                             )
                     continue
 
-                if streaming and pcm_buffer is not None:
+                if streaming and mobile_control_state.recording and pcm_buffer is not None:
                     # Mute the mic while the AI is speaking. Without this the
                     # glasses' own TTS echoes back into the mic, gets VAD-segmented
                     # and can launch a bogus turn — which then blocks the user's
