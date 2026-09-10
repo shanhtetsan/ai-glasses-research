@@ -2738,7 +2738,7 @@ async def ws_camera_esp(ws: WebSocket):
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
-        if AI_BACKEND == "gemini_live"
+        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
         else None
     )
 
@@ -2946,7 +2946,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
-        if AI_BACKEND == "gemini_live"
+        if AI_BACKEND == "gemini_live" and not STABILITY_MODE
         else None
     )
 
