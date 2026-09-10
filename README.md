@@ -181,14 +181,14 @@ Prior work: UNav (arXiv 2209.11336) · AnyLoc (arXiv 2308.00688) · LightGlue (a
 
 ---
 
+
 ## Team
 
 | Role | Person |
 |---|---|
 | Advisor | Prof. Hao Tang |
 | Research mentor | Prof. Jiawei Liu |
-| Team lead | Shan |
-| Contributors | Ian, Alicia |
+| Contributors | Shan, Ian, Md, Phone |
 
 Task ownership and current assignments: [`TEAM_OPS.md`](./TEAM_OPS.md)
 Development log: [`DEVLOG.md`](./DEVLOG.md)
