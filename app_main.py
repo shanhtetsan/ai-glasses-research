@@ -915,10 +915,75 @@ async def _on_turn_complete():
         if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
         omni_previous_nav_state = None
 
-async def _on_interrupted():
-    """User barged in and cut off Gemini's current response."""
+RECONNECT_APOLOGY_TIMEOUT_SEC = 30.0
+RECONNECT_APOLOGY_POLL_SEC = 0.5
+RECONNECT_APOLOGY_PROMPT = (
+    "Say exactly this and nothing else: "
+    "\"Sorry, I lost the connection there — could you say that again?\""
+)
+
+
+async def _apologize_for_dropped_turn(reason: str, turn_id: int) -> None:
+    """Best-effort notice for a turn abandoned by a session drop, not a user
+    barge-in — session resumption restores conversation context, but there's
+    no evidence (in this SDK or this app's own history — even the planned
+    goaway rotation path abandons active turns the same way) that a specific
+    in-flight generation survives a reconnect. Rather than leave the user
+    wondering whether they were heard, wait for the session to come back and
+    have Gemini say so directly, reusing the existing audio/TTS pipeline.
+
+    Never raises — a missed apology is strictly better than crashing
+    anything downstream of it. Skips quietly if the user has already moved
+    on to a fresh turn (e.g. they spoke again during the reconnect gap)
+    rather than talking over them, and gives up quietly if the session
+    doesn't come back within RECONNECT_APOLOGY_TIMEOUT_SEC.
+    """
+    try:
+        waited = 0.0
+        while not gemini_live.connected and waited < RECONNECT_APOLOGY_TIMEOUT_SEC:
+            await asyncio.sleep(RECONNECT_APOLOGY_POLL_SEC)
+            waited += RECONNECT_APOLOGY_POLL_SEC
+        if not gemini_live.connected:
+            print(
+                f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+                "gave_up=yes (session did not come back in time)",
+                flush=True,
+            )
+            return
+        if latency_tracker.active_turn_id is not None:
+            print(
+                f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+                "skipped=new_turn_already_active",
+                flush=True,
+            )
+            return
+        sent = await gemini_live.send_text(
+            RECONNECT_APOLOGY_PROMPT, source="reconnect_apology"
+        )
+        print(
+            f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+            f"waited_sec={waited:.1f} sent={sent}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+            f"failed error={type(exc).__name__}",
+            flush=True,
+        )
+
+
+async def _on_interrupted(reason: str = "user_barge_in"):
+    """An active turn was cut off — either the user barged in
+    (reason="user_barge_in") or the session itself was dropped/rotated out
+    from under it (any other reason: "receive_error", "normal_receive_end",
+    "goaway", etc.). Either way the ESP32 needs the same TTS-stop cleanup so
+    tts_playing clears and the mic un-mutes; only a connection-caused
+    interruption that actually had a turn in flight also gets a spoken
+    apology once the session comes back (see _apologize_for_dropped_turn).
+    """
     global _ratecv_state_8k
-    print("[Gemini Live] Response interrupted by user", flush=True)
+    print(f"[Gemini Live] Response interrupted reason={reason}", flush=True)
     turn_id = latency_tracker.active_turn_id
 
     # Same as _on_turn_complete: tell the firmware the TTS stream is over so
@@ -934,6 +999,9 @@ async def _on_interrupted():
     _ratecv_state_8k = None
     _clear_gemini_turn_state("interrupted")
     await hard_reset_audio("gemini_interrupted")
+
+    if reason != "user_barge_in" and turn_id is not None:
+        asyncio.create_task(_apologize_for_dropped_turn(reason, turn_id))
 
 
 async def _on_gemini_session_transition(reason: str, _generation: int):

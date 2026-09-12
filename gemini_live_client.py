@@ -119,7 +119,12 @@ class GeminiLiveClient:
         self.on_input_transcription = None
         self.on_output_transcription = None
         self.on_turn_complete = None   # called when the model has finished a full response turn
-        self.on_interrupted = None     # called when the user barges in and cuts off the model
+        self.on_interrupted = None     # async callback(reason: str) — called whenever an
+                                        # active turn is abandoned, either because the user
+                                        # barged in (reason="user_barge_in") or because the
+                                        # session itself was dropped/rotated out from under it
+                                        # (reason="receive_error"/"normal_receive_end"/"goaway"/
+                                        # other rotation reasons)
         self.on_session_transition = None  # clears app turn state without finalizing latency twice
         self.turn_id_provider = None
 
@@ -679,7 +684,7 @@ class GeminiLiveClient:
         )
         self._log_audio_lock_summary(turn_id, f"rotation_{reason}")
         if self._has_active_turn() and self.on_interrupted:
-            await self.on_interrupted()
+            await self.on_interrupted(reason=reason)
         self._response_active = False
         self._first_model_audio_seen = False
         await self._notify_session_transition(reason)
@@ -799,7 +804,7 @@ class GeminiLiveClient:
                         if server_content.interrupted:
                             self._log_audio_lock_summary(turn_id, "interrupted")
                             if self.on_interrupted:
-                                await self.on_interrupted()
+                                await self.on_interrupted(reason="user_barge_in")
                             self._response_active = False
                             self._first_model_audio_seen = False
                     if self._rotation_pending and not self._has_active_turn():
@@ -832,7 +837,7 @@ class GeminiLiveClient:
                     # callers (e.g. the ESP32 TTS state) don't get stuck
                     # waiting on a signal that will never arrive.
                     if self.on_interrupted:
-                        await self.on_interrupted()
+                        await self.on_interrupted(reason="normal_receive_end")
                     await self._notify_session_transition("normal_receive_end")
                     await self._reconnect_with_backoff(
                         reason="normal_receive_end"
@@ -866,7 +871,7 @@ class GeminiLiveClient:
                 # abandoned mid-stream, so fire on_interrupted for cleanup
                 # before reconnecting.
                 if self.on_interrupted:
-                    await self.on_interrupted()
+                    await self.on_interrupted(reason="receive_error")
                 await self._notify_session_transition("receive_error")
                 await self._reconnect_with_backoff(reason="receive_error")
                 # loop condition re-checks self.connected — if the reconnect
