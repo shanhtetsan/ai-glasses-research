@@ -1128,6 +1128,17 @@ GEMINI_VIDEO_INTERVAL_SEC = max(
 )
 _last_gemini_video_submit = 0.0
 
+# The video pump above only runs while mic_streaming is true, so any gap
+# between conversations longer than that leaves the Gemini Live session with
+# nothing at all being sent. Gemini's server closes such idle sessions with
+# WS close code 1008 after ~150s (measured empirically from backend.log —
+# not documented). This loop sends an occasional frame during those gaps to
+# keep the session alive; see _gemini_keepalive_loop().
+GEMINI_KEEPALIVE_INTERVAL_SEC = max(
+    30.0, float(os.getenv("GEMINI_KEEPALIVE_INTERVAL_SEC", "60"))
+)
+_gemini_keepalive_task: Optional[asyncio.Task] = None
+
 # Same drop-to-latest / rate-limited shape as the Gemini video pump above,
 # decoupled to its own interval so research sampling never competes with
 # Gemini's cadence. research_exporter.publish_event() is itself a no-op
@@ -4025,6 +4036,52 @@ async def startup_gemini():
     # gemini_regular/qwen don't touch Gemini Live at all — they use local
     # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
 
+
+async def _gemini_keepalive_loop() -> None:
+    """Sends an occasional idle-time video frame so the Gemini Live session
+    never sits long enough to hit its ~150s no-activity close (code 1008).
+
+    Only fires when there's genuinely nothing else going on: no active turn,
+    and no real send (audio/image/text) in the last GEMINI_KEEPALIVE_INTERVAL_SEC.
+    Tagged source="keepalive" end to end (GEMINI-TIMING lines, this print) so
+    it's never mistaken for a real vision send. It also never touches
+    latency_tracker or _vision_frame_sequence_for_turn — those are only set
+    from _on_input_transcription's own pre_response vision send — so a
+    keepalive frame structurally cannot show up as a turn's gemini_rgb_frame_id
+    or any other per-turn telemetry field.
+    """
+    while True:
+        await asyncio.sleep(5.0)
+        if AI_BACKEND != "gemini_live":
+            continue
+        if not gemini_live.connected:
+            continue
+        if gemini_live.has_active_turn():
+            continue
+        if gemini_live.seconds_since_last_activity() < GEMINI_KEEPALIVE_INTERVAL_SEC:
+            continue
+        frame = latest_rgb.snapshot()
+        if frame.data is None:
+            continue
+        sent = await gemini_live.send_image(
+            frame.data, sequence=frame.sequence, source="keepalive"
+        )
+        print(
+            f"[GEMINI-KEEPALIVE] sent={sent} bytes={len(frame.data)} "
+            f"sequence={frame.sequence}",
+            flush=True,
+        )
+
+
+@app.on_event("startup")
+async def startup_gemini_keepalive():
+    global _gemini_keepalive_task
+    if AI_BACKEND == "gemini_live" and (
+        _gemini_keepalive_task is None or _gemini_keepalive_task.done()
+    ):
+        _gemini_keepalive_task = asyncio.create_task(_gemini_keepalive_loop())
+
+
 @app.on_event("startup")
 async def on_startup():
     if STABILITY_MODE:
@@ -4037,7 +4094,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     """Clean up resources when the application shuts down."""
-    global _tts_sender_task
+    global _tts_sender_task, _gemini_keepalive_task
     print("[SHUTDOWN] Starting resource cleanup...")
     await hand_client.stop()
     await yolo_client.stop()
@@ -4068,6 +4125,14 @@ async def on_shutdown():
         except asyncio.CancelledError:
             pass
         _tts_sender_task = None
+
+    if _gemini_keepalive_task is not None:
+        _gemini_keepalive_task.cancel()
+        try:
+            await _gemini_keepalive_task
+        except asyncio.CancelledError:
+            pass
+        _gemini_keepalive_task = None
 
     print("[SHUTDOWN] Resource cleanup complete")
 

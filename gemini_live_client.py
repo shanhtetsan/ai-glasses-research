@@ -151,6 +151,11 @@ class GeminiLiveClient:
         self._audio_sdk_send_buckets = [
             0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
         ]
+        # Last successful send of any kind (audio/image/text, keepalive
+        # included) — lets a caller detect "this session has gone idle"
+        # without duplicating per-send-type bookkeeping. See
+        # seconds_since_last_activity().
+        self._last_activity_monotonic = 0.0
 
     def _current_turn_id(self):
         if self.turn_id_provider is None:
@@ -162,6 +167,19 @@ class GeminiLiveClient:
 
     def _has_active_turn(self) -> bool:
         return self._response_active or self._current_turn_id() is not None
+
+    def has_active_turn(self) -> bool:
+        """Public wrapper for callers (e.g. the idle keepalive loop) that
+        need to know without reaching into a private method."""
+        return self._has_active_turn()
+
+    def seconds_since_last_activity(self) -> float:
+        """Time since the last successful audio/image/text send, of any
+        kind. 0.0 before anything has ever been sent on the current
+        client instance."""
+        if not self._last_activity_monotonic:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_activity_monotonic)
 
     def _session_age_sec(self) -> float:
         if not self._session_opened_at:
@@ -308,6 +326,7 @@ class GeminiLiveClient:
             self._latest_resumption_handle = None
         self.session_generation += 1
         self._session_opened_at = time.monotonic()
+        self._last_activity_monotonic = time.monotonic()
         self._session_mode = mode
         self._response_active = False
         self._first_model_audio_seen = False
@@ -448,6 +467,7 @@ class GeminiLiveClient:
                     ),
                     result="sent",
                 )
+                self._last_activity_monotonic = time.monotonic()
                 return True
         except asyncio.TimeoutError:
             self._log_timing(
@@ -520,6 +540,7 @@ class GeminiLiveClient:
                     self._audio_sdk_send_buckets[
                         self._audio_send_bucket(sdk_send_ms)
                     ] += 1
+            self._last_activity_monotonic = time.monotonic()
             return True
         except Exception as exc:
             print(
