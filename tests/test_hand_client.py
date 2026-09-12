@@ -127,7 +127,9 @@ class HandClientContractTests(unittest.TestCase):
         client.cache.replace({
             "source_frame_id": 7,
             "source_received_at": 100.0,
+            "backend_received_monotonic_ns": now[0],
             "inference_completed_monotonic_ns": now[0],
+            "request_ms": 42.0,
             **_result(7, hands=[]),
         })
         zero = client.latest_hands()
@@ -145,7 +147,9 @@ class HandClientContractTests(unittest.TestCase):
         hand.cache.replace({
             "source_frame_id": 1,
             "source_received_at": 1.0,
+            "backend_received_monotonic_ns": time.monotonic_ns(),
             "inference_completed_monotonic_ns": time.monotonic_ns(),
+            "request_ms": 42.0,
             **_result(1),
         })
         self.assertTrue(hand.latest_hands()["available"])

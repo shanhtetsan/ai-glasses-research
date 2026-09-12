@@ -116,7 +116,7 @@ class RequestedTargetExtractionTests(unittest.TestCase):
         self.assertIsNone(extract_requested_target("Tell me a joke"))
         source = Path("app_main.py").read_text(encoding="utf-8")
         self.assertIn("def build_perception_state(utterance: str =", source)
-        self.assertIn("perception = build_perception_state(combined)", source)
+        self.assertIn("perception, perception_raw = build_perception_state(combined)", source)
 
 
 class AuthoritativeHandednessTests(unittest.TestCase):

@@ -594,6 +594,10 @@ class YoloShadowClient:
             "age_ms": cache["age_ms"],
             "service_healthy": service_healthy,
             "frame_id": None,
+            "source_frame_id": None,
+            "backend_received_monotonic_ns": None,
+            "inference_completed_monotonic_ns": None,
+            "request_ms": None,
             "inference_ms": None,
             "image_width": None,
             "image_height": None,
@@ -620,6 +624,10 @@ class YoloShadowClient:
         if result is not None:
             response.update({
                 "frame_id": result["frame_id"],
+                "source_frame_id": result["source_frame_id"],
+                "backend_received_monotonic_ns": result["backend_received_monotonic_ns"],
+                "inference_completed_monotonic_ns": result["inference_completed_monotonic_ns"],
+                "request_ms": result["request_ms"],
                 "inference_ms": result["inference_ms"],
                 "image_width": result["image_width"],
                 "image_height": result["image_height"],

@@ -237,6 +237,9 @@ class LatencyTracker:
         "last_microphone_chunk_received",
         "speech_end_detected",
         "first_input_transcription",
+        "vision_frame_selected",
+        "perception_state_built",
+        "perception_state_sent",
         "first_gemini_audio_received",
         "first_tts_chunk_queued",
         "tts_start_sent",
@@ -303,6 +306,7 @@ class LatencyTracker:
             "device_metrics": None,
             "audio_integrity_degraded": False,
             "mic_loss": None,
+            "perception": None,
         }
 
     def start_turn(
@@ -495,6 +499,21 @@ class LatencyTracker:
                 return False
             target["device_metrics"] = metrics
             self._latest_device_metrics = dict(metrics)
+            return True
+
+    def update_perception(self, turn_id: int, perception: dict) -> bool:
+        with self._lock:
+            target = None
+            if self._active is not None and self._active["turn_id"] == turn_id:
+                target = self._active
+            else:
+                for turn in reversed(self._history):
+                    if turn["turn_id"] == turn_id:
+                        target = turn
+                        break
+            if target is None:
+                return False
+            target["perception"] = copy.deepcopy(perception)
             return True
 
     def update_rtt(

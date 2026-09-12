@@ -142,7 +142,9 @@ class YoloClientContractTests(unittest.TestCase):
 
         cached = {
             "source_frame_id": 7,
+            "backend_received_monotonic_ns": now[0],
             "inference_completed_monotonic_ns": now[0],
+            "request_ms": 42.0,
             "frame_id": 7,
             "inference_ms": 12.5,
             "image_width": 240,
