@@ -140,6 +140,10 @@ class GeminiLiveClient:
         self._response_active = False
         self._rotation_pending = False
         self._rotation_reason = None
+        self._force_fresh_next_open = False  # set by reset_session(); consumed once by
+                                              # _controlled_rotation to force a fresh
+                                              # (non-resumed) open regardless of any
+                                              # resumption handle captured in the meantime
         self._goaway_time_left = None
         self._goaway_deadline_task = None
         self._goaway_deadline_forced = False
@@ -283,6 +287,7 @@ class GeminiLiveClient:
 
         self._response_modality = response_modality
         self._shutting_down = False
+        self._force_fresh_next_open = False
         self._connecting = True
         try:
             self.client = genai.Client(
@@ -391,6 +396,32 @@ class GeminiLiveClient:
                 self._latest_resumption_handle = None
                 await self._close_current_session("resumption_failed")
         await self._open_session(resumption_handle=None)
+
+    async def reset_session(self, reason: str = "manual_reset") -> bool:
+        """Force the next session open to skip resumption, discarding
+        server-side conversation context. Mirrors the goaway rotation path:
+        closing the live session nudges receive_loop (the sole owner of
+        connection replacement) to notice _rotation_pending and reopen, but
+        _force_fresh_next_open makes _controlled_rotation open fresh instead
+        of trying _open_with_fresh_fallback()'s resumption first.
+
+        Returns True if a live session was actually reset. Returns False if
+        there was nothing live to reset — the eventual connect()/reconnect
+        starts fresh regardless, since the resumption handle is cleared
+        unconditionally below.
+        """
+        self._latest_resumption_handle = None
+        if not self.connected or self.session is None:
+            return False
+        self._force_fresh_next_open = True
+        self._rotation_pending = True
+        self._rotation_reason = reason
+        self._cancel_goaway_deadline()
+        try:
+            await self.session.close()
+        except Exception:
+            pass
+        return True
 
     async def disconnect(self):
         print("[Gemini Live] Disconnecting...")
@@ -506,6 +537,18 @@ class GeminiLiveClient:
 
     async def send_audio(self, audio_bytes: bytes) -> bool:
         if not self.connected or self.session is None:
+            # Mirrors _send_traced's "not_connected" result for image/text —
+            # this path used to drop the chunk with zero log output, making
+            # audio loss during a reconnect window indistinguishable from
+            # audio never having been sent by the caller at all.
+            self._log_timing(
+                "audio_sdk_send_end",
+                turn_id=self._current_turn_id(),
+                source="audio",
+                sequence=0,
+                bytes=len(audio_bytes),
+                result="not_connected",
+            )
             return False
         session = self.session
         wait_started_ns = time.monotonic_ns()
@@ -525,6 +568,14 @@ class GeminiLiveClient:
                 if wait_ms > 250:
                     self._audio_lock_wait_over_250 += 1
                 if not self.connected or self.session is not session:
+                    self._log_timing(
+                        "audio_sdk_send_end",
+                        turn_id=self._current_turn_id(),
+                        source="audio",
+                        sequence=0,
+                        bytes=len(audio_bytes),
+                        result="session_changed",
+                    )
                     return False
                 sdk_send_started_ns = time.monotonic_ns()
                 try:
@@ -548,6 +599,17 @@ class GeminiLiveClient:
             self._last_activity_monotonic = time.monotonic()
             return True
         except Exception as exc:
+            # Previously a bare print — invisible next to _send_traced's
+            # structured "error" result for image/text sends on the same lock.
+            self._log_timing(
+                "audio_sdk_send_end",
+                turn_id=self._current_turn_id(),
+                source="audio",
+                sequence=0,
+                bytes=len(audio_bytes),
+                result="error",
+                error_type=type(exc).__name__,
+            )
             print(
                 f"[Gemini Live] send_audio failed: {type(exc).__name__}",
                 flush=True,
@@ -690,7 +752,11 @@ class GeminiLiveClient:
         await self._notify_session_transition(reason)
         await self._close_current_session(reason)
         try:
-            await self._open_with_fresh_fallback()
+            if self._force_fresh_next_open:
+                self._force_fresh_next_open = False
+                await self._open_session(resumption_handle=None)
+            else:
+                await self._open_with_fresh_fallback()
         except Exception as exc:
             print(
                 f"[GEMINI-SESSION] generation={generation} "

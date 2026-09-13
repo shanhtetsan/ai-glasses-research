@@ -298,6 +298,9 @@ _vision_frame_sequence_for_turn: Optional[int] = None
 _vision_frame_backend_ns_for_turn: Optional[int] = None  # same frame's capture time, same clock as detectors' backend_received_monotonic_ns
 _vision_intent_for_turn: bool = False   # latched True if is_explicit_vision_request() ever fired this turn
 _thermal_intent_for_turn: bool = False  # latched True if is_thermal_request() ever fired this turn
+_thermal_facts_available_for_turn: Optional[bool] = None  # None=thermal send never attempted
+                                                           # this turn, True=fresh frame found,
+                                                           # False=build_thermal_facts() was stale/empty
 _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
@@ -360,7 +363,7 @@ def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
     global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
-    global _vision_intent_for_turn, _thermal_intent_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _thermal_facts_available_for_turn
     had_state = bool(
         _input_text_buf
         or _output_text_buf
@@ -376,6 +379,7 @@ def _clear_gemini_turn_state(reason: str) -> None:
     _vision_frame_backend_ns_for_turn = None
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
+    _thermal_facts_available_for_turn = None
     if had_state:
         print(
             f"[GEMINI-TURN] state_cleared reason={reason} "
@@ -743,7 +747,7 @@ async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
     global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
-    global _vision_intent_for_turn, _thermal_intent_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _thermal_facts_available_for_turn
     if not text:
         return
     turn_id = _ensure_turn()
@@ -758,6 +762,13 @@ async def _on_input_transcription(text: str):
         pass
     wants_vision = is_explicit_vision_request(combined)
     wants_thermal = is_thermal_request(combined)
+    # Only gates the THERMAL_MEASUREMENTS send below; wants_thermal itself
+    # keeps driving the vision-frame trigger and thermal_intent latch below
+    # so THERMAL_MODE stays isolated to the thermal-text A/B variable.
+    thermal_gate_open = (
+        thermal_mode_config["mode"] == "always"
+        or (thermal_mode_config["mode"] == "auto" and wants_thermal)
+    )
     if wants_vision:
         _vision_intent_for_turn = True
     if wants_thermal:
@@ -880,10 +891,11 @@ async def _on_input_transcription(text: str):
         })
 
     # Thermal goes as structured text, never as the colorized heatmap.
-    if wants_thermal and not _thermal_submitted_for_turn:
+    if thermal_gate_open and not _thermal_submitted_for_turn:
         build_started_ns = time.monotonic_ns()
         _log_gemini_timing("thermal_build_begin", turn_id)
         facts = build_thermal_facts()
+        _thermal_facts_available_for_turn = facts is not None
         _log_gemini_timing(
             "thermal_build_end",
             turn_id,
@@ -941,7 +953,7 @@ async def _on_turn_complete():
     """
     global omni_conversation_active, omni_previous_nav_state
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
-    global _vision_intent_for_turn, _thermal_intent_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _thermal_facts_available_for_turn
 
     turn_id = _ensure_turn()
     active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
@@ -971,6 +983,7 @@ async def _on_turn_complete():
     _perception_submitted_for_turn = False
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
+    _thermal_facts_available_for_turn = None
 
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
@@ -1329,6 +1342,28 @@ thermal_display_config: Dict[str, Any] = {
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
+_THERMAL_MODES = ("auto", "always", "never")
+
+
+def _normalize_thermal_mode(value: str) -> Optional[str]:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in _THERMAL_MODES else None
+
+
+_env_thermal_mode_raw = os.getenv("THERMAL_MODE", "auto")
+_env_thermal_mode = _normalize_thermal_mode(_env_thermal_mode_raw)
+if _env_thermal_mode is None:
+    print(
+        f"[THERMAL-MODE] invalid THERMAL_MODE={_env_thermal_mode_raw!r}, defaulting to auto",
+        flush=True,
+    )
+    _env_thermal_mode = "auto"
+# "auto": send thermal only when the phrase gate fires (is_thermal_request).
+# "always": skip the phrase gate, but build_thermal_facts() still requires a
+# fresh thermal frame — see _on_input_transcription's thermal_gate_open.
+# "never": never send thermal, regardless of phrase.
+thermal_mode_config: Dict[str, str] = {"mode": _env_thermal_mode}
+
 camera_viewers: Set[WebSocket] = set()
 thermal_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
@@ -1435,6 +1470,9 @@ async def _finalize_latency_turn(status: str, turn_id: int) -> None:
     record["response_text"] = "".join(_output_text_buf).strip() or None
     record["vision_intent"] = _vision_intent_for_turn
     record["thermal_intent"] = _thermal_intent_for_turn
+    record["thermal_mode"] = thermal_mode_config["mode"]
+    record["thermal_sent"] = _thermal_submitted_for_turn
+    record["thermal_facts_available"] = _thermal_facts_available_for_turn
     # Unlike the above, session tag IS taken at turn-start (see _tag_turn_session)
     # so a session boundary crossed mid-turn doesn't erase which block it was in.
     session_id, session_label = _turn_session_tags.pop(turn_id, (None, None))
@@ -2538,7 +2576,47 @@ def update_thermal_display(settings: ThermalDisplaySettings):
             flush=True,
         )
     return JSONResponse(thermal_display_state())
-   
+
+
+class ThermalModeSettings(BaseModel):
+    mode: str
+
+
+@app.get("/api/thermal-mode")
+def get_thermal_mode():
+    return JSONResponse({"mode": thermal_mode_config["mode"], "valid_modes": list(_THERMAL_MODES)})
+
+
+@app.post("/api/thermal-mode")
+async def update_thermal_mode(settings: ThermalModeSettings):
+    normalized = _normalize_thermal_mode(settings.mode)
+    if normalized is None:
+        return JSONResponse(
+            {"error": "mode must be one of: auto, always, never"}, status_code=400
+        )
+    previous = thermal_mode_config["mode"]
+    thermal_mode_config["mode"] = normalized
+    session_reset = False
+    if normalized != previous:
+        session_reset = await gemini_live.reset_session(
+            f"thermal_mode_changed:{previous}->{normalized}"
+        )
+    print(
+        f"[THERMAL-MODE] mode set to {normalized} (was {previous}) "
+        f"session_reset={session_reset}",
+        flush=True,
+    )
+    return JSONResponse({"mode": normalized, "session_reset": session_reset})
+
+
+@app.post("/api/gemini-session/reset")
+async def reset_gemini_session():
+    """Force a fresh Gemini Live session (discards server-side conversation
+    context) without changing THERMAL_MODE — for clearing contamination
+    between repeated trials of the same A/B condition."""
+    session_reset = await gemini_live.reset_session("manual_reset")
+    print(f"[GEMINI-SESSION-RESET] manual reset session_reset={session_reset}", flush=True)
+    return JSONResponse({"session_reset": session_reset})
 
 
 @app.get("/api/imu-validation")

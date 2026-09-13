@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import unittest
+from unittest import mock
 
 from google.genai import types
 
@@ -320,6 +321,71 @@ class GeminiLiveLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(session.closed)
         self.assertTrue(client._goaway_deadline_forced)
+
+    async def test_reset_session_returns_false_when_not_connected(self):
+        client = GeminiLiveClient()
+        self.assertFalse(await client.reset_session())
+        self.assertFalse(client._rotation_pending)
+        self.assertFalse(client._force_fresh_next_open)
+
+    async def test_reset_session_closes_session_and_forces_fresh_flags(self):
+        client = GeminiLiveClient()
+        session = _FakeSession()
+        client.session = session
+        client.connected = True
+        client._latest_resumption_handle = "secret-resumption-handle"
+
+        self.assertTrue(await client.reset_session("manual_reset"))
+        self.assertTrue(session.closed)
+        self.assertTrue(client._force_fresh_next_open)
+        self.assertTrue(client._rotation_pending)
+        self.assertEqual(client._rotation_reason, "manual_reset")
+        self.assertIsNone(client._latest_resumption_handle)
+
+    async def test_controlled_rotation_forces_fresh_open_even_with_handle_present(self):
+        old_session = _FakeSession()
+        old_cm = _FakeContextManager(old_session)
+        new_session = _FakeSession()
+        sdk_client = _FakeClient([new_session])
+        client = GeminiLiveClient()
+        client.client = sdk_client
+        client.session = old_session
+        client._live_cm = old_cm
+        client.connected = True
+        client.session_generation = 1
+        client._session_opened_at = 1.0
+        client._latest_resumption_handle = "secret-resumption-handle"
+        client._force_fresh_next_open = True
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            await client._controlled_rotation("manual_reset")
+
+        self.assertTrue(old_cm.exited)
+        self.assertIs(client.session, new_session)
+        self.assertEqual(client.session_generation, 2)
+        self.assertEqual(client._session_mode, "fresh")
+        self.assertEqual(len(sdk_client.live.calls), 1)
+        self.assertIsNone(
+            sdk_client.live.calls[0]["config"]["session_resumption"].handle
+        )
+        self.assertFalse(client._force_fresh_next_open)
+
+    async def test_connect_clears_stale_force_fresh_flag(self):
+        client = GeminiLiveClient()
+        client._force_fresh_next_open = True
+
+        with mock.patch("gemini_live_client.genai.Client") as mock_ctor:
+            mock_ctor.return_value = _FakeClient([_FakeSession()])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                await client.connect()
+            try:
+                self.assertFalse(client._force_fresh_next_open)
+            finally:
+                client.receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await client.receive_task
 
 
 if __name__ == "__main__":
