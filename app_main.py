@@ -638,18 +638,25 @@ def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
     hand_state = hand_client.latest_hands()
     raw_metrics = {"yolo": yolo, "hands": hand_state}
 
+    # Gate on backend_frame_age_ms (time since the RGB frame was received),
+    # not completion_age_ms (time since inference finished on it) — the
+    # latter under-counts staleness by exactly that frame's request_ms, which
+    # can matter once a request queues up or a service slows down.
+    # completion_age_ms is still recorded via _detector_perception_telemetry.
+    yolo_backend_age_ms = _age_ms_since(yolo.get("backend_received_monotonic_ns"))
     yolo_fresh = bool(
         yolo.get("enabled")
-        and yolo.get("available")
-        and not yolo.get("stale")
         and yolo.get("service_healthy") is not False
+        and yolo_backend_age_ms is not None
+        and yolo_backend_age_ms <= yolo_client.settings.stale_after_sec * 1000.0
     )
 
+    hands_backend_age_ms = _age_ms_since(hand_state.get("backend_received_monotonic_ns"))
     hands_fresh = bool(
         hand_state.get("enabled")
-        and hand_state.get("available")
-        and not hand_state.get("stale")
         and hand_state.get("service_healthy") is not False
+        and hands_backend_age_ms is not None
+        and hands_backend_age_ms <= hand_client.settings.stale_after_sec * 1000.0
     )
 
     if not yolo_fresh and not hands_fresh:
