@@ -1,6 +1,7 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, csv, tempfile, wave, hmac
+import os, sys, time, json, asyncio, base64, csv, tempfile, wave, hmac, logging, uuid
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -293,6 +294,10 @@ _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
 _perception_submitted_for_turn: bool = False
+_vision_frame_sequence_for_turn: Optional[int] = None
+_vision_frame_backend_ns_for_turn: Optional[int] = None  # same frame's capture time, same clock as detectors' backend_received_monotonic_ns
+_vision_intent_for_turn: bool = False   # latched True if is_explicit_vision_request() ever fired this turn
+_thermal_intent_for_turn: bool = False  # latched True if is_thermal_request() ever fired this turn
 _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
@@ -312,9 +317,50 @@ def _log_gemini_timing(event: str, turn_id: Optional[int], **fields) -> None:
     print("[GEMINI-TIMING] " + " ".join(parts), flush=True)
 
 
+def _age_ms_since(started_ns: Optional[int]) -> Optional[float]:
+    if started_ns is None:
+        return None
+    return round(max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000), 3)
+
+
+def _detector_perception_telemetry(raw: dict) -> dict:
+    """Shape one detector's raw latest_* response into the persisted turn record."""
+    return {
+        "source_frame_id": raw.get("source_frame_id"),
+        "backend_frame_received_ns": raw.get("backend_received_monotonic_ns"),
+        "inference_completed_ns": raw.get("inference_completed_monotonic_ns"),
+        "request_ms": raw.get("request_ms"),
+        "inference_ms": raw.get("inference_ms"),
+        "completion_age_ms": raw.get("age_ms"),
+        "backend_frame_age_ms": _age_ms_since(raw.get("backend_received_monotonic_ns")),
+        "service_healthy": raw.get("service_healthy"),
+    }
+
+
+def _frame_alignment(
+    gemini_frame_id: Optional[int],
+    gemini_backend_ns: Optional[int],
+    yolo_raw: dict,
+) -> Tuple[Optional[int], Optional[float]]:
+    """How far the RGB frame sent to Gemini has drifted from the frame YOLO's
+    detections are based on: frame-sequence count and wall-clock time, both
+    gemini minus yolo. Null whenever either side's frame id is missing."""
+    yolo_frame_id = yolo_raw.get("source_frame_id")
+    if gemini_frame_id is None or yolo_frame_id is None:
+        return None, None
+    frame_id_delta = gemini_frame_id - yolo_frame_id
+    yolo_backend_ns = yolo_raw.get("backend_received_monotonic_ns")
+    time_delta_ms = None
+    if gemini_backend_ns is not None and yolo_backend_ns is not None:
+        time_delta_ms = round((gemini_backend_ns - yolo_backend_ns) / 1_000_000.0, 3)
+    return frame_id_delta, time_delta_ms
+
+
 def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn
     had_state = bool(
         _input_text_buf
         or _output_text_buf
@@ -326,6 +372,10 @@ def _clear_gemini_turn_state(reason: str) -> None:
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
     _perception_submitted_for_turn = False
+    _vision_frame_sequence_for_turn = None
+    _vision_frame_backend_ns_for_turn = None
+    _vision_intent_for_turn = False
+    _thermal_intent_for_turn = False
     if had_state:
         print(
             f"[GEMINI-TURN] state_cleared reason={reason} "
@@ -543,7 +593,7 @@ async def _on_audio(pcm24k: bytes):
     so a single 24k->8k resample feeds it directly.
     """
     global _ratecv_state_8k
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
     first_audio = latency_tracker.mark("first_gemini_audio_received", turn_id)
     if first_audio:
         _log_gemini_timing(
@@ -570,8 +620,14 @@ async def _on_audio(pcm24k: bytes):
                 )
 
 
-def build_perception_state(utterance: str = "") -> Optional[dict]:
-    """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates."""
+def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
+    """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates.
+
+    Returns (perception, raw_metrics) where raw_metrics carries the exact
+    yolo/hand_state dicts read here, so telemetry callers observe the same
+    cache snapshot used for fusion rather than risking a second, later read
+    of a cache that may have advanced (YOLO paces at its own interval).
+    """
     requested_target = extract_requested_target(utterance)
     guidance_anchor = guidance_anchor_for_utterance(utterance)
     anchor_reason = guidance_anchor_reason(utterance)
@@ -580,6 +636,7 @@ def build_perception_state(utterance: str = "") -> Optional[dict]:
         requested_target=requested_target,
     )
     hand_state = hand_client.latest_hands()
+    raw_metrics = {"yolo": yolo, "hands": hand_state}
 
     yolo_fresh = bool(
         yolo.get("enabled")
@@ -596,7 +653,7 @@ def build_perception_state(utterance: str = "") -> Optional[dict]:
     )
 
     if not yolo_fresh and not hands_fresh:
-        return None
+        return None, raw_metrics
 
     objects = []
     if yolo_fresh:
@@ -672,15 +729,17 @@ def build_perception_state(utterance: str = "") -> Optional[dict]:
         "hands": hands,
         "target_selection": target_selection,
         "guidance": guidance,
-    }
+    }, raw_metrics
 
 
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn
     if not text:
         return
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
     latency_tracker.mark("first_input_transcription", turn_id)
     combined = append_transcription_delta(_input_text_buf, text)
     try:
@@ -692,6 +751,10 @@ async def _on_input_transcription(text: str):
         pass
     wants_vision = is_explicit_vision_request(combined)
     wants_thermal = is_thermal_request(combined)
+    if wants_vision:
+        _vision_intent_for_turn = True
+    if wants_thermal:
+        _thermal_intent_for_turn = True
     if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
         _log_gemini_timing(
             "vision_intent_detected",
@@ -703,6 +766,11 @@ async def _on_input_transcription(text: str):
             frame_age_ms = max(
                 0.0, (time.monotonic() - frame.timestamp) * 1000
             )
+            latency_tracker.mark("vision_frame_selected", turn_id)
+            _vision_frame_sequence_for_turn = frame.sequence
+            # Same conversion yolo_client.py/hand_client.py use for their
+            # backend_received_monotonic_ns, so the two are directly comparable.
+            _vision_frame_backend_ns_for_turn = int(frame.timestamp * 1_000_000_000)
             _log_gemini_timing(
                 "vision_snapshot",
                 turn_id,
@@ -725,7 +793,9 @@ async def _on_input_transcription(text: str):
 
     # Send fresh specialized perception with the same RGB vision turn.
     if _vision_submitted_for_turn and not _perception_submitted_for_turn:
-        perception = build_perception_state(combined)
+        perception, perception_raw = build_perception_state(combined)
+        latency_tracker.mark("perception_state_built", turn_id)
+        perception_bytes = None
 
         if perception is None:
             print(
@@ -763,11 +833,14 @@ async def _on_input_transcription(text: str):
                   "unavailable."
             )
 
+            perception_bytes = len(perception_payload.encode("utf-8"))
             _perception_submitted_for_turn = await gemini_live.send_text(
                 perception_payload,
                 turn_id=turn_id,
                 source="perception_facts",
             )
+            if _perception_submitted_for_turn:
+                latency_tracker.mark("perception_state_sent", turn_id)
 
             print(
                 f"[PERCEPTION] generation={gemini_live.session_generation} "
@@ -783,6 +856,21 @@ async def _on_input_transcription(text: str):
                     "[GUIDANCE] " + compact_guidance_for_log(perception["guidance"]),
                     flush=True,
                 )
+
+        frame_id_delta, frame_time_delta_ms = _frame_alignment(
+            _vision_frame_sequence_for_turn,
+            _vision_frame_backend_ns_for_turn,
+            perception_raw["yolo"],
+        )
+        latency_tracker.update_perception(turn_id, {
+            "yolo": _detector_perception_telemetry(perception_raw["yolo"]),
+            "hands": _detector_perception_telemetry(perception_raw["hands"]),
+            "sent": bool(perception is not None and _perception_submitted_for_turn),
+            "bytes": perception_bytes,
+            "gemini_rgb_frame_id": _vision_frame_sequence_for_turn,
+            "frame_id_delta": frame_id_delta,
+            "frame_time_delta_ms": frame_time_delta_ms,
+        })
 
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
@@ -846,8 +934,9 @@ async def _on_turn_complete():
     """
     global omni_conversation_active, omni_previous_nav_state
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn
 
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
     active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
     integrity_degraded = bool(active_turn.get("audio_integrity_degraded"))
     if integrity_degraded:
@@ -873,6 +962,8 @@ async def _on_turn_complete():
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
     _perception_submitted_for_turn = False
+    _vision_intent_for_turn = False
+    _thermal_intent_for_turn = False
 
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
@@ -1158,6 +1249,57 @@ audio_freshness_tracker = AudioFreshnessTracker(
     recent_window_sec=2.0,
 )
 _latency_csv_lock = threading.Lock()
+
+# Free-text label for a block of turns under manual test (e.g. "far-room-walking"),
+# set via POST /api/session/start and cleared via POST /api/session/stop. Not
+# related to research_session_gate above — that's an external research-platform
+# activation gate; this is purely a label carried on this app's own turn telemetry.
+_telemetry_session_id: Optional[str] = None
+_telemetry_session_label: Optional[str] = None
+
+# Snapshot of (session_id, session_label) taken the moment each turn_id is first
+# created, so a turn started mid-session keeps that session's tag even if
+# /api/session/stop (or a new /api/session/start) fires before the turn finishes —
+# the transition itself is what a labeled test block is trying to capture.
+_turn_session_tags: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+
+
+def _tag_turn_session(turn_id: int) -> int:
+    _turn_session_tags.setdefault(turn_id, (_telemetry_session_id, _telemetry_session_label))
+    return turn_id
+
+
+def _ensure_turn() -> int:
+    return _tag_turn_session(latency_tracker.ensure_turn())
+
+
+def _start_turn(turn_id: Optional[int] = None) -> int:
+    return _tag_turn_session(latency_tracker.start_turn(turn_id))
+
+# Persisted per-turn telemetry (latency timestamps, tts stats, and the
+# perception record) as JSONL on the Fly volume, alongside backend.log.
+# Rotating handler caps disk usage; a missing /data (e.g. local dev outside
+# Docker) disables this with one warning instead of failing every turn.
+_TURN_TELEMETRY_PATH = os.getenv("TURN_TELEMETRY_PATH", "/data/turn_telemetry.jsonl")
+_TURN_TELEMETRY_MAX_BYTES = int(os.getenv("TURN_TELEMETRY_MAX_BYTES", str(20 * 1024 * 1024)))
+_TURN_TELEMETRY_BACKUP_COUNT = int(os.getenv("TURN_TELEMETRY_BACKUP_COUNT", "3"))
+_turn_telemetry_logger = logging.getLogger("turn_telemetry")
+_turn_telemetry_logger.setLevel(logging.INFO)
+_turn_telemetry_logger.propagate = False
+_turn_telemetry_enabled = False
+try:
+    _turn_telemetry_handler = RotatingFileHandler(
+        _TURN_TELEMETRY_PATH,
+        maxBytes=_TURN_TELEMETRY_MAX_BYTES,
+        backupCount=_TURN_TELEMETRY_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _turn_telemetry_handler.setFormatter(logging.Formatter("%(message)s"))
+    _turn_telemetry_logger.addHandler(_turn_telemetry_handler)
+    _turn_telemetry_enabled = True
+except OSError as exc:
+    print(f"[TURN-TELEMETRY] disabled, cannot open {_TURN_TELEMETRY_PATH}: {exc}", flush=True)
+
 # Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
 latest_thermal_matrix: Optional[np.ndarray] = None
 latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
@@ -1264,13 +1406,38 @@ async def _append_latency_csv_safely(record: dict) -> None:
         print(f"[LATENCY] CSV append failed: {exc}", flush=True)
 
 
+def _append_turn_telemetry(record: dict) -> None:
+    _turn_telemetry_logger.info(json.dumps(record, separators=(",", ":")))
+
+
+async def _append_turn_telemetry_safely(record: dict) -> None:
+    try:
+        await asyncio.to_thread(_append_turn_telemetry, record)
+    except Exception as exc:
+        print(f"[TURN-TELEMETRY] append failed: {exc}", flush=True)
+
+
 async def _finalize_latency_turn(status: str, turn_id: int) -> None:
     record = latency_tracker.finish(status, turn_id)
     if record is None:
         return
+    # Read here rather than at turn-start: these buffers/flags are still the
+    # ones for `turn_id` at every call site (all four call this before the
+    # buffers/flags get cleared), so this is the full-turn content.
+    record["input_transcription"] = "".join(_input_text_buf).strip() or None
+    record["response_text"] = "".join(_output_text_buf).strip() or None
+    record["vision_intent"] = _vision_intent_for_turn
+    record["thermal_intent"] = _thermal_intent_for_turn
+    # Unlike the above, session tag IS taken at turn-start (see _tag_turn_session)
+    # so a session boundary crossed mid-turn doesn't erase which block it was in.
+    session_id, session_label = _turn_session_tags.pop(turn_id, (None, None))
+    record["session_id"] = session_id
+    record["session_label"] = session_label
     print("[LATENCY] " + json.dumps(record, separators=(",", ":")), flush=True)
     if status == "completed" and os.getenv("LATENCY_LOG_CSV", "").strip():
         asyncio.create_task(_append_latency_csv_safely(record))
+    if _turn_telemetry_enabled:
+        asyncio.create_task(_append_turn_telemetry_safely(record))
 
 recording_pipeline = RecordingPipeline(
     sync_recorder.record_frame,
@@ -1982,7 +2149,7 @@ async def start_ai_with_text(user_text: str):
                         # and writes to i2sOut.
                         _ws = esp32_audio_ws
                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
-                            turn_id = latency_tracker.ensure_turn()
+                            turn_id = _ensure_turn()
                             _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
                             for _i in range(0, len(pcm8k), _CHUNK):
                                 _enqueue_tts_chunk(pcm8k[_i:_i + _CHUNK], turn_id)
@@ -2191,6 +2358,32 @@ async def vision_request(request: Request, payload: VisionRequest):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     result = await request_gemini_vision(f"api:{payload.reason[:80]}")
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+class SessionStartRequest(BaseModel):
+    label: str
+
+
+@app.post("/api/session/start")
+async def session_start(payload: SessionStartRequest):
+    """Tag every turn recorded from now until /api/session/stop with a label
+    (e.g. "far-room-walking") for manual test blocks. In-memory only, no auth —
+    same trust boundary as the rest of this app's local-network control plane."""
+    global _telemetry_session_id, _telemetry_session_label
+    _telemetry_session_id = uuid.uuid4().hex
+    _telemetry_session_label = payload.label
+    return JSONResponse({
+        "session_id": _telemetry_session_id,
+        "session_label": _telemetry_session_label,
+    })
+
+
+@app.post("/api/session/stop")
+async def session_stop():
+    global _telemetry_session_id, _telemetry_session_label
+    _telemetry_session_id = None
+    _telemetry_session_label = None
+    return JSONResponse({"stopped": True})
 
 
 class ResearchSessionCommand(BaseModel):
@@ -2820,7 +3013,7 @@ async def ws_audio(ws: WebSocket):
                         await _finalize_latency_turn("interrupted", active_turn_id)
                     if active_turn_id != turn_id:
                         _clear_gemini_turn_state("speech_start")
-                    latency_tracker.start_turn(turn_id)
+                    _start_turn(turn_id)
                     continue
 
                 if raw.startswith("SPEECH_END:"):
@@ -2829,7 +3022,7 @@ async def ws_audio(ws: WebSocket):
                     except ValueError:
                         continue
                     if latency_tracker.active_turn_id is None:
-                        latency_tracker.start_turn(turn_id)
+                        _start_turn(turn_id)
                     latency_tracker.mark("speech_end_detected", turn_id)
                     continue
 
