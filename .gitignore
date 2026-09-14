@@ -15,6 +15,9 @@ research_session_state.json*
 # Model files (download with scripts/download_models.sh)
 model/*.pt
 model/*.task
+# Precomputed YOLOE whitelist text embeddings are small (~60KB) derived data,
+# not a downloaded weight file — commit them (scripts/precompute_yoloe_embeddings.py).
+!model/yoloe-whitelist-embeddings.pt
 
 # Ultralytics asset cache (auto-downloaded on first YOLOE load, ~571 MiB)
 mobileclip_blt.ts
@@ -36,3 +39,18 @@ scripts/build_comparison_csv.py
 scripts/run_qwen_on_screenshots.py
 scripts/fill_untitled_sheet.py
 test.md
+
+# model weights (download from ModelScope)
+model/*.pt
+model/*.obj
+model/*.task
+!model/yoloe-whitelist-embeddings.pt
+
+# test images and scratch
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.save
+*.log
+turn_telemetry.jsonl

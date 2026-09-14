@@ -23,6 +23,20 @@ the client reuses `YOLO_SERVICE_URL` and `YOLO_SERVICE_TOKEN` because both
 endpoints live in this authenticated service. `HAND_MIN_INTERVAL_SEC` defaults
 to `0.33` and `HAND_CACHE_STALE_SEC` defaults to `1.25`.
 
+Segmentation (`road_crossing`/`blind_path`) is independently enabled with
+`ENABLE_YOLO_SEG=true`; the client reuses `YOLO_SERVICE_URL`/`YOLO_SERVICE_TOKEN`
+unless `YOLO_SEG_SERVICE_URL`/`YOLO_SEG_SERVICE_TOKEN` are set explicitly.
+`YOLO_SEG_MIN_INTERVAL_SEC` defaults to `1.0` and `YOLO_SEG_CACHE_STALE_SEC`
+defaults to `3.0`.
+
+Open-vocabulary obstacle detection is independently enabled with
+`ENABLE_YOLOE_OBSTACLES=true`, with the same `YOLO_SERVICE_URL`/`YOLO_SERVICE_TOKEN`
+fallback via `YOLOE_SERVICE_URL`/`YOLOE_SERVICE_TOKEN`. The service prompts
+YOLOE with a fixed obstacle whitelist (`OBSTACLE_WHITELIST` in `app.py`,
+copied from `obstacle_detector_client.py`) once at startup, using CLIP text
+embeddings precomputed offline — see "Precomputing YOLOE embeddings" below.
+It never imports CLIP or reaches the network at runtime.
+
 The default image uses CPU-only PyTorch. `PYTORCH_INDEX_URL` is a build argument
 so a compatible GPU wheel index and `YOLO_DEVICE` can be selected for a future
 GPU deployment without changing the API contract.
@@ -81,3 +95,52 @@ no rotation or mirror parameter: the caller sends the already-canonical RGB
 JPEG and every normalized coordinate is in that exact source space. A response
 contains at most two hands, each with 21 landmarks plus `index_tip_norm`,
 `wrist_norm`, `hand_center_norm`, and `bbox_norm`.
+
+`POST /v1/segment?confidence=0.25` (`yolo-seg.pt`) and
+`POST /v1/obstacles?confidence=0.25` (`yoloe-11l-seg.pt`, prompted with the
+fixed obstacle whitelist) use the same header contract, status codes, and
+per-endpoint single-slot admission as `/v1/detect`, including
+`X-Camera-Rotation-Deg`. Their objects carry an additional
+`mask_coverage_norm` (fraction of the frame the instance mask covers,
+resolution-independent):
+
+```json
+{
+  "frame_id": 1234,
+  "inference_ms": 210.3,
+  "image_width": 320,
+  "image_height": 240,
+  "objects": [
+    {
+      "class_id": 1,
+      "label": "blind_path",
+      "confidence": 0.83,
+      "bbox_norm": [0.0, 0.4, 1.0, 1.0],
+      "center_norm": [0.5, 0.7],
+      "mask_coverage_norm": 0.32
+    }
+  ]
+}
+```
+
+`/v1/segment`'s checkpoint contract is `{0: "road_crossing", 1: "blind_path"}`;
+the service refuses to serve a checkpoint whose class names don't match this
+exactly (fails at load, not at inference).
+
+## Precomputing YOLOE embeddings
+
+`/v1/obstacles`'s whitelist is static, so its CLIP text embeddings are
+computed once, offline, with `scripts/precompute_yoloe_embeddings.py`, rather
+than in the service itself — calling `get_text_pe()` in the service would
+import OpenAI's CLIP (an unpinned `pip install git+...` on first use) and
+download the ~338MB ViT-B/32 checkpoint from OpenAI's CDN at container
+startup. Run this once wherever CLIP already resolves (e.g. after running
+`obstacle_detector_client.py` locally) and commit the resulting
+`model/yoloe-whitelist-embeddings.pt`:
+
+```sh
+python3 scripts/precompute_yoloe_embeddings.py
+```
+
+Re-run it only if the whitelist in `obstacle_detector_client.py`/`app.py`'s
+`OBSTACLE_WHITELIST` ever changes — the two must stay in sync.

@@ -8,7 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
     YOLO_CONFIDENCE=0.25 \
     YOLO_IMAGE_SIZE=640 \
     YOLO_TORCH_THREADS=1 \
-    HAND_MODEL_PATH=/app/hand_landmarker.task
+    HAND_MODEL_PATH=/app/hand_landmarker.task \
+    YOLO_SEG_MODEL_PATH=/app/yolo-seg.pt \
+    YOLO_SEG_CONFIDENCE=0.25 \
+    YOLOE_MODEL_PATH=/app/yoloe-11l-seg.pt \
+    YOLOE_EMBEDDINGS_PATH=/app/yoloe-whitelist-embeddings.pt \
+    YOLOE_CONFIDENCE=0.25
 
 WORKDIR /app
 
@@ -26,12 +31,31 @@ RUN python3 -m pip install --upgrade pip \
 
 COPY yolov8n.pt /app/yolov8n.pt
 COPY hand_landmarker.task /app/hand_landmarker.task
+COPY model/yolo-seg.pt /app/yolo-seg.pt
+COPY model/yoloe-11l-seg.pt /app/yoloe-11l-seg.pt
+COPY model/yoloe-whitelist-embeddings.pt /app/yoloe-whitelist-embeddings.pt
 COPY yolo_service/core.py yolo_service/app.py /app/
 
 # Validate the exact creator checkpoint during build without saving output or
 # permitting an implicit model download.
 RUN python3 -c "import numpy as np; from ultralytics import YOLO; YOLO('/app/yolov8n.pt', task='detect').predict(source=np.zeros((240, 320, 3), dtype=np.uint8), device='cpu', imgsz=640, batch=1, save=False, verbose=False)"
 RUN python3 -c "from mediapipe.tasks import python; from mediapipe.tasks.python import vision; model=vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(base_options=python.BaseOptions(model_asset_path='/app/hand_landmarker.task', delegate=python.BaseOptions.Delegate.CPU), running_mode=vision.RunningMode.IMAGE, num_hands=2)); model.close()"
+# road_crossing/blind_path segmentation and open-vocab obstacle checkpoints,
+# validated through the app's own loaders (not reimplemented here) so the
+# class-name/embeddings contract can't drift between build-time validation
+# and what the running service actually does. Fails the build loudly on a
+# mismatched checkpoint or a missing/broken precomputed embeddings file
+# instead of surfacing at first request.
+RUN python3 -c "\
+import sys; sys.path.insert(0, '/app'); \
+import numpy as np; \
+import app; \
+app._load_seg_model(); \
+assert app._seg_model_loaded, app._seg_model_error; \
+app._seg_model.predict(source=np.zeros((240, 320, 3), dtype=np.uint8), device='cpu', imgsz=640, batch=1, save=False, verbose=False); \
+app._load_obstacle_model(); \
+assert app._obstacle_model_loaded, app._obstacle_model_error; \
+app._obstacle_model.predict(source=np.zeros((240, 320, 3), dtype=np.uint8), device='cpu', imgsz=640, batch=1, save=False, verbose=False)"
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \

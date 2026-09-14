@@ -636,7 +636,9 @@ def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
         requested_target=requested_target,
     )
     hand_state = hand_client.latest_hands()
-    raw_metrics = {"yolo": yolo, "hands": hand_state}
+    yolo_seg = yolo_seg_client.latest_perception(display_rotation_deg=0)
+    yoloe = yoloe_client.latest_perception(display_rotation_deg=0)
+    raw_metrics = {"yolo": yolo, "hands": hand_state, "yolo_seg": yolo_seg, "yoloe": yoloe}
 
     # Gate on backend_frame_age_ms (time since the RGB frame was received),
     # not completion_age_ms (time since inference finished on it) — the
@@ -659,14 +661,48 @@ def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
         and hands_backend_age_ms <= hand_client.settings.stale_after_sec * 1000.0
     )
 
-    if not yolo_fresh and not hands_fresh:
+    # yolo_seg (road_crossing/blind_path) and yoloe (open-vocab obstacle
+    # whitelist) are independently gated the same way — either being off or
+    # stale never blocks the others, and neither participates in hand-target
+    # guidance fusion (out of scope: navigation_master/state machine).
+    segmentation_backend_age_ms = _age_ms_since(yolo_seg.get("backend_received_monotonic_ns"))
+    segmentation_fresh = bool(
+        yolo_seg.get("enabled")
+        and yolo_seg.get("service_healthy") is not False
+        and segmentation_backend_age_ms is not None
+        and segmentation_backend_age_ms <= yolo_seg_client.settings.stale_after_sec * 1000.0
+    )
+
+    obstacles_backend_age_ms = _age_ms_since(yoloe.get("backend_received_monotonic_ns"))
+    obstacles_fresh = bool(
+        yoloe.get("enabled")
+        and yoloe.get("service_healthy") is not False
+        and obstacles_backend_age_ms is not None
+        and obstacles_backend_age_ms <= yoloe_client.settings.stale_after_sec * 1000.0
+    )
+
+    if not (yolo_fresh or hands_fresh or segmentation_fresh or obstacles_fresh):
         return None, raw_metrics
 
     objects = []
     if yolo_fresh:
         for obj in (yolo.get("objects") or [])[:8]:
             if isinstance(obj, dict):
-                objects.append(dict(obj))
+                tagged = dict(obj)
+                tagged["source"] = "yolo_detect"
+                objects.append(tagged)
+    if segmentation_fresh:
+        for obj in (yolo_seg.get("objects") or [])[:8]:
+            if isinstance(obj, dict):
+                tagged = dict(obj)
+                tagged["source"] = "yolo_seg"
+                objects.append(tagged)
+    if obstacles_fresh:
+        for obj in (yoloe.get("objects") or [])[:8]:
+            if isinstance(obj, dict):
+                tagged = dict(obj)
+                tagged["source"] = "yoloe_obstacle"
+                objects.append(tagged)
 
     hands = []
     if hands_fresh:
@@ -722,6 +758,12 @@ def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
         "objects_fresh": yolo_fresh,
         "objects_age_ms": yolo.get("age_ms") if yolo_fresh else None,
         "object_frame_id": yolo.get("frame_id") if yolo_fresh else None,
+        "segmentation_fresh": segmentation_fresh,
+        "segmentation_age_ms": yolo_seg.get("age_ms") if segmentation_fresh else None,
+        "segment_frame_id": yolo_seg.get("frame_id") if segmentation_fresh else None,
+        "obstacles_fresh": obstacles_fresh,
+        "obstacles_age_ms": yoloe.get("age_ms") if obstacles_fresh else None,
+        "obstacle_frame_id": yoloe.get("frame_id") if obstacles_fresh else None,
         "objects": objects,
         "hands_fresh": hands_fresh,
         "hands_age_ms": hand_state.get("age_ms") if hands_fresh else None,
@@ -872,6 +914,8 @@ async def _on_input_transcription(text: str):
         latency_tracker.update_perception(turn_id, {
             "yolo": _detector_perception_telemetry(perception_raw["yolo"]),
             "hands": _detector_perception_telemetry(perception_raw["hands"]),
+            "yolo_seg": _detector_perception_telemetry(perception_raw["yolo_seg"]),
+            "yoloe": _detector_perception_telemetry(perception_raw["yoloe"]),
             "sent": bool(perception is not None and _perception_submitted_for_turn),
             "bytes": perception_bytes,
             "gemini_rgb_frame_id": _vision_frame_sequence_for_turn,
@@ -1199,6 +1243,8 @@ from stability_runtime import (
 )
 from yolo_client import YoloClientSettings, YoloShadowClient
 from hand_client import HandClientSettings, HandTrackingClient
+from yolo_seg_client import YoloSegClientSettings, YoloSegShadowClient
+from yoloe_client import YoloeClientSettings, YoloeShadowClient
 from research_exporter import (
     DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
     ResearchExporter, ResearchExporterSettings, SessionGate,
@@ -1249,6 +1295,20 @@ hand_target_guidance = HandTargetGuidanceTracker(
 )
 hand_settings = HandClientSettings.from_env()
 hand_client = HandTrackingClient(hand_settings, latest_rgb)
+yolo_seg_settings = YoloSegClientSettings.from_env()
+yolo_seg_client = YoloSegShadowClient(
+    yolo_seg_settings,
+    latest_rgb,
+    rotation_provider=lambda: 0,
+    on_event=research_exporter.publish_event,
+)
+yoloe_settings = YoloeClientSettings.from_env()
+yoloe_client = YoloeShadowClient(
+    yoloe_settings,
+    latest_rgb,
+    rotation_provider=lambda: 0,
+    on_event=research_exporter.publish_event,
+)
 latency_tracker = LatencyTracker(history_size=200)
 latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
 audio_freshness_tracker = AudioFreshnessTracker(
@@ -2267,6 +2327,8 @@ def health():
         "vision": dict(vision_controller.metrics),
         "yolo": yolo_client.health(),
         "hands": hand_client.health(),
+        "yolo_seg": yolo_seg_client.health(),
+        "yoloe": yoloe_client.health(),
         "thermal_calibration": thermal_calibration_diagnostics(),
         "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
@@ -4192,6 +4254,16 @@ async def startup_hand_tracking():
 
 
 @app.on_event("startup")
+async def startup_yolo_seg():
+    await yolo_seg_client.start()
+
+
+@app.on_event("startup")
+async def startup_yoloe_obstacles():
+    await yoloe_client.start()
+
+
+@app.on_event("startup")
 async def startup_research_exporter():
     await research_exporter.start()
 
@@ -4366,6 +4438,8 @@ async def on_shutdown():
     print("[SHUTDOWN] Starting resource cleanup...")
     await hand_client.stop()
     await yolo_client.stop()
+    await yolo_seg_client.stop()
+    await yoloe_client.stop()
     await research_exporter.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
