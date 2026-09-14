@@ -108,7 +108,7 @@ class YoloSegClientContractTests(unittest.TestCase):
         self.assertEqual(fresh["source_frame_id"], 7)
         self.assertEqual(fresh["inference_rotation_deg"], 90)
 
-        now[0] += 3_000_000_001
+        now[0] += 6_000_000_001  # exceeds the 6.0s default stale_after_sec
         stale = client.latest_perception(display_rotation_deg=0)
         self.assertFalse(stale["available"])
         self.assertTrue(stale["stale"])

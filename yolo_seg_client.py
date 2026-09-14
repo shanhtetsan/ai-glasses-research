@@ -54,10 +54,12 @@ class YoloSegClientSettings:
     enabled: bool = False
     service_url: str = ""
     service_token: str = ""
-    min_interval_sec: float = 1.0
-    request_timeout_sec: float = 2.0
+    # Server-measured on deployment CPUs: avg 3690ms, p95 5323ms — min_interval
+    # and timeout below are calibrated to that, not the ~220-280ms local figure.
+    min_interval_sec: float = 4.0
+    request_timeout_sec: float = 8.0
     confidence: float = 0.25
-    stale_after_sec: float = 3.0
+    stale_after_sec: float = 6.0
     health_interval_sec: float = 30.0
 
     @classmethod
@@ -75,10 +77,10 @@ class YoloSegClientSettings:
                 os.getenv("YOLO_SEG_SERVICE_TOKEN", "").strip()
                 or os.getenv("YOLO_SERVICE_TOKEN", "").strip()
             ),
-            min_interval_sec=_env_float("YOLO_SEG_MIN_INTERVAL_SEC", 1.0, 0.1),
-            request_timeout_sec=_env_float("YOLO_SEG_REQUEST_TIMEOUT_SEC", 2.0, 0.1),
+            min_interval_sec=_env_float("YOLO_SEG_MIN_INTERVAL_SEC", 4.0, 0.1),
+            request_timeout_sec=_env_float("YOLO_SEG_REQUEST_TIMEOUT_SEC", 8.0, 0.1),
             confidence=_env_float("YOLO_SEG_CONFIDENCE", 0.25, 0.0, 1.0),
-            stale_after_sec=_env_float("YOLO_SEG_CACHE_STALE_SEC", 3.0, 0.1),
+            stale_after_sec=_env_float("YOLO_SEG_CACHE_STALE_SEC", 6.0, 0.1),
             health_interval_sec=_env_float("YOLO_SEG_HEALTH_INTERVAL_SEC", 30.0, 5.0),
         )
 

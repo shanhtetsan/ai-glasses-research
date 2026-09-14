@@ -38,3 +38,17 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 venv/**/*
 fly.toml
+
+# Needed by yolo_service Dockerfile
+!model/yolo-seg.pt
+!model/yoloe-11l-seg.pt
+!model/yoloe-whitelist-embeddings.pt
+
+# Needed by yolo_service Dockerfile
+!model/yolo-seg.pt
+!model/yoloe-11l-seg.pt
+!model/yoloe-whitelist-embeddings.pt
+
+# Large, never needed in the image
+.git
+**/*.obj

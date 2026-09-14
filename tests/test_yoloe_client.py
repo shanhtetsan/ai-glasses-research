@@ -106,7 +106,7 @@ class YoloeClientContractTests(unittest.TestCase):
         self.assertEqual(fresh["frame_id"], 3)
         self.assertEqual(fresh["source_frame_id"], 3)
 
-        now[0] += 3_000_000_001
+        now[0] += 4_000_000_001  # exceeds the 4.0s default stale_after_sec
         stale = client.latest_perception(display_rotation_deg=0)
         self.assertFalse(stale["available"])
         self.assertTrue(stale["stale"])

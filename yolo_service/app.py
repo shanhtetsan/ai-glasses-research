@@ -145,17 +145,34 @@ _obstacle_metrics = {
 }
 
 
+def _configure_torch_threads() -> None:
+    """Set torch's process-global thread config.
+
+    Every torch-based loader calls this as its first action — not just
+    _load_model(). All four loaders now run concurrently at startup (see
+    lifespan()), each on its own executor thread with no ordering guarantee,
+    and torch.set_num_threads() must run before any parallel op starts or it
+    may silently not take effect. Relying on _load_model() alone to "win the
+    race" let _load_seg_model()/_load_obstacle_model() construct their models
+    — and potentially run a first parallel op — before thread config was
+    applied, leaving them at whatever thread count the OS/torch default was.
+    Calling this repeatedly (once per loader) is harmless: the parameters are
+    identical every time.
+    """
+    torch.set_num_threads(TORCH_THREADS)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
 def _load_model() -> None:
     global _model, _model_loaded, _model_error
     try:
         model_file = Path(MODEL_PATH)
         if not model_file.is_file():
             raise FileNotFoundError(MODEL_PATH)
-        torch.set_num_threads(TORCH_THREADS)
-        try:
-            torch.set_num_interop_threads(1)
-        except RuntimeError:
-            pass
+        _configure_torch_threads()
         if DEVICE.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("cuda_requested_but_unavailable")
         _model = YOLO(str(model_file), task="detect")
@@ -176,6 +193,7 @@ def _load_seg_model() -> None:
         model_file = Path(SEG_MODEL_PATH)
         if not model_file.is_file():
             raise FileNotFoundError(SEG_MODEL_PATH)
+        _configure_torch_threads()
         if DEVICE.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("cuda_requested_but_unavailable")
         model = YOLO(str(model_file), task="segment")
@@ -215,6 +233,7 @@ def _load_obstacle_model() -> None:
         embeddings_file = Path(OBSTACLE_EMBEDDINGS_PATH)
         if not embeddings_file.is_file():
             raise FileNotFoundError(OBSTACLE_EMBEDDINGS_PATH)
+        _configure_torch_threads()
         if DEVICE.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("cuda_requested_but_unavailable")
         model = YOLOE(str(model_file))

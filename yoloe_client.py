@@ -56,10 +56,15 @@ class YoloeClientSettings:
     enabled: bool = False
     service_url: str = ""
     service_token: str = ""
-    min_interval_sec: float = 1.0
-    request_timeout_sec: float = 2.0
+    # Server-measured on deployment CPUs: avg 1956ms with one 14661ms outlier
+    # (no p95 available yet) — min_interval/timeout calibrated to that, not
+    # the ~158-310ms local figure. stale_after_sec deliberately stays well
+    # under the outlier: a detection built from a 14s-old frame should read
+    # as stale, not get treated as current.
+    min_interval_sec: float = 2.5
+    request_timeout_sec: float = 20.0
     confidence: float = 0.25
-    stale_after_sec: float = 3.0
+    stale_after_sec: float = 4.0
     health_interval_sec: float = 30.0
 
     @classmethod
@@ -77,10 +82,10 @@ class YoloeClientSettings:
                 os.getenv("YOLOE_SERVICE_TOKEN", "").strip()
                 or os.getenv("YOLO_SERVICE_TOKEN", "").strip()
             ),
-            min_interval_sec=_env_float("YOLOE_MIN_INTERVAL_SEC", 1.0, 0.1),
-            request_timeout_sec=_env_float("YOLOE_REQUEST_TIMEOUT_SEC", 2.0, 0.1),
+            min_interval_sec=_env_float("YOLOE_MIN_INTERVAL_SEC", 2.5, 0.1),
+            request_timeout_sec=_env_float("YOLOE_REQUEST_TIMEOUT_SEC", 20.0, 0.1),
             confidence=_env_float("YOLOE_CONFIDENCE", 0.25, 0.0, 1.0),
-            stale_after_sec=_env_float("YOLOE_CACHE_STALE_SEC", 3.0, 0.1),
+            stale_after_sec=_env_float("YOLOE_CACHE_STALE_SEC", 4.0, 0.1),
             health_interval_sec=_env_float("YOLOE_HEALTH_INTERVAL_SEC", 30.0, 5.0),
         )
 

@@ -26,8 +26,12 @@ to `0.33` and `HAND_CACHE_STALE_SEC` defaults to `1.25`.
 Segmentation (`road_crossing`/`blind_path`) is independently enabled with
 `ENABLE_YOLO_SEG=true`; the client reuses `YOLO_SERVICE_URL`/`YOLO_SERVICE_TOKEN`
 unless `YOLO_SEG_SERVICE_URL`/`YOLO_SEG_SERVICE_TOKEN` are set explicitly.
-`YOLO_SEG_MIN_INTERVAL_SEC` defaults to `1.0` and `YOLO_SEG_CACHE_STALE_SEC`
-defaults to `3.0`.
+`YOLO_SEG_MIN_INTERVAL_SEC` defaults to `4.0`, `YOLO_SEG_REQUEST_TIMEOUT_SEC`
+to `8.0`, and `YOLO_SEG_CACHE_STALE_SEC` to `6.0` — calibrated to this
+model's server-measured deployment latency (avg 3690ms, p95 5323ms on the
+production CPU class), not its much faster ~220-280ms local latency. Don't
+reset these to the small defaults the other detectors use without re-checking
+`/healthz`'s `average_seg_inference_ms`/`p95_seg_inference_ms` first.
 
 Open-vocabulary obstacle detection is independently enabled with
 `ENABLE_YOLOE_OBSTACLES=true`, with the same `YOLO_SERVICE_URL`/`YOLO_SERVICE_TOKEN`
@@ -36,6 +40,11 @@ YOLOE with a fixed obstacle whitelist (`OBSTACLE_WHITELIST` in `app.py`,
 copied from `obstacle_detector_client.py`) once at startup, using CLIP text
 embeddings precomputed offline — see "Precomputing YOLOE embeddings" below.
 It never imports CLIP or reaches the network at runtime.
+`YOLOE_MIN_INTERVAL_SEC` defaults to `2.5`, `YOLOE_REQUEST_TIMEOUT_SEC` to
+`20.0` (server-measured avg 1956ms with one 14661ms outlier — no p95 yet;
+revisit once one exists), and `YOLOE_CACHE_STALE_SEC` to `4.0`, deliberately
+well under that outlier so a detection built from a 14-second-old frame
+reads as stale rather than current.
 
 The default image uses CPU-only PyTorch. `PYTORCH_INDEX_URL` is a build argument
 so a compatible GPU wheel index and `YOLO_DEVICE` can be selected for a future
