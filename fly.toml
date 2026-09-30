@@ -14,6 +14,7 @@ primary_region = 'ewr'
   YOLO_CONFIDENCE = '0.25'
   YOLO_MIN_INTERVAL_SEC = '1.0'
   YOLO_REQUEST_TIMEOUT_SEC = '3.0'
+  LATENCY_LOG_CSV = '/data/latency.csv'
 
 [http_service]
   internal_port = 8081
@@ -28,9 +29,9 @@ primary_region = 'ewr'
   hard_limit = 25
 
 [[vm]]
-  cpu_kind = "performance"
-  cpus = 4
-  memory = "3gb"
+  cpu_kind = "shared"
+  cpus = 2
+  memory = "1gb"
 
 [[mounts]]
   source = "test_logs"

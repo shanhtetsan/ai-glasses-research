@@ -61,6 +61,24 @@ All paths below confirmed against the working tree.
 | File | Role |
 |---|---|
 | `compile/compile.ino` | Entire device firmware — capture loop, both WebSocket clients, I2S playback, sensor reads |
+| `compile/ArduinoWebsockets.h`, `compile/tiny_websockets/`, and `compile/websockets_*.cpp` | Sketch-local patched fork of ArduinoWebsockets 0.5.4 |
+
+#### Vendored ArduinoWebsockets fork
+
+The firmware vendors ArduinoWebsockets 0.5.4 directly under `compile/` and
+includes it explicitly from `compile.ino`. Arduino compiles the vendored root
+`.cpp` files as part of the sketch, and the sketch-root include resolves its
+`tiny_websockets/` headers without consulting Library Manager. Do not replace it with the Library Manager
+copy: upstream 0.5.4 discards the byte count returned by ESP32
+`NetworkClient::write()` and then reports every WebSocket frame as successfully
+sent. A zero or partial TCP write can therefore leave an incomplete frame on
+the stream and desynchronize the receiver.
+
+The vendored fork makes the ESP transport require `written == requested`. It
+closes the TCP client after a zero or partial write, and the WebSocket endpoint
+propagates the closed transport as a failed `sendBinary()` or `ping()` call.
+The remaining source is unchanged from ArduinoWebsockets 0.5.4. Its upstream
+license is retained at `compile/ArduinoWebsockets-LICENSE.txt`.
 
 ### Backend (Python / FastAPI)
 | File | Role |
@@ -127,7 +145,12 @@ python3 app_main.py
 Dashboard: `http://localhost:8081/` (`app_main.py`'s `if __name__ == "__main__"` block hardcodes `port=8081`; `fly.toml`'s `internal_port` and the `Dockerfile`'s `EXPOSE` agree)
 
 ### Firmware
-Flash `compile.ino` via Arduino IDE with the XIAO ESP32-S3 board package. WiFi credentials (`WIFI_SSID`, `WIFI_PASS`) and the backend host (`SERVER_HOST`) are hardcoded plaintext constants near the top of `compile/compile.ino` (~line 42-44) — edit them there before flashing.
+Flash `compile.ino` via Arduino IDE with the XIAO ESP32-S3 board package. The
+Arduino build system compiles the vendored WebSocket fork from the sketch
+folder; no separate ArduinoWebsockets installation is required. WiFi
+credentials (`WIFI_SSID`, `WIFI_PASS`) and the backend host (`SERVER_HOST`) are
+hardcoded plaintext constants near the top of `compile/compile.ino` (~line
+42-44) — edit them there before flashing.
 
 Note `#define STABILITY_MODE 1` (line 24). **Correction:** this does *not* make `/api/camera` a no-op. `handle_researcher_camera_cmd()` (compile.ino ~L779) and the `/api/camera` handler (`app_main.py` ~L2386) both explicitly carve `SET:FRAMESIZE=` and `SET:FPS=` out of the STABILITY_MODE block — those two are "compiled in regardless of STABILITY_MODE" per the firmware's own comment. Only the legacy sensor-tuning fields (`quality`, `exposure_auto`, `exposure_value`, `gain_ceiling`, `aec2`, `ae_level`) are blocked (HTTP 409) under STABILITY_MODE. See `PROJECT_CONTEXT.md` §3.2 — this is the Camera Researcher Control feature, implemented but not yet flash-tested.
 

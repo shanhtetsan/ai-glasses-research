@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
 import re
+from datetime import datetime, timezone
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -65,7 +66,7 @@ except ImportError as e:
     YOLO = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -1447,6 +1448,7 @@ def _append_latency_csv(record: dict) -> None:
     if not csv_path:
         return
     fields = (
+        "logged_at",
         "turn_id", "status",
         "speech_end_to_first_gemini_audio_ms",
         "speech_end_to_first_tts_send_ms",
@@ -1455,8 +1457,10 @@ def _append_latency_csv(record: dict) -> None:
         "backend_turn_total_ms",
         "speech_end_to_first_i2s_ms",
         "tts_chunks", "tts_bytes", "max_queue_depth",
+        "input_transcription", "response_text",
     )
     row = {field: record.get(field) for field in fields}
+    row["logged_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _latency_csv_lock:
         needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
         with open(csv_path, "a", newline="", encoding="utf-8") as handle:
@@ -1501,7 +1505,7 @@ async def _finalize_latency_turn(status: str, turn_id: int) -> None:
     record["session_id"] = session_id
     record["session_label"] = session_label
     print("[LATENCY] " + json.dumps(record, separators=(",", ":")), flush=True)
-    if status == "completed" and os.getenv("LATENCY_LOG_CSV", "").strip():
+    if os.getenv("LATENCY_LOG_CSV", "").strip():
         asyncio.create_task(_append_latency_csv_safely(record))
     if _turn_telemetry_enabled:
         asyncio.create_task(_append_turn_telemetry_safely(record))
@@ -2361,6 +2365,14 @@ def audio_freshness():
 @app.get("/latency/metrics")
 def latency_metrics():
     return JSONResponse(latency_tracker.snapshot())
+
+
+@app.get("/latency.csv")
+def latency_csv():
+    csv_path = os.getenv("LATENCY_LOG_CSV", "").strip()
+    if not csv_path or not os.path.isfile(csv_path):
+        return JSONResponse({"error": "latency csv not available"}, status_code=404)
+    return FileResponse(csv_path, media_type="text/csv", filename="latency.csv")
 
 
 @app.get("/api/yolo/detections")
