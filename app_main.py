@@ -295,6 +295,7 @@ _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
 _perception_submitted_for_turn: bool = False
+_vision_declined_for_turn: bool = False  # told Gemini it cannot see; suppresses a later image this turn
 _vision_frame_sequence_for_turn: Optional[int] = None
 _vision_frame_backend_ns_for_turn: Optional[int] = None  # same frame's capture time, same clock as detectors' backend_received_monotonic_ns
 _vision_intent_for_turn: bool = False   # latched True if is_explicit_vision_request() ever fired this turn
@@ -373,6 +374,7 @@ def _clear_gemini_turn_state(reason: str) -> None:
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
     _perception_submitted_for_turn = False
+    _vision_declined_for_turn = False
     _vision_frame_sequence_for_turn = None
     _vision_frame_backend_ns_for_turn = None
     _vision_intent_for_turn = False
@@ -786,7 +788,7 @@ async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
     global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
     global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
-    global _vision_intent_for_turn, _thermal_intent_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
     if not text:
         return
     turn_id = _ensure_turn()
@@ -805,17 +807,25 @@ async def _on_input_transcription(text: str):
         _vision_intent_for_turn = True
     if wants_thermal:
         _thermal_intent_for_turn = True
-    if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
+    if (
+        not _vision_submitted_for_turn
+        and not _vision_declined_for_turn
+        and (wants_vision or wants_thermal)
+    ):
         _log_gemini_timing(
             "vision_intent_detected",
             turn_id,
             thermal_intent="yes" if wants_thermal else "no",
         )
         frame = latest_rgb.snapshot()
-        if frame.data is not None:
-            frame_age_ms = max(
-                0.0, (time.monotonic() - frame.timestamp) * 1000
-            )
+        frame_age_ms = max(0.0, (time.monotonic() - frame.timestamp) * 1000)
+        # Only vision turns treat a stale frame as unavailable; thermal-only
+        # turns keep submitting whatever latest_rgb holds, as before.
+        frame_unavailable = frame.data is None or (
+            _vision_intent_for_turn
+            and frame_age_ms > VISION_FRAME_MAX_AGE_SEC * 1000
+        )
+        if not frame_unavailable:
             latency_tracker.mark("vision_frame_selected", turn_id)
             _vision_frame_sequence_for_turn = frame.sequence
             # Same conversion yolo_client.py/hand_client.py use for their
@@ -838,6 +848,21 @@ async def _on_input_transcription(text: str):
                 f"[VISION] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
                 f"submitted={_vision_submitted_for_turn}",
+                flush=True,
+            )
+        elif _vision_intent_for_turn:
+            # Without this, Gemini answers from nothing and invents a
+            # plausible scene the user has no way to check.
+            _vision_declined_for_turn = await gemini_live.send_text(
+                "SYSTEM: No camera frame is available for this turn. Tell the "
+                "user plainly that you cannot see right now. Do not describe "
+                "or guess at any visual scene.",
+                turn_id=turn_id,
+                source="vision_unavailable",
+            )
+            print(
+                f"[VISION] no frame available, instructed model to decline "
+                f"turn_id={turn_id}",
                 flush=True,
             )
 
@@ -1014,6 +1039,7 @@ async def _on_turn_complete():
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
     _perception_submitted_for_turn = False
+    _vision_declined_for_turn = False
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
 
