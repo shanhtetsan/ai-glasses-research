@@ -1140,6 +1140,51 @@ VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
 camera_viewers: Set[WebSocket] = set()
 thermal_viewers: Set[WebSocket] = set()
+
+# Browser fan-out is fire-and-forget: producers only enqueue, and each viewer
+# drains its own small queue from its own task. A stalled tab fills its queue
+# and loses its oldest frames; it never delays the producer or another viewer.
+VIEWER_QUEUE_MAX = 2
+VIEWER_SEND_TIMEOUT_SEC = 2.0
+_viewer_queues: Dict[WebSocket, asyncio.Queue] = {}
+
+
+def _viewer_publish(viewers: Set[WebSocket], *messages) -> None:
+    """Queue one frame (bytes and/or text parts, sent in order) for every viewer."""
+    for viewer_ws in viewers:
+        queue = _viewer_queues.get(viewer_ws)
+        if queue is None:
+            continue
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(messages)
+
+
+async def _viewer_sender(ws: WebSocket, viewers: Set[WebSocket], queue: asyncio.Queue) -> None:
+    try:
+        while True:
+            for message in await queue.get():
+                send = ws.send_text if isinstance(message, str) else ws.send_bytes
+                await asyncio.wait_for(send(message), timeout=VIEWER_SEND_TIMEOUT_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        viewers.discard(ws)
+        _viewer_queues.pop(ws, None)
+
+
+def _viewer_attach(ws: WebSocket, viewers: Set[WebSocket]) -> asyncio.Task:
+    queue: asyncio.Queue = asyncio.Queue(maxsize=VIEWER_QUEUE_MAX)
+    _viewer_queues[ws] = queue
+    viewers.add(ws)
+    return asyncio.create_task(_viewer_sender(ws, viewers, queue))
+
+
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
@@ -3157,15 +3202,7 @@ async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
     if ok and thermal_viewers:
         jpeg_bytes = enc.tobytes()
         stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
-        dead = []
-        for viewer_ws in list(thermal_viewers):
-            try:
-                await viewer_ws.send_bytes(jpeg_bytes)
-                await viewer_ws.send_text(stats)
-            except Exception:
-                dead.append(viewer_ws)
-        for d in dead:
-            thermal_viewers.discard(d)
+        _viewer_publish(thermal_viewers, jpeg_bytes, stats)
     return thermal_frame_count
 
 
@@ -3258,14 +3295,7 @@ async def ws_camera_esp(ws: WebSocket):
 
             # Broadcast the annotated frame to browser viewers
             if out_jpeg and camera_viewers:
-                dead = []
-                for viewer_ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
-                    except Exception:
-                        dead.append(viewer_ws)
-                for d in dead:
-                    camera_viewers.discard(d)
+                _viewer_publish(camera_viewers, out_jpeg)
 
     processor_task = asyncio.create_task(_processor())
 
@@ -3440,15 +3470,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
             if jpeg_bytes is None:
                 continue
             thermal_frame_count += 1
-            dead = []
-            for viewer_ws in list(thermal_viewers):
-                try:
-                    await asyncio.wait_for(viewer_ws.send_bytes(jpeg_bytes), timeout=0.25)
-                    await asyncio.wait_for(viewer_ws.send_text(stats), timeout=0.25)
-                except Exception:
-                    dead.append(viewer_ws)
-            for viewer_ws in dead:
-                thermal_viewers.discard(viewer_ws)
+            _viewer_publish(thermal_viewers, jpeg_bytes, stats)
             latency_ms = (time.monotonic() - received_at) * 1000
             if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
                 print(
@@ -3500,14 +3522,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                     pass
 
             if out_jpeg and camera_viewers:
-                dead = []
-                for viewer_ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
-                    except Exception:
-                        dead.append(viewer_ws)
-                for d in dead:
-                    camera_viewers.discard(d)
+                _viewer_publish(camera_viewers, out_jpeg)
 
     processor_task = asyncio.create_task(_processor())
 
@@ -3675,7 +3690,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 @app.websocket("/ws/viewer")
 async def ws_viewer(ws: WebSocket):
     await ws.accept()
-    camera_viewers.add(ws)
+    sender_task = _viewer_attach(ws, camera_viewers)
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
         while True:
@@ -3684,6 +3699,8 @@ async def ws_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[VIEWER] Browser disconnected", flush=True)
     finally:
+        sender_task.cancel()
+        _viewer_queues.pop(ws, None)
         try:
             camera_viewers.remove(ws)
         except Exception:
@@ -3756,7 +3773,7 @@ async def ws_thermal_esp(ws: WebSocket):
 @app.websocket("/ws/thermal_viewer")
 async def ws_thermal_viewer(ws: WebSocket):
     await ws.accept()
-    thermal_viewers.add(ws)
+    sender_task = _viewer_attach(ws, thermal_viewers)
     print(f"[THERMAL-VIEWER] Browser connected. Total viewers: {len(thermal_viewers)}", flush=True)
     try:
         while True:
@@ -3764,6 +3781,8 @@ async def ws_thermal_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[THERMAL-VIEWER] Browser disconnected", flush=True)
     finally:
+        sender_task.cancel()
+        _viewer_queues.pop(ws, None)
         thermal_viewers.discard(ws)
         print(f"[THERMAL-VIEWER] Removed. Total viewers: {len(thermal_viewers)}", flush=True)
 
@@ -3997,19 +4016,7 @@ async def on_startup_register_bridge_sender():
                 if DEBUG: print("[YOLOMEDIA] Starting to send processed frames", flush=True)
             
             async def _broadcast():
-                if not camera_viewers:
-                    return
-                dead = []
-                for ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(ws.send_bytes(jpeg_bytes), timeout=0.25)
-                    except Exception as e:
-                        dead.append(ws)
-                for ws in dead:
-                    try:
-                        camera_viewers.remove(ws)
-                    except Exception:
-                        pass
+                _viewer_publish(camera_viewers, jpeg_bytes)
             
             # Use the saved main-thread event loop
             future = asyncio.run_coroutine_threadsafe(_broadcast(), main_loop)
