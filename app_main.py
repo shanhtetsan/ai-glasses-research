@@ -66,7 +66,7 @@ except ImportError as e:
     YOLO = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -2138,6 +2138,28 @@ def camera_freshness():
         ),
         "canonical_frame_sequence": rgb.sequence,
     })
+
+
+@app.get("/api/camera-frame.jpg")
+def camera_frame_jpeg():
+    """The newest canonical RGB JPEG, byte-for-byte what Gemini is sent.
+
+    For checking orientation by eye: these bytes pass through no browser
+    canvas or CSS, so what the saved file shows is what the model sees.
+    """
+    rgb = latest_rgb.snapshot()
+    if rgb.data is None:
+        return JSONResponse({"error": "no camera frame received yet"}, status_code=404)
+    age_ms = round(max(0.0, time.monotonic() - rgb.timestamp) * 1000.0, 1)
+    return Response(
+        content=rgb.data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Sequence": str(rgb.sequence),
+            "X-Frame-Age-Ms": str(age_ms),
+        },
+    )
 
 
 @app.get("/api/audio-freshness")
