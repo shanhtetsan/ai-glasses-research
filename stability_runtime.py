@@ -238,8 +238,6 @@ class LatencyTracker:
         "speech_end_detected",
         "first_input_transcription",
         "vision_frame_selected",
-        "perception_state_built",
-        "perception_state_sent",
         "first_gemini_audio_received",
         "first_tts_chunk_queued",
         "tts_start_sent",

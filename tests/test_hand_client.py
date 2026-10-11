@@ -155,15 +155,10 @@ class HandClientContractTests(unittest.TestCase):
         self.assertTrue(hand.latest_hands()["available"])
         self.assertFalse(yolo.latest_detections()["available"])
 
-    def test_app_wiring_is_read_only_and_firmware_socket_count_is_unchanged(self):
+    def test_app_no_longer_wires_hand_client_and_firmware_socket_count_is_unchanged(self):
         app_source = Path("app_main.py").read_text(encoding="utf-8")
-        endpoint = app_source.split('@app.get("/api/perception/hands/latest")', 1)[1]
-        endpoint = endpoint.split("class RecordingCommand", 1)[0]
-        self.assertIn("hand_client.latest_hands()", endpoint)
-        self.assertNotIn("_request_hands", endpoint)
-        camera_handler = app_source.split("async def _handle_camera_frame", 1)[1]
-        camera_handler = camera_handler.split("def _retain_latest_thermal", 1)[0]
-        self.assertNotIn("hand_client", camera_handler)
+        self.assertNotIn("hand_client", app_source)
+        self.assertNotIn("/api/perception/hands/latest", app_source)
         gemini_source = Path("gemini_live_client.py").read_text(encoding="utf-8")
         self.assertNotIn("hand_client", gemini_source)
         self.assertNotIn("/v1/hands", gemini_source)

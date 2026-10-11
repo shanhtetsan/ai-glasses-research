@@ -1,3 +1,4 @@
+import ast
 import unittest
 from pathlib import Path
 
@@ -81,11 +82,48 @@ class HandPerceptionIntentTests(unittest.TestCase):
             "# ---- Thermal facts", 1
         )[0]
         self.assertIn("is_hand_perception_request", function)
+        self.assertIn("is_target_directed_request", function)
+        # No detector-vocabulary gate: "where is the door?" must send a frame
+        # even though "door" is not a COCO class.
+        self.assertNotIn("extract_requested_target", function)
+        self.assertNotIn("should_wait_for_explicit_target", function)
         callback = source.split("async def _on_input_transcription", 1)[1].split(
             "async def _on_output_transcription", 1
         )[0]
         self.assertIn("wants_vision = is_explicit_vision_request(combined)", callback)
-        self.assertIn("not _perception_submitted_for_turn", callback)
+        # Detector facts are gone; thermal facts still go out on their own send.
+        self.assertNotIn("PERCEPTION_STATE", source)
+        self.assertNotIn("perception_state_", source)
+        self.assertIn('"THERMAL_MEASUREMENTS "', callback)
+        for reason in ("no_frame", "frame_too_old", "already_sent_this_turn"):
+            self.assertIn(f'"{reason}"', callback)
+        self.assertIn('"not_a_vision_request"', source)
+
+    def test_per_turn_flags_are_declared_global_wherever_they_are_reset(self):
+        # A bare assignment without `global` only makes a local, so the flag
+        # never resets — one declined turn then disables vision for good.
+        tree = ast.parse(Path("app_main.py").read_text(encoding="utf-8"))
+        checked = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in ("_on_turn_complete", "_clear_gemini_turn_state"):
+                continue
+            declared = {
+                name
+                for stmt in ast.walk(node) if isinstance(stmt, ast.Global)
+                for name in stmt.names
+            }
+            assigned = {
+                target.id
+                for stmt in ast.walk(node) if isinstance(stmt, ast.Assign)
+                for target in stmt.targets
+                if isinstance(target, ast.Name) and target.id.endswith("_for_turn")
+            }
+            self.assertIn("_vision_declined_for_turn", assigned)
+            self.assertEqual(assigned - declared, set(), node.name)
+            checked += 1
+        self.assertEqual(checked, 2)
 
     def test_streamed_target_command_waits_for_supported_noun(self):
         self.assertTrue(should_wait_for_explicit_target("grab"))
@@ -114,9 +152,6 @@ class RequestedTargetExtractionTests(unittest.TestCase):
     def test_target_extraction_is_current_turn_only(self):
         self.assertEqual(extract_requested_target("Grab the cup"), "cup")
         self.assertIsNone(extract_requested_target("Tell me a joke"))
-        source = Path("app_main.py").read_text(encoding="utf-8")
-        self.assertIn("def build_perception_state(utterance: str =", source)
-        self.assertIn("perception, perception_raw = build_perception_state(combined)", source)
 
 
 class AuthoritativeHandednessTests(unittest.TestCase):
@@ -155,18 +190,6 @@ class AuthoritativeHandednessTests(unittest.TestCase):
         self.assertEqual(fact["anatomical_handedness"], "Right")
         self.assertEqual(fact["image_position"], "image_right")
         self.assertFalse(fact["handedness_authoritative"])
-
-    def test_structured_prompt_states_authority_and_gesture_limit(self):
-        source = Path("app_main.py").read_text(encoding="utf-8")
-        callback = source.split("PERCEPTION_STATE", 1)[1].split(
-            "# Thermal goes as structured text", 1
-        )[0]
-        self.assertIn("ANATOMICAL handedness", callback)
-        self.assertIn("MUST NOT override", callback)
-        self.assertIn("Right hand can appear at image_left", callback)
-        self.assertIn('"hand can appear at image_right', callback)
-        self.assertIn("gesture_authoritative", callback)
-        self.assertIn("MUST NOT override it from the", callback)
 
 
 class GestureClassificationTests(unittest.TestCase):

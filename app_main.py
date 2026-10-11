@@ -83,17 +83,8 @@ from perception_orientation import (
     summarize_thermal_grid,
 )
 from perception_fusion import (
-    HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
-    HandTargetGuidanceTracker,
-    build_hand_fusion_fact,
-    compact_guidance_for_log,
-    compact_hand_facts_for_log,
-    extract_requested_target,
-    guidance_anchor_for_utterance,
-    guidance_anchor_reason,
     is_hand_perception_request,
     is_target_directed_request,
-    should_wait_for_explicit_target,
 )
 try:
     import audioop
@@ -294,10 +285,9 @@ _tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
 _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
-_perception_submitted_for_turn: bool = False
 _vision_declined_for_turn: bool = False  # told Gemini it cannot see; suppresses a later image this turn
 _vision_frame_sequence_for_turn: Optional[int] = None
-_vision_frame_backend_ns_for_turn: Optional[int] = None  # same frame's capture time, same clock as detectors' backend_received_monotonic_ns
+_frame_not_sent_logged: set = set()  # reasons already logged this turn; mutated in place, never rebound
 _vision_intent_for_turn: bool = False   # latched True if is_explicit_vision_request() ever fired this turn
 _thermal_intent_for_turn: bool = False  # latched True if is_thermal_request() ever fired this turn
 _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
@@ -319,49 +309,43 @@ def _log_gemini_timing(event: str, turn_id: Optional[int], **fields) -> None:
     print("[GEMINI-TIMING] " + " ".join(parts), flush=True)
 
 
-def _age_ms_since(started_ns: Optional[int]) -> Optional[float]:
-    if started_ns is None:
-        return None
-    return round(max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000), 3)
+def _log_frame_not_sent(turn_id: Optional[int], reason: str, **fields) -> None:
+    """Name why no camera frame went to Gemini. Once per reason per turn."""
+    if reason in _frame_not_sent_logged:
+        return
+    _frame_not_sent_logged.add(reason)
+    parts = [
+        f"reason={reason}",
+        f"turn_id={turn_id if turn_id is not None else 'unknown'}",
+    ]
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print("[VISION] frame_not_sent " + " ".join(parts), flush=True)
 
 
-def _detector_perception_telemetry(raw: dict) -> dict:
-    """Shape one detector's raw latest_* response into the persisted turn record."""
-    return {
-        "source_frame_id": raw.get("source_frame_id"),
-        "backend_frame_received_ns": raw.get("backend_received_monotonic_ns"),
-        "inference_completed_ns": raw.get("inference_completed_monotonic_ns"),
-        "request_ms": raw.get("request_ms"),
-        "inference_ms": raw.get("inference_ms"),
-        "completion_age_ms": raw.get("age_ms"),
-        "backend_frame_age_ms": _age_ms_since(raw.get("backend_received_monotonic_ns")),
-        "service_healthy": raw.get("service_healthy"),
-    }
-
-
-def _frame_alignment(
-    gemini_frame_id: Optional[int],
-    gemini_backend_ns: Optional[int],
-    yolo_raw: dict,
-) -> Tuple[Optional[int], Optional[float]]:
-    """How far the RGB frame sent to Gemini has drifted from the frame YOLO's
-    detections are based on: frame-sequence count and wall-clock time, both
-    gemini minus yolo. Null whenever either side's frame id is missing."""
-    yolo_frame_id = yolo_raw.get("source_frame_id")
-    if gemini_frame_id is None or yolo_frame_id is None:
-        return None, None
-    frame_id_delta = gemini_frame_id - yolo_frame_id
-    yolo_backend_ns = yolo_raw.get("backend_received_monotonic_ns")
-    time_delta_ms = None
-    if gemini_backend_ns is not None and yolo_backend_ns is not None:
-        time_delta_ms = round((gemini_backend_ns - yolo_backend_ns) / 1_000_000.0, 3)
-    return frame_id_delta, time_delta_ms
+def _log_turn_without_frame_request(turn_id: Optional[int], **fields) -> None:
+    """At turn end: speech arrived but nothing in it asked for a frame."""
+    if "turn_end_checked" in _frame_not_sent_logged:
+        return
+    _frame_not_sent_logged.add("turn_end_checked")
+    if (
+        not _input_text_buf
+        or _vision_submitted_for_turn
+        or _vision_intent_for_turn
+        or _thermal_intent_for_turn
+    ):
+        return
+    _log_frame_not_sent(
+        turn_id,
+        "not_a_vision_request",
+        text=repr("".join(_input_text_buf).strip()[:160]),
+        **fields,
+    )
 
 
 def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
-    global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_frame_sequence_for_turn, _vision_declined_for_turn
     global _vision_intent_for_turn, _thermal_intent_for_turn
     had_state = bool(
         _input_text_buf
@@ -369,14 +353,14 @@ def _clear_gemini_turn_state(reason: str) -> None:
         or _vision_submitted_for_turn
         or _thermal_submitted_for_turn
     )
+    _log_turn_without_frame_request(None, cleared_by=reason)
+    _frame_not_sent_logged.clear()
     _input_text_buf.clear()
     _output_text_buf.clear()
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
-    _perception_submitted_for_turn = False
     _vision_declined_for_turn = False
     _vision_frame_sequence_for_turn = None
-    _vision_frame_backend_ns_for_turn = None
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
     if had_state:
@@ -623,171 +607,10 @@ async def _on_audio(pcm24k: bytes):
                 )
 
 
-def build_perception_state(utterance: str = "") -> tuple[Optional[dict], dict]:
-    """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates.
-
-    Returns (perception, raw_metrics) where raw_metrics carries the exact
-    yolo/hand_state dicts read here, so telemetry callers observe the same
-    cache snapshot used for fusion rather than risking a second, later read
-    of a cache that may have advanced (YOLO paces at its own interval).
-    """
-    requested_target = extract_requested_target(utterance)
-    guidance_anchor = guidance_anchor_for_utterance(utterance)
-    anchor_reason = guidance_anchor_reason(utterance)
-    yolo = yolo_client.latest_perception(
-        display_rotation_deg=0,
-        requested_target=requested_target,
-    )
-    hand_state = hand_client.latest_hands()
-    yolo_seg = yolo_seg_client.latest_perception(display_rotation_deg=0)
-    yoloe = yoloe_client.latest_perception(display_rotation_deg=0)
-    raw_metrics = {"yolo": yolo, "hands": hand_state, "yolo_seg": yolo_seg, "yoloe": yoloe}
-
-    # Gate on backend_frame_age_ms (time since the RGB frame was received),
-    # not completion_age_ms (time since inference finished on it) — the
-    # latter under-counts staleness by exactly that frame's request_ms, which
-    # can matter once a request queues up or a service slows down.
-    # completion_age_ms is still recorded via _detector_perception_telemetry.
-    yolo_backend_age_ms = _age_ms_since(yolo.get("backend_received_monotonic_ns"))
-    yolo_fresh = bool(
-        yolo.get("enabled")
-        and yolo.get("service_healthy") is not False
-        and yolo_backend_age_ms is not None
-        and yolo_backend_age_ms <= yolo_client.settings.stale_after_sec * 1000.0
-    )
-
-    hands_backend_age_ms = _age_ms_since(hand_state.get("backend_received_monotonic_ns"))
-    hands_fresh = bool(
-        hand_state.get("enabled")
-        and hand_state.get("service_healthy") is not False
-        and hands_backend_age_ms is not None
-        and hands_backend_age_ms <= hand_client.settings.stale_after_sec * 1000.0
-    )
-
-    # yolo_seg (road_crossing/blind_path) and yoloe (open-vocab obstacle
-    # whitelist) are independently gated the same way — either being off or
-    # stale never blocks the others, and neither participates in hand-target
-    # guidance fusion (out of scope: navigation_master/state machine).
-    segmentation_backend_age_ms = _age_ms_since(yolo_seg.get("backend_received_monotonic_ns"))
-    segmentation_fresh = bool(
-        yolo_seg.get("enabled")
-        and yolo_seg.get("service_healthy") is not False
-        and segmentation_backend_age_ms is not None
-        and segmentation_backend_age_ms <= yolo_seg_client.settings.stale_after_sec * 1000.0
-    )
-
-    obstacles_backend_age_ms = _age_ms_since(yoloe.get("backend_received_monotonic_ns"))
-    obstacles_fresh = bool(
-        yoloe.get("enabled")
-        and yoloe.get("service_healthy") is not False
-        and obstacles_backend_age_ms is not None
-        and obstacles_backend_age_ms <= yoloe_client.settings.stale_after_sec * 1000.0
-    )
-
-    if not (yolo_fresh or hands_fresh or segmentation_fresh or obstacles_fresh):
-        return None, raw_metrics
-
-    objects = []
-    if yolo_fresh:
-        for obj in (yolo.get("objects") or [])[:8]:
-            if isinstance(obj, dict):
-                tagged = dict(obj)
-                tagged["source"] = "yolo_detect"
-                objects.append(tagged)
-    if segmentation_fresh:
-        for obj in (yolo_seg.get("objects") or [])[:8]:
-            if isinstance(obj, dict):
-                tagged = dict(obj)
-                tagged["source"] = "yolo_seg"
-                objects.append(tagged)
-    if obstacles_fresh:
-        for obj in (yoloe.get("objects") or [])[:8]:
-            if isinstance(obj, dict):
-                tagged = dict(obj)
-                tagged["source"] = "yoloe_obstacle"
-                objects.append(tagged)
-
-    hands = []
-    if hands_fresh:
-        for hand in (hand_state.get("hands") or [])[:2]:
-            compact = build_hand_fusion_fact(hand)
-            if compact is not None:
-                hands.append(compact)
-
-    target_selection = (
-        dict(yolo.get("guidance_target") or {})
-        if yolo_fresh
-        else {
-            "target_state": "uncertain",
-            "stable": False,
-            "requested_target": requested_target,
-        }
-    )
-    selected_hand = None
-    if hands:
-        def _hand_priority(item: dict) -> tuple:
-            try:
-                handedness_score = float(item.get("handedness_score", 0.0))
-            except (TypeError, ValueError):
-                handedness_score = 0.0
-            return (
-                bool(item.get("gesture_authoritative") and item.get("gesture") == "pointing"),
-                bool(item.get("gesture_authoritative")),
-                bool(item.get("handedness_authoritative")),
-                handedness_score,
-                -int(item.get("hand_index", 0)),
-            )
-        selected_hand = max(hands, key=_hand_priority)
-
-    guidance = None
-    if selected_hand is not None and yolo_fresh:
-        guidance = hand_target_guidance.build(
-            target_selection,
-            selected_hand,
-            guidance_anchor=guidance_anchor,
-            anchor_reason=anchor_reason,
-            requested_target=requested_target,
-            objects_age_ms=yolo.get("age_ms"),
-            hands_age_ms=hand_state.get("age_ms"),
-            object_frame_id=yolo.get("frame_id"),
-            hand_frame_id=hand_state.get("frame_id"),
-        )
-
-    return {
-        "coordinate_space": "canonical_rgb_normalized_2d",
-        "requested_target": requested_target,
-        "guidance_anchor": guidance_anchor,
-        "guidance_anchor_reason": anchor_reason,
-        "objects_fresh": yolo_fresh,
-        "objects_age_ms": yolo.get("age_ms") if yolo_fresh else None,
-        "object_frame_id": yolo.get("frame_id") if yolo_fresh else None,
-        "segmentation_fresh": segmentation_fresh,
-        "segmentation_age_ms": yolo_seg.get("age_ms") if segmentation_fresh else None,
-        "segment_frame_id": yolo_seg.get("frame_id") if segmentation_fresh else None,
-        "obstacles_fresh": obstacles_fresh,
-        "obstacles_age_ms": yoloe.get("age_ms") if obstacles_fresh else None,
-        "obstacle_frame_id": yoloe.get("frame_id") if obstacles_fresh else None,
-        "objects": objects,
-        "hands_fresh": hands_fresh,
-        "hands_age_ms": hand_state.get("age_ms") if hands_fresh else None,
-        "hand_frame_id": hand_state.get("frame_id") if hands_fresh else None,
-        "handedness_semantics": {
-            "tracker_label": "anatomical_handedness",
-            "image_position": "independent canonical RGB left/center/right fact",
-            "authoritative_score_threshold": HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
-            "gesture_source": "landmark_geometry",
-            "gesture_authoritative_only_when_flagged": True,
-        },
-        "hands": hands,
-        "target_selection": target_selection,
-        "guidance": guidance,
-    }, raw_metrics
-
-
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
-    global _vision_frame_sequence_for_turn, _vision_frame_backend_ns_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_frame_sequence_for_turn
     global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
     if not text:
         return
@@ -807,6 +630,11 @@ async def _on_input_transcription(text: str):
         _vision_intent_for_turn = True
     if wants_thermal:
         _thermal_intent_for_turn = True
+    if wants_vision or wants_thermal:
+        if _vision_submitted_for_turn:
+            _log_frame_not_sent(turn_id, "already_sent_this_turn")
+        elif _vision_declined_for_turn:
+            _log_frame_not_sent(turn_id, "already_declined_this_turn")
     if (
         not _vision_submitted_for_turn
         and not _vision_declined_for_turn
@@ -825,12 +653,18 @@ async def _on_input_transcription(text: str):
             _vision_intent_for_turn
             and frame_age_ms > VISION_FRAME_MAX_AGE_SEC * 1000
         )
+        if frame.data is None:
+            _log_frame_not_sent(turn_id, "no_frame")
+        elif frame_unavailable:
+            _log_frame_not_sent(
+                turn_id,
+                "frame_too_old",
+                age_ms=round(frame_age_ms, 3),
+                max_age_ms=round(VISION_FRAME_MAX_AGE_SEC * 1000),
+            )
         if not frame_unavailable:
             latency_tracker.mark("vision_frame_selected", turn_id)
             _vision_frame_sequence_for_turn = frame.sequence
-            # Same conversion yolo_client.py/hand_client.py use for their
-            # backend_received_monotonic_ns, so the two are directly comparable.
-            _vision_frame_backend_ns_for_turn = int(frame.timestamp * 1_000_000_000)
             _log_gemini_timing(
                 "vision_snapshot",
                 turn_id,
@@ -865,89 +699,6 @@ async def _on_input_transcription(text: str):
                 f"turn_id={turn_id}",
                 flush=True,
             )
-
-    # Send fresh specialized perception with the same RGB vision turn.
-    if _vision_submitted_for_turn and not _perception_submitted_for_turn:
-        perception, perception_raw = build_perception_state(combined)
-        latency_tracker.mark("perception_state_built", turn_id)
-        perception_bytes = None
-
-        if perception is None:
-            print(
-                f"[PERCEPTION] turn_id={turn_id} no fresh detector state; not submitted",
-                flush=True,
-            )
-        else:
-            perception_payload = (
-                "PERCEPTION_STATE "
-                + json.dumps(perception, separators=(",", ":"))
-                + " Use these fresh detector results as supplemental visual evidence. "
-                  "MediaPipe handedness is ANATOMICAL handedness. When "
-                  "handedness_authoritative is true, you MUST use that anatomical "
-                  "Left/Right label and MUST NOT override it by visually guessing from "
-                  "image position. A Right hand can appear at image_left and a Left "
-                  "hand can appear at image_right; image position and anatomical "
-                  "handedness are different facts. Gesture labels such as fist or open "
-                  "palm are backend landmark-geometry facts; when gesture_authoritative "
-                  "is true, you MUST use that gesture and MUST NOT override it from the "
-                  "image. When target_state is uncertain, do not guess or give directional "
-                  "guidance. When target_state is not_found, say the requested target was "
-                  "not found and NEVER substitute another detected object. The requested_target "
-                  "and guidance_anchor fields are deterministic current-turn backend facts. "
-                  "Use the selected anchor and do not substitute a different hand landmark. "
-                  "When held_through_miss is true, the bbox is the last validated fresh cached "
-                  "position held for one temporary miss, not a new visual observation. "
-                  "When target_state is stable, guidance.horizontal_relation and "
-                  "guidance.vertical_relation are deterministic backend-computed facts in "
-                  "canonical RGB coordinates: do not reverse or reinterpret them from the "
-                  "image. Convert stable relations into concise instructions such as "
-                  "'Move your right hand left.' Object detections may be incomplete. "
-                  "Normalized offsets are 2D image coordinates only; NEVER describe dx_norm "
-                  "or dy_norm as meters, inches, physical depth, forward/backward movement, "
-                  "or physical distance such as '8 inches forward'. Depth and contact are "
-                  "unavailable."
-            )
-
-            perception_bytes = len(perception_payload.encode("utf-8"))
-            _perception_submitted_for_turn = await gemini_live.send_text(
-                perception_payload,
-                turn_id=turn_id,
-                source="perception_facts",
-            )
-            if _perception_submitted_for_turn:
-                latency_tracker.mark("perception_state_sent", turn_id)
-
-            print(
-                f"[PERCEPTION] generation={gemini_live.session_generation} "
-                f"turn_id={turn_id} "
-                f"objects={len(perception['objects'])} "
-                f"hands={len(perception['hands'])} "
-                f"hand_facts={compact_hand_facts_for_log(perception['hands'])} "
-                f"submitted={_perception_submitted_for_turn}",
-                flush=True,
-            )
-            if _perception_submitted_for_turn and perception.get("guidance") is not None:
-                print(
-                    "[GUIDANCE] " + compact_guidance_for_log(perception["guidance"]),
-                    flush=True,
-                )
-
-        frame_id_delta, frame_time_delta_ms = _frame_alignment(
-            _vision_frame_sequence_for_turn,
-            _vision_frame_backend_ns_for_turn,
-            perception_raw["yolo"],
-        )
-        latency_tracker.update_perception(turn_id, {
-            "yolo": _detector_perception_telemetry(perception_raw["yolo"]),
-            "hands": _detector_perception_telemetry(perception_raw["hands"]),
-            "yolo_seg": _detector_perception_telemetry(perception_raw["yolo_seg"]),
-            "yoloe": _detector_perception_telemetry(perception_raw["yoloe"]),
-            "sent": bool(perception is not None and _perception_submitted_for_turn),
-            "bytes": perception_bytes,
-            "gemini_rgb_frame_id": _vision_frame_sequence_for_turn,
-            "frame_id_delta": frame_id_delta,
-            "frame_time_delta_ms": frame_time_delta_ms,
-        })
 
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
@@ -1010,10 +761,11 @@ async def _on_turn_complete():
     Gemini at all while in a restrictive navigation state.
     """
     global omni_conversation_active, omni_previous_nav_state
-    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
-    global _vision_intent_for_turn, _thermal_intent_for_turn
+    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
 
     turn_id = _ensure_turn()
+    _log_turn_without_frame_request(turn_id)
     active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
     integrity_degraded = bool(active_turn.get("audio_integrity_degraded"))
     if integrity_degraded:
@@ -1038,7 +790,6 @@ async def _on_turn_complete():
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
-    _perception_submitted_for_turn = False
     _vision_declined_for_turn = False
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
@@ -1055,6 +806,7 @@ async def _on_turn_complete():
     # never showed up because it was never sent as a final).
     user_text = "".join(_input_text_buf).strip()
     _input_text_buf.clear()
+    _frame_not_sent_logged.clear()
     if user_text:
         try:
             await ui_broadcast_final("(user) " + user_text)
@@ -1268,10 +1020,6 @@ from stability_runtime import (
     PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
-from yolo_client import YoloClientSettings, YoloShadowClient
-from hand_client import HandClientSettings, HandTrackingClient
-from yolo_seg_client import YoloSegClientSettings, YoloSegShadowClient
-from yoloe_client import YoloeClientSettings, YoloeShadowClient
 from research_exporter import (
     DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
     ResearchExporter, ResearchExporterSettings, SessionGate,
@@ -1310,32 +1058,6 @@ research_exporter = ResearchExporter(
     research_session_gate,
 )
 
-yolo_settings = YoloClientSettings.from_env()
-yolo_client = YoloShadowClient(
-    yolo_settings,
-    latest_rgb,
-    rotation_provider=lambda: 0,
-    on_event=research_exporter.publish_event,
-)
-hand_target_guidance = HandTargetGuidanceTracker(
-    deadband=yolo_settings.guidance_deadband,
-)
-hand_settings = HandClientSettings.from_env()
-hand_client = HandTrackingClient(hand_settings, latest_rgb)
-yolo_seg_settings = YoloSegClientSettings.from_env()
-yolo_seg_client = YoloSegShadowClient(
-    yolo_seg_settings,
-    latest_rgb,
-    rotation_provider=lambda: 0,
-    on_event=research_exporter.publish_event,
-)
-yoloe_settings = YoloeClientSettings.from_env()
-yoloe_client = YoloeShadowClient(
-    yoloe_settings,
-    latest_rgb,
-    rotation_provider=lambda: 0,
-    on_event=research_exporter.publish_event,
-)
 latency_tracker = LatencyTracker(history_size=200)
 latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
 audio_freshness_tracker = AudioFreshnessTracker(
@@ -1568,15 +1290,10 @@ _VISION_PHRASES = (
 
 def is_explicit_vision_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
-    if should_wait_for_explicit_target(normalized):
-        return False
     return (
         any(phrase in normalized for phrase in _VISION_PHRASES)
         or is_hand_perception_request(normalized)
-        or (
-            is_target_directed_request(normalized)
-            and extract_requested_target(normalized) is not None
-        )
+        or is_target_directed_request(normalized)
     )
 
 # ---- Thermal facts for Gemini ----
@@ -2355,10 +2072,6 @@ def health():
             "audio": recording_audio_pipeline.health(),
         },
         "vision": dict(vision_controller.metrics),
-        "yolo": yolo_client.health(),
-        "hands": hand_client.health(),
-        "yolo_seg": yolo_seg_client.health(),
-        "yoloe": yoloe_client.health(),
         "thermal_calibration": thermal_calibration_diagnostics(),
         "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
@@ -2399,27 +2112,6 @@ def latency_csv():
     if not csv_path or not os.path.isfile(csv_path):
         return JSONResponse({"error": "latency csv not available"}, status_code=404)
     return FileResponse(csv_path, media_type="text/csv", filename="latency.csv")
-
-
-@app.get("/api/yolo/detections")
-def yolo_detections():
-    """Read-only Phase 2.1 shadow cache; never feeds Gemini or navigation."""
-    return JSONResponse({
-        "enabled": yolo_settings.enabled,
-        **yolo_client.latest_detections(),
-    })
-
-
-@app.get("/api/perception/latest")
-def latest_perception():
-    """Read-only browser view of the latest YOLO shadow result."""
-    return JSONResponse(yolo_client.latest_perception(display_rotation_deg=0))
-
-
-@app.get("/api/perception/hands/latest")
-def latest_hands():
-    """Read-only hand cache in the canonical RGB source coordinate space."""
-    return JSONResponse(hand_client.latest_hands())
 
 
 class RecordingCommand(BaseModel):
@@ -4282,26 +3974,6 @@ class UDPProto(asyncio.DatagramProtocol):
 
 # === New: register a send callback for bridge_io (broadcast JPEG to /ws/viewer) ===
 @app.on_event("startup")
-async def startup_yolo_shadow():
-    await yolo_client.start()
-
-
-@app.on_event("startup")
-async def startup_hand_tracking():
-    await hand_client.start()
-
-
-@app.on_event("startup")
-async def startup_yolo_seg():
-    await yolo_seg_client.start()
-
-
-@app.on_event("startup")
-async def startup_yoloe_obstacles():
-    await yoloe_client.start()
-
-
-@app.on_event("startup")
 async def startup_research_exporter():
     await research_exporter.start()
 
@@ -4474,10 +4146,6 @@ async def on_shutdown():
     """Clean up resources when the application shuts down."""
     global _tts_sender_task, _gemini_keepalive_task
     print("[SHUTDOWN] Starting resource cleanup...")
-    await hand_client.stop()
-    await yolo_client.stop()
-    await yolo_seg_client.stop()
-    await yoloe_client.stop()
     await research_exporter.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()

@@ -313,19 +313,14 @@ class YoloClientContractTests(unittest.TestCase):
         )[0]
         gemini_client = Path("gemini_live_client.py").read_text(encoding="utf-8")
         self.assertNotIn("yolo_client", camera_handler)
+        for client in ("yolo_client", "yolo_seg_client", "yoloe_client"):
+            self.assertNotIn(client, source)
+        for endpoint in ("/api/yolo/detections", "/api/perception/latest"):
+            self.assertNotIn(endpoint, source)
         self.assertNotIn("yolo", gemini_client.lower())
         service_dockerfile = Path("yolo_service/Dockerfile").read_text(encoding="utf-8")
         self.assertIn("COPY yolov8n.pt", service_dockerfile)
         self.assertNotIn("yoloe-11l-seg-pf.pt", service_dockerfile)
-
-    def test_perception_endpoint_only_reads_latest_shadow_state(self):
-        source = Path("app_main.py").read_text(encoding="utf-8")
-        endpoint = source.split('@app.get("/api/perception/latest")', 1)[1].split(
-            "class RecordingCommand", 1
-        )[0]
-        self.assertIn("yolo_client.latest_perception", endpoint)
-        self.assertNotIn("_request_detection", endpoint)
-        self.assertNotIn("service_token", endpoint.lower())
 
 
 class YoloClientFailureTests(unittest.IsolatedAsyncioTestCase):

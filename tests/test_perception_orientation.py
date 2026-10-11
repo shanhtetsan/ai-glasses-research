@@ -50,10 +50,8 @@ class RgbOrientationTests(unittest.TestCase):
         for consumer in ("latest_rgb.update", "recording_pipeline.enqueue_latest", "last_frames.append"):
             self.assertIn(consumer, fanout)
         self.assertNotIn("rotate_jpeg", source)
-        self.assertIn("rotation_provider=lambda: 0", source)
-        self.assertIn("display_rotation_deg=0", source)
         health_endpoint = source.split('def health():', 1)[1].split(
-            '@app.get("/api/yolo/detections")', 1
+            "class RecordingCommand", 1
         )[0]
         self.assertIn('"rgb_canonicalizer": rgb_canonicalizer_telemetry.health()', health_endpoint)
 
