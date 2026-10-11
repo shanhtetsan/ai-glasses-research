@@ -82,7 +82,7 @@ from perception_orientation import (
     run_latest_rgb_canonicalizer,
     summarize_thermal_grid,
 )
-from perception_fusion import (
+from vision_intent import (
     is_hand_perception_request,
     is_target_directed_request,
 )

@@ -87,18 +87,17 @@ license is retained at `compile/ArduinoWebsockets-LICENSE.txt`.
 | `gemini_live_client.py` | Google Gemini Live API session management |
 | `stability_runtime.py` | Dependency-free wire-protocol / message-parsing primitives shared by the backend and its tests (mic-loss control frames, camera/thermal/IMU/status struct layouts) — not strictly "stability-mode flags," but does back the STABILITY_MODE-era hardening |
 | `perception_orientation.py` | Orientation / spatial reasoning helpers |
-| `perception_fusion.py` | Fuses MediaPipe hand-landmark tracking with YOLO object detections: extracts a requested object from an utterance (matched against the validated `yolov8n.pt` label vocabulary + a small alias table), classifies hand gestures, tracks which detected object a hand is sticky-directed at (IoU + persistence across frames, per-axis hysteresis), and builds the compact "guidance facts" the Gemini prompt consumes. Imported by `app_main.py`, has its own test file (`tests/test_perception_fusion.py`). **Omitted from the original draft.** |
+| `vision_intent.py` | Phrase-level checks for whether an utterance needs a camera frame (`is_hand_perception_request`, `is_target_directed_request`). Pure string matching with no detector vocabulary; used by `is_explicit_vision_request()` in `app_main.py`. Tests in `tests/test_vision_intent.py`. |
 | `vision_backend.py` | **Hard dependency — imported unconditionally** at `app_main.py:253`, unlike the torch/mediapipe/dashscope imports a few lines above it, which are wrapped in `try/except` and degrade gracefully when absent. `vision_backend.py` has no such guard: if it or its dependencies are missing, the server fails to start. It's a switch point that reads `MODEL_BACKEND` (`gemini` → `gemini_client.py`, or `qwen` → loads a local Qwen2.5-Omni-3B onto MPS) and re-exports `stream_chat`/`OmniStreamPiece`. Note this is a **separate env var from `AI_BACKEND`** (see "Running locally") — `AI_BACKEND` picks the primary conversational pipeline (`gemini_live`/`gemini_regular`/`qwen`), `MODEL_BACKEND` picks what `vision_backend.py` re-exports for the non-`gemini_live` code paths. `requirements-cloud.txt` pins Pillow specifically because `gemini_client.py` (the default backend this module imports) decodes images via `PIL.Image`. **Omitted from the original draft**, and the draft's framing that all heavy imports degrade gracefully was wrong for this one. |
-| `yolo_client.py` | YOLO object detection **client** — talks to the standalone `yolo_service/` microservice below over HTTP; not deployed to cloud *as part of the main backend* (it has no torch/ultralytics dependency itself, just an HTTP client) |
 | `research_exporter.py` | Research data capture. Session gate persisted to disk (atomic write via `os.replace`), 6-hour auto-expiry (`DEFAULT_SESSION_TTL_SEC`), `publish_event()` explicitly guaranteed never to raise into hot paths (camera/audio/Gemini/turn code) |
 
 ### Standalone YOLO + hand-tracking microservice — `yolo_service/`
 
-Deployed **independently** from the main backend, as its own Fly app (`ai-glasses-yolo-perception`, own `Dockerfile` + `fly.toml`, `internal_port = 8080`). `yolo_service/README.md` is explicit that deploying this service does **not** enable the client in the main backend — that requires setting `YOLO_SERVICE_URL` + `ENABLE_YOLO=true` in the main backend's own config.
+Deployed **independently** from the main backend, as its own Fly app (`ai-glasses-yolo-perception`, own `Dockerfile` + `fly.toml`, `internal_port = 8080`). **The main backend no longer talks to it:** the detector clients (`yolo_client.py`, `hand_client.py`, `yolo_seg_client.py`, `yoloe_client.py`), `perception_fusion.py`, the `PERCEPTION_STATE` message and the `ENABLE_YOLO` / `YOLO_SERVICE_URL` config were removed. Gemini now answers visual questions from the camera frame alone. The service code remains in this repo but nothing in the main backend calls it.
 
 It's an authenticated FastAPI app (`yolo_service/app.py`) running YOLOv8n (`ultralytics`, CPU by default) for object detection and, in the same process, MediaPipe hand-landmark tracking (`hand_landmarker.task`) behind a separate opt-in flag (`ENABLE_HAND_TRACKING`). `GET /healthz` is unauthenticated for the platform health probe; everything else requires the shared `YOLO_SERVICE_TOKEN`.
 
-**Was it running during P01/P02?** The main backend's `fly.toml` already had `ENABLE_YOLO='true'` and `YOLO_SERVICE_URL` pointed at `ai-glasses-yolo-perception.fly.dev` as of commit `a33eab8` (the build both P01 and P02 likely ran, per `PROJECT_CONTEXT.md` §7) — the commit that added `yolo_service/` (`7a84056`, 2026-08-10) predates it. So the config was in place. **[VERIFY]** whether the separate `ai-glasses-yolo-perception` Fly app was actually deployed and reachable at session time is operational/deployment history this audit can't confirm from source alone — worth a lead check if it matters for the writeup.
+**Was it running during P01/P02?** (Historical — describes the builds before the detector clients were removed.) The main backend's `fly.toml` already had `ENABLE_YOLO='true'` and `YOLO_SERVICE_URL` pointed at `ai-glasses-yolo-perception.fly.dev` as of commit `a33eab8` (the build both P01 and P02 likely ran, per `PROJECT_CONTEXT.md` §7) — the commit that added `yolo_service/` (`7a84056`, 2026-08-10) predates it. So the config was in place. **[VERIFY]** whether the separate `ai-glasses-yolo-perception` Fly app was actually deployed and reachable at session time is operational/deployment history this audit can't confirm from source alone — worth a lead check if it matters for the writeup.
 
 ### Frontend (researcher dashboard)
 | File | Role |
@@ -128,7 +127,7 @@ Standalone **Next.js** app — 11-table Prisma schema on Neon (Postgres), `/api/
 
 ## Running locally
 
-**There is no `.env.example` in this repo** — `.env` is gitignored and no template is committed. Env vars below were read directly from `os.getenv`/`os.environ` calls across `app_main.py`, `gemini_live_client.py`, `research_exporter.py`, and `yolo_client.py`.
+**There is no `.env.example` in this repo** — `.env` is gitignored and no template is committed. Env vars below were read directly from `os.getenv`/`os.environ` calls across `app_main.py`, `gemini_live_client.py`, and `research_exporter.py`.
 
 ```bash
 pip install -r requirements-cloud.txt
@@ -137,7 +136,7 @@ pip install -r requirements-cloud.txt
 #   LATENCY_LOG_CSV, RESEARCH_FRAME_SAMPLE_INTERVAL_SEC, RESEARCH_SESSION_DEFAULT_TTL_SEC,
 #   RESEARCH_SESSION_SHARED_SECRET, RESEARCH_SESSION_STATE_PATH, STABILITY_TEST_TOKEN,
 #   THERMAL_FACT_MAX_AGE_SEC, VISION_FRAME_MAX_AGE_SEC, VISION_MIN_INTERVAL_SEC,
-#   RESEARCH_INGEST_PATH, RESEARCH_PLATFORM_URL, YOLO_SERVICE_URL, YOLO_SERVICE_TOKEN,
+#   RESEARCH_INGEST_PATH, RESEARCH_PLATFORM_URL,
 #   DASHSCOPE_API_KEY, GENERAL_DET_CONF, STABILITY_MODE (defaults true)
 python3 app_main.py
 ```
@@ -172,9 +171,9 @@ Extracted from `@app.get/post/websocket` decorators in `app_main.py` — confirm
 
 **WebSocket:** `/ws/camera_thermal` · `/ws_audio` · `/ws/camera` · `/ws/viewer` · `/ws/thermal` · `/ws/thermal_viewer` · `/ws_ui` · `/ws`
 
-**HTTP:** `/api/health` · `/api/camera-freshness` · `/api/audio-freshness` · `/latency/metrics` · `/api/perception/latest` · `/api/perception/hands/latest` · `/api/recording` · `/api/vision` · `/internal/research-session` · `/api/settings` · `/api/camera` · `/api/restart` · `/api/command` · `/api/imu-validation` · `/api/thermal-display` · `/api/yolo/detections`
+**HTTP:** `/api/health` · `/api/camera-freshness` · `/api/audio-freshness` · `/latency/metrics` · `/api/recording` · `/api/vision` · `/internal/research-session` · `/api/settings` · `/api/camera` · `/api/restart` · `/api/command` · `/api/imu-validation` · `/api/thermal-display`
 
-**Corrected:** the original list omitted `/api/perception/hands/latest` and `/internal/research-session`.
+**Corrected:** the original list omitted `/internal/research-session`. `/api/perception/latest`, `/api/perception/hands/latest` and `/api/yolo/detections` were removed with the detector clients.
 
 `/api/camera` is **not** a no-op under `STABILITY_MODE` — see "Running locally" above.
 

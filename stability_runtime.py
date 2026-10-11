@@ -499,21 +499,6 @@ class LatencyTracker:
             self._latest_device_metrics = dict(metrics)
             return True
 
-    def update_perception(self, turn_id: int, perception: dict) -> bool:
-        with self._lock:
-            target = None
-            if self._active is not None and self._active["turn_id"] == turn_id:
-                target = self._active
-            else:
-                for turn in reversed(self._history):
-                    if turn["turn_id"] == turn_id:
-                        target = turn
-                        break
-            if target is None:
-                return False
-            target["perception"] = copy.deepcopy(perception)
-            return True
-
     def update_rtt(
         self,
         latest_ms: float,

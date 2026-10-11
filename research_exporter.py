@@ -1,10 +1,8 @@
 """Best-effort event export to the standalone research platform.
 
-Modeled directly on YoloShadowClient in yolo_client.py: bounded queue,
-drop-oldest, HTTPS-only service URL, bearer-token auth, short timeout,
-exponential backoff, health() snapshot. The two clients talk to different
-external Fly/Vercel services, but the "never let an external call touch the
-realtime hot path" shape is identical on purpose.
+A background client built so an external call can never touch the realtime
+hot path: bounded queue, drop-oldest, HTTPS-only service URL, bearer-token
+auth, short timeout, exponential backoff, health() snapshot.
 
 Two independent safety gates keep this module inert by default:
 
@@ -331,7 +329,7 @@ class ResearchExporter:
             print(f"[RESEARCH-EXPORTER] disabled reason={config_error}", flush=True)
             return False
         try:
-            import httpx  # existing cloud dependency via google-genai (see yolo_client.py)
+            import httpx  # existing cloud dependency via google-genai
             self._httpx = httpx
             self._http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.settings.request_timeout_sec),
