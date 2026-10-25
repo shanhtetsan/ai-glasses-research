@@ -636,10 +636,14 @@ async def _on_input_transcription(text: str):
             _log_frame_not_sent(turn_id, "already_sent_this_turn")
         elif _vision_declined_for_turn:
             _log_frame_not_sent(turn_id, "already_declined_this_turn")
+    # Resolved once per turn, in one place: the env default unless the open
+    # trial set this arm for itself (see trial_config.py). Nothing downstream
+    # reads PIN_FRAME_EVERY_TURN directly.
+    pin_frame_every_turn = session_config.get("pin_frame_every_turn")
     if (
         not _vision_submitted_for_turn
         and not _vision_declined_for_turn
-        and (wants_vision or wants_thermal or PIN_FRAME_EVERY_TURN)
+        and (wants_vision or wants_thermal or pin_frame_every_turn)
     ):
         if wants_vision or wants_thermal:
             _log_gemini_timing(
@@ -690,7 +694,7 @@ async def _on_input_transcription(text: str):
                 f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
                 f"submitted={_vision_submitted_for_turn} "
                 f"vision_intent={str(_vision_intent_for_turn).lower()} "
-                f"pinned={str(PIN_FRAME_EVERY_TURN and not (wants_vision or wants_thermal)).lower()}",
+                f"pinned={str(pin_frame_every_turn and not (wants_vision or wants_thermal)).lower()}",
                 flush=True,
             )
         elif _vision_intent_for_turn:
@@ -1033,6 +1037,7 @@ from stability_runtime import (
     PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
+from trial_config import SessionConfig, parse_bool
 from trial_recorder import TrialRecorder
 from trial_scorer import TrialScoringError, score_trial_folder
 from trial_archive import _SAFE_TRIAL_ID, TrialArchive, TrialArchiveError, TrialNotFound
@@ -1099,14 +1104,54 @@ def _trial_thermal_summary(matrix, age_sec, calibration):
     return facts
 
 
+def _gemini_live_model_id() -> str:
+    import gemini_live_client as _glc
+    return _glc.GEMINI_LIVE_MODEL
+
+
+# The experiment knobs, and the one resolver that says which value is in force.
+# A knob registered settable=True can be set for one trial in the
+# POST /internal/trial body; the rest are observed and recorded only. Every
+# default is read at the moment it is asked for, so patching the module global
+# (as tests do) and setting the env var both still work.
+def _build_session_config() -> SessionConfig:
+    """A config with no overrides — exactly what a freshly started process has.
+
+    Also what a test uses to simulate a restart: nothing an override touches
+    lives outside this object (trial_config.RECORDED_CONFIG_KEYS lists the same
+    knobs for readers that only have a meta.json).
+    """
+    config = SessionConfig()
+    config.register(
+        "pin_frame_every_turn", lambda: PIN_FRAME_EVERY_TURN,
+        parse=parse_bool, settable=True,
+    )
+    config.register("gemini_video_interval_sec", lambda: GEMINI_VIDEO_INTERVAL_SEC)
+    config.register("vision_frame_max_age_sec", lambda: VISION_FRAME_MAX_AGE_SEC)
+    config.register("stability_mode", lambda: STABILITY_MODE)
+    config.register("model", _gemini_live_model_id)
+    return config
+
+
+session_config = _build_session_config()
+
+
 def _trial_static_fields() -> dict:
+    """What meta.json and session_start record about the run, read at open time.
+
+    The config block is the config *observed* in this process at the moment the
+    session opens — never a copy of what the request asked for — so a trial can
+    never claim an arm it did not run.
+    """
     import hashlib
     import gemini_live_client as _glc
     prompt_sha = hashlib.sha256(
         _glc.SMART_GLASSES_SYSTEM_INSTRUCTION.encode("utf-8")
     ).hexdigest()
     return {
-        "model": _glc.GEMINI_LIVE_MODEL,
+        **session_config.observed(),
+        # Which of those came from this trial rather than from the environment.
+        "config_overridden": ",".join(sorted(session_config.overrides())) or None,
         "prompt_sha256": prompt_sha,
         "git_sha": os.getenv("GIT_SHA", "").strip() or "unknown",
         "prompt_version_default": os.getenv("PROMPT_VERSION", "").strip() or f"sha-{prompt_sha[:8]}",
@@ -1352,6 +1397,7 @@ trial_recorder = TrialRecorder(
     thermal_summarizer=_trial_thermal_summary,
     static_fields=_trial_static_fields,
     on_session_ended=_schedule_trial_score,
+    session_config=session_config,
 )
 trial_archive = TrialArchive(trial_recorder.root, trial_object_storage)
 gemini_live.on_session_opened = trial_recorder.session_rotate
@@ -2592,7 +2638,9 @@ async def _set_trial_safely(payload: Any, reason: str) -> Optional[dict]:
         ground_truth = payload.get("ground_truth")
         if ground_truth is not None and not isinstance(ground_truth, dict):
             raise ValueError("ground_truth must be a JSON object")
-        return await trial_recorder.set_trial(payload, ground_truth, reason=reason)
+        return await trial_recorder.set_trial(
+            payload, ground_truth, reason=reason, config=payload.get("config")
+        )
     except Exception as exc:
         print(f"[TRIAL] set_trial failed reason={reason} error={exc}", flush=True)
         trial_recorder.error("set_trial", exc)
@@ -2612,8 +2660,15 @@ async def trial_set(request: Request):
     """Set trial metadata (and optional ground_truth) before a run.
 
     Body: {"trial","pid","site","cond","task","success_criterion",
-    "prompt_version"?, "ground_truth"?}. Posting the same trial+pid again
-    resumes that session; a different one closes the current session first.
+    "prompt_version"?, "ground_truth"?, "config"?}. Posting the same trial+pid
+    again resumes that session; a different one closes the current session first.
+
+    "config" sets the experiment knobs for this trial only — currently
+    {"pin_frame_every_turn": true|false} — instead of a secret plus a redeploy
+    between A/B arms. Omit it and the environment's value stands, which is
+    exactly the behaviour before this existed. The override is held in memory
+    for the session's lifetime and dropped when it ends; whatever was really in
+    force at open is stamped into meta.json.
     """
     denied = _trial_auth_failed(request)
     if denied:
@@ -2630,7 +2685,9 @@ async def trial_set(request: Request):
     if ground_truth is not None and not isinstance(ground_truth, dict):
         return JSONResponse({"error": "ground_truth must be a JSON object"}, status_code=400)
     try:
-        status = await trial_recorder.set_trial(payload, ground_truth, reason="internal_trial")
+        status = await trial_recorder.set_trial(
+            payload, ground_truth, reason="internal_trial", config=payload.get("config")
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     return JSONResponse(status)

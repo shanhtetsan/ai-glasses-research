@@ -28,6 +28,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from trial_config import NullSessionConfig
+
 EVENT_SCHEMA_VERSION = 1
 QUEUE_MAXSIZE = 256
 UNTITLED_IDLE_CLOSE_SEC = 30 * 60
@@ -67,6 +69,7 @@ class TrialRecorder:
         thermal_summarizer: Optional[Callable[[Any, float, dict], Optional[dict]]] = None,
         static_fields: Optional[Callable[[], dict]] = None,
         on_session_ended: Optional[Callable[[str, str], None]] = None,
+        session_config: Optional[Any] = None,
     ) -> None:
         self.enabled = (os.getenv("TRIAL_RECORDER", "") == "1") if enabled is None else bool(enabled)
         self.root = root or os.getenv("TRIAL_ROOT", "/data/trials")
@@ -76,6 +79,10 @@ class TrialRecorder:
         self._thermal_summarizer = thermal_summarizer
         self._static_fields = static_fields or (lambda: {})
         self._on_session_ended = on_session_ended
+        # Per-trial experiment knobs. The override's lifetime is this recorder's
+        # session, so the recorder owns installing and dropping it; what the
+        # knobs mean is none of its business (see trial_config.py).
+        self._config = session_config if session_config is not None else NullSessionConfig()
 
         # Session state (event-loop thread only).
         self._session: Optional[dict] = None
@@ -142,21 +149,36 @@ class TrialRecorder:
 
     # ------------------------------------------------------------------ sessions
 
-    async def set_trial(self, meta: dict, ground_truth: Optional[dict] = None, reason: str = "set_trial") -> dict:
-        """Open (or resume) a titled session. Raises ValueError on bad input."""
+    async def set_trial(self, meta: dict, ground_truth: Optional[dict] = None, reason: str = "set_trial",
+                        config: Any = None) -> dict:
+        """Open (or resume) a titled session. Raises ValueError on bad input.
+
+        `config` is the optional per-trial knob block. It is validated before
+        anything is opened or closed, installed between closing the previous
+        session and opening this one — so the values stamped into meta.json are
+        the ones this session will actually run on — and dropped again by
+        end_session().
+        """
         if not self.enabled:
             raise RuntimeError("trial recorder disabled (set TRIAL_RECORDER=1)")
         trial = str(meta.get("trial", "")).strip()
         pid = str(meta.get("pid", "")).strip()
         if not _SAFE_ID.match(trial) or not _SAFE_ID.match(pid):
             raise ValueError("trial and pid are required: letters, digits, '-' (max 32)")
+        parsed_config = self._config.parse(config)
         session_id = f"{trial}_{pid}"
         current = self._session
         if current is not None and current["id"] == session_id:
+            # A resume, not a new run: meta.json is already written, so the arm
+            # cannot be swapped under it. Agreeing with what is running is fine.
+            conflict = self._config.conflict(parsed_config)
+            if conflict:
+                raise ValueError(conflict)
             self._emit("session_resume", None, reason=reason)
             return self.status()
         if current is not None:
             self.end_session(reason="new_trial")
+        self._config.apply(parsed_config)
         clean = {"trial": trial, "pid": pid}
         for key in _TRIAL_TEXT_FIELDS:
             value = meta.get(key)
@@ -210,6 +232,10 @@ class TrialRecorder:
             return None
         try:
             session = self._session
+            # Every close funnels through here — /internal/trial/end, a new trial
+            # replacing this one, and the idle expiry of an untitled session — so
+            # this is the one place the per-trial override has to be dropped.
+            self._config.clear()
             self._emit("session_end", None, reason=reason, dropped_total=self.metrics["events_dropped"],
                        frames_not_sent=self.metrics["frames_not_sent"])
             self._put({"op": "close", "dir": session["dir"]}, control=True)
@@ -271,7 +297,11 @@ class TrialRecorder:
             "ground_truth": ground_truth,
         }, control=True)
         if resumed:
-            self._emit("session_resume", None, reason=reason)
+            # Carries the same observed fields as session_start. meta.json is
+            # written once, at the first open, so after a restart this line is
+            # the only record of what the resumed process is really running —
+            # notably that a per-trial override did not survive the restart.
+            self._emit("session_resume", None, reason=reason, **start_fields)
         else:
             self._emit("session_start", None, **start_fields)
         print(f"[TRIAL] session {'resumed' if resumed else 'opened'} id={session_id} reason={reason}", flush=True)
@@ -706,6 +736,10 @@ class TrialRecorder:
             # Questions asked in the open session, for the live count on /trials.
             "turn_count": None if session is None else session["turns"],
             "meta": None if session is None else dict(session["meta"]),
+            # What the backend is running right now, and which of it was set by
+            # this trial rather than by the environment.
+            "config": self._config.observed(),
+            "config_overrides": self._config.overrides(),
             "queue_depth": None if self._queue is None else self._queue.qsize(),
             "queue_maxsize": self._queue_maxsize,
             "pending_drops": self._pending_drops,

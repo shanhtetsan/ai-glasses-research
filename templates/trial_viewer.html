@@ -36,6 +36,7 @@
               <div><dt>Trial</dt><dd id="liveId">—</dd></div>
               <div><dt>Turns</dt><dd id="liveTurns">0</dd></div>
               <div><dt>Queue</dt><dd id="liveQueue">—</dd></div>
+              <div><dt>Pinned</dt><dd id="livePin">—</dd></div>
             </dl>
             <button type="button" class="btn stop" id="btnEnd">End trial</button>
           </div>
@@ -46,6 +47,14 @@
               <label>Participant<input id="fPid" name="pid" required placeholder="PSIM"></label>
               <label>Site<input id="fSite" name="site" placeholder="VISIONS NYC"></label>
               <label>Condition<input id="fCond" name="cond" placeholder="thermal-on"></label>
+              <fieldset class="seg wide">
+                <legend>Frame pinned to every turn</legend>
+                <div class="seg-opts">
+                  <label><input type="radio" name="pin" value="" checked><span id="fPinEnv">Backend default</span></label>
+                  <label><input type="radio" name="pin" value="1"><span>Pinned</span></label>
+                  <label><input type="radio" name="pin" value="0"><span>Unpinned</span></label>
+                </div>
+              </fieldset>
               <label class="wide">Task<input id="fTask" name="task" placeholder="find the microwave"></label>
               <label class="wide">Success criterion<input id="fCrit" name="success_criterion" placeholder="names it and gives a usable direction"></label>
               <label>Prompt version<input id="fPrompt" name="prompt_version" placeholder="leave blank for default"></label>
@@ -58,7 +67,8 @@
               <label class="wide">Planted as unseeable<input id="gPlanted" name="planted_unseeable" placeholder="door — behind the start position"></label>
               <label class="wide">Visible from start<input id="gVisible" name="visible_from_start" placeholder="table, cup, wall ahead"></label>
             </div>
-            <p class="ctl-hint">Comma-separated lists. Site, condition and prompt version are remembered on this device.</p>
+            <p class="ctl-hint">Comma-separated lists. Site, condition and prompt version are remembered on this device.
+              The pinning choice applies to this trial only and is recorded with it; leave it on the backend default to change nothing.</p>
             <div class="ctl-actions">
               <button type="submit" class="btn go" id="btnStart">Start recording</button>
               <button type="button" class="btn" id="btnCancel">Cancel</button>
@@ -101,6 +111,10 @@
           <div><dt>Misattributed</dt><dd id="tMis">0</dd></div>
           <div><dt>Dropped events</dt><dd id="tDrop">0</dd></div>
         </dl>
+
+        <p class="warn" id="dWarn" role="alert" hidden></p>
+
+        <dl class="cfg" id="cfg" hidden></dl>
 
         <div class="gt" id="gt"></div>
 
