@@ -54,3 +54,6 @@ model/*.task
 *.save
 *.log
 turn_telemetry.jsonl
+
+# Local model weights (e.g. CLIP ViT-B-32, 337 MB) — never commit
+weights/
