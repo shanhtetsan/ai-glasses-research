@@ -1024,6 +1024,7 @@ async def run_backend_turn(user_text: str):
 
 # ---- Synchronous recorder ----
 import sync_recorder
+import shutil
 import signal
 import atexit
 from stability_runtime import (
@@ -1034,7 +1035,7 @@ from stability_runtime import (
 )
 from trial_recorder import TrialRecorder
 from trial_scorer import TrialScoringError, score_trial_folder
-from trial_archive import TrialArchive, TrialArchiveError, TrialNotFound
+from trial_archive import _SAFE_TRIAL_ID, TrialArchive, TrialArchiveError, TrialNotFound
 from trial_storage import (
     UPLOAD_RECEIPT,
     TrialStorageError,
@@ -1247,6 +1248,44 @@ def _validated_trial_directory(session_id: str) -> str:
     if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
         raise TrialStorageError("trial not found")
     return directory
+
+
+def _trial_evidence(directory: str) -> dict:
+    """Count what makes a trial worth keeping: scored windows and recorded turns.
+
+    A "turn" is one speech_start, which is exactly how trial_scorer slices the
+    log into question windows (one window per speech_start), so this is the
+    same number the /trials list shows in the Turns column — counted here
+    without loading frames. Scored windows come from the judge's own output.
+    Frames are reported for the operator's benefit but are not evidence on
+    their own: the pump writes them while a reconnected mic streams at an
+    empty room.
+    """
+    turns = 0
+    session_log = os.path.join(directory, "session.jsonl")
+    if os.path.isfile(session_log):
+        with open(session_log, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    if json.loads(line).get("t") == "speech_start":
+                        turns += 1
+                except ValueError:
+                    continue
+    scored_windows = 0
+    scores_path = os.path.join(directory, "scores.jsonl")
+    if os.path.isfile(scores_path):
+        with open(scores_path, encoding="utf-8") as handle:
+            scored_windows = sum(1 for line in handle if line.strip())
+    summary_path = os.path.join(directory, "summary.json")
+    if os.path.isfile(summary_path) and scored_windows == 0:
+        # A summary with no scores.jsonl still means the judge has run.
+        scored_windows = max(scored_windows, 1)
+    frames_dir = os.path.join(directory, "frames")
+    frames = len(os.listdir(frames_dir)) if os.path.isdir(frames_dir) else 0
+    return {"turns": turns, "scored_windows": scored_windows, "frames": frames,
+            "uploaded": os.path.isfile(os.path.join(directory, UPLOAD_RECEIPT))}
 
 
 def _assert_trial_ready_for_upload(directory: str) -> None:
@@ -2611,6 +2650,58 @@ async def trial_end(request: Request):
     status = trial_recorder.status()
     status["job"] = _trial_job(ended) if ended else None
     return JSONResponse({"ended": ended, **status})
+
+
+@app.delete("/internal/trial/{trial_id}")
+async def trial_delete(trial_id: str, request: Request):
+    """Delete a trial folder that holds no evidence.
+
+    Eligibility, enforced here and not negotiable from the client: zero scored
+    windows AND zero recorded turns. Anything the judge has scored, and
+    anything with a single question in it, is refused with 409 — a trial with
+    real evidence can never be deleted through this API. The currently open
+    session is refused too; end it first. Only the local folder under
+    TRIAL_ROOT is removed: an R2 copy, if one exists, is left alone.
+    """
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    if not _SAFE_TRIAL_ID.fullmatch(trial_id):
+        return JSONResponse({"error": "invalid trial id"}, status_code=400)
+    if trial_recorder.status().get("session_id") == trial_id:
+        return JSONResponse(
+            {"error": "trial is still open — end it before deleting"}, status_code=409
+        )
+    root = os.path.realpath(trial_recorder.root)
+    directory = os.path.realpath(os.path.join(root, trial_id))
+    if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+
+    evidence = await asyncio.to_thread(_trial_evidence, directory)
+    if evidence["scored_windows"] or evidence["turns"]:
+        return JSONResponse({
+            "error": (
+                f"trial has evidence: {evidence['turns']} recorded turn(s), "
+                f"{evidence['scored_windows']} scored window(s). Only a trial with "
+                "zero of both can be deleted."
+            ),
+            **evidence,
+        }, status_code=409)
+
+    try:
+        await asyncio.to_thread(shutil.rmtree, directory)
+    except OSError as exc:
+        return JSONResponse({"error": f"could not delete trial: {exc}"}, status_code=500)
+    _trial_jobs.pop(trial_id, None)
+    print(f"[TRIAL] deleted empty trial id={trial_id} frames={evidence['frames']}", flush=True)
+    return JSONResponse({
+        "deleted": trial_id,
+        "frames_removed": evidence["frames"],
+        # Deleting local evidence never reaches into the archive bucket.
+        "r2": "kept (local folder only)" if evidence["uploaded"] else "no archived copy",
+    })
 
 
 @app.post("/internal/trial/{trial_id}/score")

@@ -41,6 +41,62 @@
     return payload || {};
   }
 
+  async function deleteJSON(url) {
+    const response = await fetch(url, {method: "DELETE", credentials: "same-origin",
+                                       headers: {Accept: "application/json"}});
+    let payload = null;
+    try { payload = await response.json(); } catch (_) {}
+    if (!response.ok) throw new Error((payload && payload.error) || `Request failed (${response.status})`);
+    return payload || {};
+  }
+
+  // Only a row the server would also accept: no recorded turns, nothing scored,
+  // and not the session being recorded or waiting on the judge. The server
+  // re-checks before removing anything; this only decides what is offered.
+  const deletable = trial => trial.turn_count === 0 && !trial.scored
+    && !["recording", "queued", "scoring"].includes(trial.status || "");
+
+  function deleteButton(trial, onDone) {
+    const button = node("button", "del", "delete");
+    button.type = "button";
+    button.setAttribute("aria-label", `Delete empty trial ${trial.trial || trial.id}`);
+    button.title = "Delete this empty trial folder";
+    let armed = false;
+    let revert = 0;
+    const disarm = () => {
+      armed = false;
+      window.clearTimeout(revert);
+      button.classList.remove("armed");
+      button.textContent = "delete";
+    };
+    button.addEventListener("keydown", event => event.stopPropagation());
+    button.addEventListener("click", async event => {
+      event.stopPropagation();          // the row itself opens the trial
+      if (!armed) {
+        armed = true;
+        button.classList.add("armed");
+        button.textContent = "confirm?";
+        revert = window.setTimeout(disarm, 5000);
+        return;
+      }
+      window.clearTimeout(revert);
+      button.disabled = true;
+      button.textContent = "deleting…";
+      try {
+        await deleteJSON(`/internal/trial/${encodeURIComponent(trial.id)}`);
+        onDone();
+      } catch (error) {
+        button.disabled = false;
+        disarm();
+        const state = $("#indexState");
+        state.hidden = false;
+        state.classList.add("error");
+        state.textContent = error.message;
+      }
+    });
+    return button;
+  }
+
   function percent(rate) {
     const value = Number(rate);
     return Number.isFinite(value) ? Math.round(value * 100) : 0;
@@ -89,6 +145,9 @@
       statusCell.append(badge);
       row.append(statusCell);
       row.append(node("td", "num sub", dateLabel(trial.date)));
+      const actions = node("td", "act");
+      if (deletable(trial)) actions.append(deleteButton(trial, refreshIndex));
+      row.append(actions);
       const open = () => { window.location.href = `/trials/${encodeURIComponent(trial.id)}`; };
       row.addEventListener("click", open);
       row.addEventListener("keydown", event => {
