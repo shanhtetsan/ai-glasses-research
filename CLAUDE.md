@@ -50,7 +50,17 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   if it is younger than `VISION_FRAME_MAX_AGE_SEC` (3 s).
   - Do not add phrases to `_VISION_PHRASES`. `is_explicit_vision_request()` is only the
     logged `vision_intent` signal.
-  - Set the flag to 0 only for the ablation.
+  - Set the env var to 0 only for the ablation, and prefer not to: the arm is a
+    per-trial setting now. `POST /internal/trial {"config": {"pin_frame_every_turn": false}}`
+    (or the pinning control on the /trials start form) overrides the env default for that
+    recorder session only, so both arms run on one deploy and one machine.
+  - Nothing reads `PIN_FRAME_EVERY_TURN` directly except `trial_config.SessionConfig`.
+    Resolve it with `session_config.get("pin_frame_every_turn")`, once per turn, in
+    `_on_input_transcription`. Register new knobs in `_build_session_config()` and add
+    their names to `trial_config.RECORDED_CONFIG_KEYS` (a test asserts the two match).
+  - The override is held in memory and never persisted. A crash, a restart or a deploy
+    comes back on the env default; a resumed session's `session_resume` event carries the
+    config actually in force, which is what `resume_drift()` compares with `meta.json`.
 - Primary latency metric: `speech_end_to_first_i2s_ms`, not `backend_turn_total_ms`.
   Despite the name, with ESP32 audio off it comes from the iOS app
   (`LATENCY:DEVICE:<turn>:<ms>`). It measures the app's speech end to the first reply
@@ -75,6 +85,13 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
 
 - `TRIAL_RECORDER=1` turns recording on, under `TRIAL_ROOT` (default `/data/trials`).
   When unset, `POST /internal/trial` returns 409 and nothing is recorded.
+- `meta.json` is written once at session open and carries the runtime config observed
+  at that moment: `pin_frame_every_turn`, `gemini_video_interval_sec`,
+  `vision_frame_max_age_sec`, `stability_mode`, `model`, plus `config_overridden`
+  naming whichever of them this trial set for itself. These come from
+  `session_config.observed()`, never from the request body, so the typed `cond` label
+  and the arm that ran can be checked against each other (`condition_mismatch()`; the
+  trial page warns on a disagreement).
 - `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds

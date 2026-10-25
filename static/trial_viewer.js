@@ -123,7 +123,13 @@
       const trialCell = node("td");
       trialCell.append(node("span", "tid", trial.trial || trial.id));
       trialCell.append(node("div", "sub", `participant ${trial.participant || "—"}`));
-      row.append(trialCell, node("td", null, trial.site || "—"), node("td", null, trial.condition || "—"));
+      const condCell = node("td", null, trial.condition || "—");
+      if (trial.condition_mismatch) {
+        const flag = node("span", "mm", "mislabelled");
+        flag.title = trial.condition_mismatch;
+        condCell.append(flag);
+      }
+      row.append(trialCell, node("td", null, trial.site || "—"), condCell);
       row.append(node("td", "num", trial.prompt_version || "—"));
       row.append(node("td", "r num", trial.turn_count == null ? "—" : String(trial.turn_count)));
       const rateCell = node("td", "r");
@@ -158,6 +164,65 @@
     const state = $("#indexState");
     state.textContent = rows.length ? "" : "No scored trials are available yet.";
     state.hidden = Boolean(rows.length);
+  }
+
+  // The runtime config observed when the session opened, in meta.json order.
+  const CONFIG_ROWS = [
+    ["pin_frame_every_turn", "Frame pinned every turn"],
+    ["gemini_video_interval_sec", "Video pump"],
+    ["vision_frame_max_age_sec", "Max frame age"],
+    ["stability_mode", "Stability mode"],
+    ["model", "Model"]
+  ];
+
+  function configValue(key, value) {
+    if (value == null) return "not recorded";
+    if (typeof value === "boolean") return value ? "yes" : "no";
+    if (key.endsWith("_sec")) return `${value} s`;
+    return String(value);
+  }
+
+  // What actually ran, not what was typed. A trial recorded before the backend
+  // stamped its config carries none of these keys, and says so rather than
+  // showing defaults it cannot vouch for.
+  function addConfig(config, overridden) {
+    const host = $("#cfg");
+    host.replaceChildren();
+    const rows = CONFIG_ROWS.filter(([key]) => key in (config || {}));
+    if (!rows.length) {
+      host.hidden = true;
+      return;
+    }
+    for (const [key, label] of rows) {
+      const cell = node("div");
+      cell.append(node("dt", null, label));
+      const value = node("dd", null, configValue(key, config[key]));
+      if (config[key] == null) value.classList.add("off");
+      cell.append(value);
+      host.append(cell);
+    }
+    const set = String(overridden || "").split(",").filter(Boolean);
+    host.append(node("div", "note2", set.length
+      ? `Observed at session start · set for this trial: ${set.join(", ")}`
+      : "Observed at session start · all values from the deploy environment"));
+    host.hidden = false;
+  }
+
+  function addWarnings(mismatch, drift) {
+    const host = $("#dWarn");
+    host.replaceChildren();
+    if (!mismatch && !drift) {
+      host.hidden = true;
+      return;
+    }
+    host.append(node("b", null, mismatch
+      ? "Condition label does not match the run"
+      : "The configuration changed during this run"));
+    const lines = [];
+    if (mismatch) lines.push(`${mismatch} Fix the label or drop this trial from the comparison.`);
+    if (drift) lines.push(`${drift} The backend restarted mid-trial and came back on the deploy default.`);
+    for (const line of lines) host.append(node("p", null, line));
+    host.hidden = false;
   }
 
   function addGroundTruth(groundTruth) {
@@ -381,6 +446,8 @@
     // Misattribution comes from the event log, not the judge, so it is known before scoring.
     $("#tMis").textContent = summary.misattributed_turns ?? windows.filter(item => item.answer_arrived_under).length;
     $("#tDrop").textContent = judged(summary.dropped_events);
+    addWarnings(data.condition_mismatch, data.config_drift);
+    addConfig(data.config || {}, meta.config_overridden);
     addGroundTruth(data.ground_truth || {});
 
     const host = $("#turns"); host.replaceChildren();
@@ -450,10 +517,22 @@
     const state = $("#ctlState");
     dot.className = "ctl-dot";
 
+    // What the backend is running right now. While a trial is open this is that
+    // trial's arm; otherwise it is the deploy default the form offers to keep.
+    const config = status.config || {};
+    const pinned = config.pin_frame_every_turn;
+    const perTrial = Object.prototype.hasOwnProperty.call(
+      status.config_overrides || {}, "pin_frame_every_turn");
+    if (!open && pinned != null) {
+      $("#fPinEnv").textContent = `Backend default (${pinned ? "pinned" : "unpinned"})`;
+    }
+
     if (open) {
       dot.classList.add("live");
       state.textContent = "recording";
       $("#liveId").textContent = status.session_id;
+      $("#livePin").textContent = pinned == null
+        ? "—" : `${pinned ? "yes" : "no"} · ${perTrial ? "this trial" : "env"}`;
       $("#liveTurns").textContent = status.turn_count == null ? "—" : String(status.turn_count);
       $("#liveQueue").textContent = status.queue_depth == null
         ? "—" : `${status.queue_depth}/${status.queue_maxsize ?? "—"}`;
@@ -520,6 +599,10 @@
       prompt_version: $("#fPrompt").value.trim(),
       ground_truth: groundTruth
     };
+    // "" means leave the backend default alone — the request then carries no
+    // config at all, which is exactly the old behaviour.
+    const pin = (document.querySelector('input[name="pin"]:checked') || {}).value;
+    if (pin === "1" || pin === "0") body.config = {pin_frame_every_turn: pin === "1"};
     if (!body.trial || !body.pid) { controlError("Trial and participant are required."); return; }
     button.disabled = true;
     try {

@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from trial_config import condition_mismatch, recorded_config, resume_drift
 from trial_scorer import build_question_windows, read_session_events
 from trial_storage import TrialObjectNotFound, TrialObjectStorage, TrialStorageError
 
@@ -163,6 +164,11 @@ class TrialArchive:
                 "participant": meta.get("pid"),
                 "site": meta.get("site"),
                 "condition": meta.get("cond"),
+                # The typed label against the flag that actually ran: a
+                # mislabelled trial is flagged in the list, not only on its page.
+                "condition_mismatch": condition_mismatch(
+                    meta.get("cond"), meta.get("pin_frame_every_turn")
+                ),
                 "prompt_version": meta.get("prompt_version"),
                 "scored": scored,
                 "turn_count": turn_count,
@@ -204,8 +210,9 @@ class TrialArchive:
         except TrialNotFound:
             pass
 
+        events = self._events(trial_id)
         windows = []
-        for window in build_question_windows(self._events(trial_id)):
+        for window in build_question_windows(events):
             frames = []
             for frame in window.frames:
                 frames.append({
@@ -237,6 +244,15 @@ class TrialArchive:
         return {
             "id": trial_id,
             "meta": meta,
+            # What the backend was observed to be running when this session
+            # opened, and whether the typed cond label agrees with it.
+            "config": recorded_config(meta),
+            "condition_mismatch": condition_mismatch(
+                meta.get("cond"), meta.get("pin_frame_every_turn")
+            ),
+            # A restart part-way through drops the per-trial override: this is
+            # the trial saying so, from its own resume events.
+            "config_drift": resume_drift(meta, events),
             "ground_truth": ground_truth,
             "summary": summary,
             "scored": bool(summary),
