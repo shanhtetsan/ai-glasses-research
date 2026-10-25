@@ -7,6 +7,7 @@ the new failure handling around them.
 """
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 from starlette.requests import Request
 
 import app_main
+from trial_recorder import TrialRecorder
 from trial_scorer import (
     JudgeRetryableError,
     RateLimiter,
@@ -367,6 +369,142 @@ class ControlAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(app_main._trial_auth_failed(
             _request("/internal/trial", cookie="control-secret")))
         self.assertIsNotNone(app_main._trial_auth_failed(_request("/internal/trial")))
+
+
+class TrialDeleteTests(unittest.IsolatedAsyncioTestCase):
+    """DELETE /internal/trial/{id} removes junk folders and nothing else.
+
+    Eligible means zero scored windows AND zero recorded turns, and not the
+    session currently open. Everything else is a 409 — the route is a broom
+    for 0-turn folders left by a restart, never a way to lose evidence.
+    """
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.old_recorder = app_main.trial_recorder
+        self.old_token = os.environ.get("TRIAL_TOKEN")
+        os.environ["TRIAL_TOKEN"] = "control-secret"
+        app_main.trial_recorder = TrialRecorder(enabled=True, root=str(self.root))
+
+    async def asyncTearDown(self):
+        app_main.trial_recorder = self.old_recorder
+        if self.old_token is None:
+            os.environ.pop("TRIAL_TOKEN", None)
+        else:
+            os.environ["TRIAL_TOKEN"] = self.old_token
+        self.temp.cleanup()
+
+    def _trial(self, trial_id, events=(), scores=(), uploaded=False, frames=("4.jpg",)):
+        directory = self.root / trial_id
+        (directory / "frames").mkdir(parents=True)
+        for name in frames:
+            (directory / "frames" / name).write_bytes(b"\xff\xd8jpeg")
+        (directory / "meta.json").write_text(json.dumps({"trial": trial_id}), encoding="utf-8")
+        (directory / "session.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        if scores:
+            (directory / "scores.jsonl").write_text(
+                "".join(json.dumps(score) + "\n" for score in scores), encoding="utf-8")
+        if uploaded:
+            (directory / ".upload.json").write_text("{}", encoding="utf-8")
+        return directory
+
+    def _open(self, trial_id):
+        app_main.trial_recorder._begin_session(
+            trial_id, {"trial": None, "pid": None}, None, "test",
+            used_uids=set(), untitled=True, resumed=False)
+
+    async def _delete(self, trial_id, **kw):
+        return await app_main.trial_delete(
+            trial_id, _request(f"/internal/trial/{trial_id}", method="DELETE", **kw))
+
+    async def test_deletes_an_empty_trial_and_reports_what_went(self):
+        directory = self._trial("untitled_2026-10-25T15-21-35Z",
+                                events=[_event("session_start"), _event("mic_streaming", value=True)])
+        response = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertEqual(body["deleted"], directory.name)
+        self.assertEqual(body["frames_removed"], 1)
+        self.assertEqual(body["r2"], "no archived copy")
+        self.assertFalse(directory.exists())
+
+    async def test_the_page_cookie_authorises_it_too(self):
+        directory = self._trial("untitled_2026-10-25T15-40-21Z")
+        response = await self._delete(directory.name, cookie="control-secret")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(directory.exists())
+
+    async def test_refuses_a_trial_with_recorded_turns(self):
+        directory = self._trial("T08_PSIM", events=[
+            _event("session_start"),
+            _event("speech_start", "T08.PSIM.1", n=1),
+            _event("turn_end", "T08.PSIM.1", status="completed"),
+        ])
+        response = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(response.status_code, 409)
+        body = json.loads(response.body)
+        self.assertEqual(body["turns"], 1)
+        self.assertIn("1 recorded turn(s)", body["error"])
+        self.assertTrue(directory.is_dir())
+
+    async def test_refuses_a_scored_trial_even_with_no_speech_start(self):
+        directory = self._trial("T09_PSIM", scores=[{"window": 1, "label": "right"}])
+        response = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["scored_windows"], 1)
+        self.assertTrue(directory.is_dir())
+        # A summary.json alone also counts as the judge having run.
+        summary_only = self._trial("T10_PSIM")
+        (summary_only / "summary.json").write_text("{}", encoding="utf-8")
+        refused = await self._delete(summary_only.name, token="control-secret")
+        self.assertEqual(refused.status_code, 409)
+        self.assertTrue(summary_only.is_dir())
+
+    async def test_refuses_the_session_that_is_open_right_now(self):
+        directory = self._trial("untitled_2026-10-25T16-00-00Z")
+        self._open(directory.name)
+        response = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("end it before deleting", json.loads(response.body)["error"])
+        self.assertTrue(directory.is_dir())
+
+    async def test_no_token_and_no_cookie_is_rejected(self):
+        directory = self._trial("untitled_2026-10-25T16-10-00Z")
+        response = await self._delete(directory.name)
+        self.assertEqual(response.status_code, 401)
+        self.assertTrue(directory.is_dir())
+
+    async def test_path_traversal_is_rejected_without_touching_anything(self):
+        neighbour = self.root.parent / "neighbour"
+        neighbour.mkdir()
+        (neighbour / "keep.txt").write_text("evidence", encoding="utf-8")
+        try:
+            for attempt in ("../neighbour", "..", "../../tmp", "untitled_x/../../neighbour",
+                            "/etc", "a" * 80):
+                response = await self._delete(attempt, token="control-secret")
+                self.assertEqual(response.status_code, 400, attempt)
+                self.assertEqual(json.loads(response.body)["error"], "invalid trial id", attempt)
+            self.assertTrue((neighbour / "keep.txt").is_file())
+        finally:
+            shutil.rmtree(neighbour)
+
+    async def test_an_archived_trial_loses_only_its_local_folder(self):
+        directory = self._trial("untitled_2026-10-25T16-20-00Z", uploaded=True)
+        response = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["r2"], "kept (local folder only)")
+        self.assertFalse(directory.exists())
+
+    async def test_unknown_trial_is_404_and_a_disabled_recorder_is_409(self):
+        missing = await self._delete("untitled_2026-01-01T00-00-00Z", token="control-secret")
+        self.assertEqual(missing.status_code, 404)
+        app_main.trial_recorder.enabled = False
+        directory = self._trial("untitled_2026-10-25T16-30-00Z")
+        off = await self._delete(directory.name, token="control-secret")
+        self.assertEqual(off.status_code, 409)
+        self.assertTrue(directory.is_dir())
 
 
 class JobRecordTests(unittest.IsolatedAsyncioTestCase):

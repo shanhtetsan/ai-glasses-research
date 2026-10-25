@@ -128,14 +128,94 @@ class TrialRecorderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.load(fh)["room"], "4B")
         self.assertFalse(os.path.exists(os.path.join(self.root, "current.json")))
 
-    async def test_untitled_session(self):
+    async def test_startup_with_no_activity_creates_no_session(self):
+        """TRIAL_RECORDER=1 on an idle box must leave the trial root untouched.
+
+        This is the deploy case: the mic socket reconnects and sends START,
+        the camera pump and the idle keepalive push frames, and nobody is
+        wearing the glasses. None of it is evidence, so none of it may write
+        a folder the researcher then has to delete by hand.
+        """
         rec = _rec(self.root)
         await rec.start()
         rec.ensure_session("ws_start")
         rec.mic_streaming(True, "start", 1)
+        rec.frame_sent(None, 1, b"\xff\xd8pump", time.monotonic(), "pump")
+        rec.frame_sent(None, 2, b"\xff\xd8idle", time.monotonic(), "keepalive")
+        rec.imu_sample({"timestamp": time.monotonic(), "data": {"sequence": 1, "uptime_ms": 10,
+                                                                "accel": {"x": 0, "y": 0, "z": 9.8},
+                                                                "gyro": {"x": 0, "y": 0, "z": 0}}})
+        rec.session_rotate("goaway", 2, 600.0, True)
+        rec.error("gemini_pump", RuntimeError("boom"))
+        rec.turn_end(5, {"turn_id": 5, "status": "cancelled", "timestamps_ns": {}}, 1)
+        rec.mic_streaming(False, "socket_closed", 1)
+        await rec.stop()
+        self.assertIsNone(rec.status()["session_id"])
+        self.assertEqual(os.listdir(self.root), [])
+
+    async def test_first_real_event_opens_the_untitled_session(self):
+        rec = _rec(self.root)
+        await rec.start()
+        rec.ensure_session("ws_start")
+        self.assertEqual(os.listdir(self.root), [])
+        rec.speech_start(1, 1, None, None)      # the first question: now it matters
+        self.assertTrue(rec.status()["untitled"])
+        rec.speech_end(1, 1)
+        rec.turn_end(1, {"turn_id": 1, "status": "completed", "timestamps_ns": {},
+                         "input_transcription": "where is the cup",
+                         "response_text": "On the table."}, 1)
         await rec.stop()
         dirs = [d for d in os.listdir(self.root) if d.startswith("untitled_")]
         self.assertEqual(len(dirs), 1)
+        types = [e["t"] for e in _events(self.root, dirs[0])]
+        self.assertEqual(types[0], "session_start")
+        self.assertIn("speech_start", types)
+        self.assertIn("turn_end", types)
+
+    async def test_server_opened_turn_with_text_opens_the_untitled_session(self):
+        """No SPEECH_START, but Gemini produced words: that is still a run."""
+        rec = _rec(self.root)
+        await rec.start()
+        rec.ensure_session("ws_start")
+        rec.turn_end(7, {"turn_id": 7, "status": "completed", "timestamps_ns": {},
+                         "response_text": "There is a chair ahead."}, 1)
+        await rec.stop()
+        dirs = [d for d in os.listdir(self.root) if d.startswith("untitled_")]
+        self.assertEqual(len(dirs), 1)
+        replies = [e for e in _events(self.root, dirs[0]) if e["t"] == "turn_end"]
+        self.assertEqual(replies[0]["reply"], "There is a chair ahead.")
+
+    async def test_set_trial_still_opens_immediately(self):
+        """POST /internal/trial must not wait for an event: the researcher
+        presses Start and expects the row to be recording straight away."""
+        rec = _rec(self.root)
+        await rec.start()
+        await rec.set_trial({"trial": "T10", "pid": "P1", "site": "VISIONS"}, {"room": "2"})
+        self.assertEqual(rec.status()["session_id"], "T10_P1")
+        self.assertFalse(rec.status()["untitled"])
+        await rec.flush()
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "T10_P1")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "T10_P1", "meta.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "current.json")))
+        await rec.stop()
+
+    async def test_restart_resumes_an_open_session_with_content(self):
+        rec = _rec(self.root)
+        await rec.start()
+        rec.ensure_session("ws_start")
+        rec.speech_start(1, 1, None, None)
+        session_id = rec.status()["session_id"]
+        await rec.stop()        # simulated deploy: session left open
+
+        resumed = _rec(self.root)
+        await resumed.start()   # resumes from current.json, opens nothing new
+        self.assertEqual(resumed.status()["session_id"], session_id)
+        self.assertEqual(resumed.status()["turn_count"], 1)
+        resumed.ensure_session("ws_start")
+        await resumed.stop()
+        dirs = [d for d in os.listdir(self.root) if d.startswith("untitled_")]
+        self.assertEqual(dirs, [session_id])
+        self.assertIn("session_resume", [e["t"] for e in _events(self.root, session_id)])
 
     async def test_restart_resumes_and_never_reuses_uid_or_frame(self):
         rec = _rec(self.root)

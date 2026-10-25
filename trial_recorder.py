@@ -7,7 +7,9 @@ thread, so no socket handler or Gemini send ever waits on the disk.
 
 Layout under TRIAL_ROOT (default /data/trials):
 
-    <trial>_<pid>/            or untitled_<ISO8601>/
+    <trial>_<pid>/            or untitled_<ISO8601>/   (see UNTITLED_TRIGGERS:
+                              the untitled fallback is opened lazily, at the
+                              first event that is evidence, never on a START)
         meta.json             written once, never rewritten
         ground_truth.json     written once, if supplied
         session.jsonl         one event per line, append-only, flushed per line
@@ -33,6 +35,13 @@ IMU_STREAM_INTERVAL_SEC = 0.1          # 10 Hz while a turn is active
 THERMAL_MAX_AGE_SEC = 3.0
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,31}$")
 _TRIAL_TEXT_FIELDS = ("site", "cond", "task", "success_criterion", "prompt_version")
+
+# The only events that open the untitled fallback session. Both are evidence a
+# run really happened: a question was asked, or the model produced a turn with
+# text in it. Everything else the recorder sees — the mic starting, pump or
+# keepalive frames, IMU, session rotations, errors — also happens on an idle
+# box after a deploy, and must not create a folder.
+UNTITLED_TRIGGERS = frozenset({"speech_start", "turn_end"})
 
 
 def _iso_now() -> str:
@@ -156,26 +165,45 @@ class TrialRecorder:
         return self.status()
 
     def ensure_session(self, reason: str) -> None:
-        """Called on every START. Opens untitled if nothing is open; a repeat is a resume."""
+        """Called on every START. Resumes an open session; never opens one.
+
+        A START only means the mic socket is streaming. That happens on every
+        reconnect after a deploy with nobody in front of the glasses, so
+        opening the untitled fallback here wrote a 0-turn folder per deploy.
+        The fallback is opened lazily instead, by _open_untitled_for_event,
+        at the first event that is actually evidence (see UNTITLED_TRIGGERS).
+        A session opened explicitly through set_trial still opens immediately.
+        """
         if not self.enabled:
             return
         try:
-            session = self._session
-            if session is not None and session["untitled"]:
-                idle = time.monotonic() - session["last_event_mono"]
-                if idle > UNTITLED_IDLE_CLOSE_SEC:
-                    self.end_session(reason="idle")
-                    session = None
-            if session is not None:
+            self._expire_idle_untitled()
+            if self._session is not None:
                 self._emit("session_resume", None, reason=reason)
-                return
-            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
-            session_id = f"untitled_{stamp}"
-            meta = {"trial": None, "pid": None}
-            meta.update({key: None for key in _TRIAL_TEXT_FIELDS})
-            self._begin_session(session_id, meta, None, reason, used_uids=set(), untitled=True, resumed=False)
         except Exception as exc:
             self._note_internal_error("ensure_session", exc)
+
+    def _expire_idle_untitled(self) -> None:
+        """Close an untitled session that has been sitting idle too long."""
+        session = self._session
+        if session is not None and session["untitled"]:
+            if time.monotonic() - session["last_event_mono"] > UNTITLED_IDLE_CLOSE_SEC:
+                self.end_session(reason="idle")
+
+    def _open_untitled_for_event(self, trigger: str) -> bool:
+        """Open the untitled fallback for the first real event. True if open after."""
+        self._expire_idle_untitled()
+        if self._session is not None:
+            return True
+        if trigger not in UNTITLED_TRIGGERS:
+            return False
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+        session_id = f"untitled_{stamp}"
+        meta = {"trial": None, "pid": None}
+        meta.update({key: None for key in _TRIAL_TEXT_FIELDS})
+        self._begin_session(session_id, meta, None, f"first_event:{trigger}",
+                            used_uids=set(), untitled=True, resumed=False)
+        return self._session is not None
 
     def end_session(self, reason: str) -> Optional[str]:
         if not self.enabled or self._session is None:
@@ -274,9 +302,11 @@ class TrialRecorder:
     # ------------------------------------------------------------------ events
 
     def speech_start(self, n: int, server_turn_id: int, thermal: Optional[tuple], imu: Optional[dict]) -> None:
-        if not self.enabled or self._session is None:
+        if not self.enabled:
             return
         try:
+            if not self._open_untitled_for_event("speech_start"):
+                return
             uid = self._unique_uid(str(int(n)))
             self._turn_uids[server_turn_id] = uid
             self._turn_agg[server_turn_id] = {"frames": 0, "seq_first": None, "seq_last": None,
@@ -386,9 +416,17 @@ class TrialRecorder:
                    thermal_text=agg["thermal_text"], audio_ms=round(agg["audio_bytes"] / 32.0, 1))
 
     def turn_end(self, server_turn_id: int, record: dict, generation: Optional[int]) -> None:
-        if not self.enabled or self._session is None:
+        if not self.enabled:
             return
         try:
+            if self._session is None:
+                # A turn the server opened on its own still counts as a run, but
+                # only once it carries words. An empty or cancelled turn on an
+                # idle box is not evidence and must not create a folder.
+                has_text = bool(str(record.get("input_transcription") or "").strip()
+                                or str(record.get("response_text") or "").strip())
+                if not has_text or not self._open_untitled_for_event("turn_end"):
+                    return
             uid = self.turn_uid(server_turn_id)
             self.prompt_sent(server_turn_id, final=True)
             question = record.get("input_transcription")

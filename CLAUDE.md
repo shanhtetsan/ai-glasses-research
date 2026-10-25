@@ -67,14 +67,28 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   A 337 MB CLIP checkpoint once blocked every push (GitHub's limit is 100 MB).
 - The repo is public. `compile.ino` holds WiFi credentials, so never commit new ones.
 - Run tests with `PYTHONPATH=. venv/bin/python tests/<file>.py` (no pytest).
-  `test_app_strict_guards_continuous_vision_and_models` is a known, obsolete failure.
+  `test_app_strict_guards_continuous_vision_and_models` is a known, obsolete failure,
+  and `test_yolo_service` needs `psutil`, which `requirements-cloud.txt` excludes.
+  Importing `app_main` needs `GEMINI_API_KEY` set to anything non-empty.
 
 ## Trial archive (`trial_recorder.py`, `trial_scorer.py`, `trial_storage.py`, `trial_archive.py`)
 
 - `TRIAL_RECORDER=1` turns recording on, under `TRIAL_ROOT` (default `/data/trials`).
   When unset, `POST /internal/trial` returns 409 and nothing is recorded.
 - `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
-  when it is unset. It also gates `/internal/trial*` (`X-Trial-Token`) when set.
+  when it is unset. It also gates `/internal/trial*` when set, carried either as the
+  `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds
+  (`_trial_auth_failed`), so the control block on the page works without pasting a token.
+- The untitled fallback session (`untitled_<ISO8601>`) is opened lazily, at the first
+  event that is evidence: a `speech_start`, or a `turn_end` carrying a question or a
+  reply (`UNTITLED_TRIGGERS` in `trial_recorder.py`). A `START` on the mic socket,
+  pump or keepalive frames, IMU and session rotations do NOT open one — they all
+  happen on an idle box after a deploy, which used to write a 0-turn folder per deploy.
+  `POST /internal/trial` still opens immediately, and `current.json` resume is unchanged.
+- `DELETE /internal/trial/{id}` removes a local trial folder, and refuses with 409
+  unless it has zero scored windows AND zero recorded turns, or if it is the open
+  session. It never touches an R2 copy. The `/trials` list shows a delete control
+  only on rows that pass the same test.
 - R2 upload needs four secrets: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
   `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`. `R2_ENDPOINT_URL` is optional.
   The judge needs `GEMINI_API_KEY`.
