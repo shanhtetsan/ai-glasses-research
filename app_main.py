@@ -639,19 +639,21 @@ async def _on_input_transcription(text: str):
     if (
         not _vision_submitted_for_turn
         and not _vision_declined_for_turn
-        and (wants_vision or wants_thermal)
+        and (wants_vision or wants_thermal or PIN_FRAME_EVERY_TURN)
     ):
-        _log_gemini_timing(
-            "vision_intent_detected",
-            turn_id,
-            thermal_intent="yes" if wants_thermal else "no",
-        )
+        if wants_vision or wants_thermal:
+            _log_gemini_timing(
+                "vision_intent_detected",
+                turn_id,
+                thermal_intent="yes" if wants_thermal else "no",
+            )
         frame = latest_rgb.snapshot()
         frame_age_ms = max(0.0, (time.monotonic() - frame.timestamp) * 1000)
-        # Only vision turns treat a stale frame as unavailable; thermal-only
-        # turns keep submitting whatever latest_rgb holds, as before.
+        # Only thermal-only turns may submit a stale frame, as before. Vision
+        # turns and pinned turns require a fresh one.
+        thermal_only = _thermal_intent_for_turn and not _vision_intent_for_turn
         frame_unavailable = frame.data is None or (
-            _vision_intent_for_turn
+            not thermal_only
             and frame_age_ms > VISION_FRAME_MAX_AGE_SEC * 1000
         )
         if frame.data is None:
@@ -686,7 +688,9 @@ async def _on_input_transcription(text: str):
             print(
                 f"[VISION] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
-                f"submitted={_vision_submitted_for_turn}",
+                f"submitted={_vision_submitted_for_turn} "
+                f"vision_intent={str(_vision_intent_for_turn).lower()} "
+                f"pinned={str(PIN_FRAME_EVERY_TURN and not (wants_vision or wants_thermal)).lower()}",
                 flush=True,
             )
         elif _vision_intent_for_turn:
@@ -1327,6 +1331,11 @@ thermal_display_config: Dict[str, Any] = {
     "calibration_scale_y": 1.0,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
+# Pin the latest fresh frame (source=pre_response) on every turn, not only on
+# turns matching _VISION_PHRASES. Without it Gemini answers spatial follow-ups
+# ("what side is the bottle") from conversation history instead of the camera.
+# is_explicit_vision_request() stays as the logged vision_intent signal.
+PIN_FRAME_EVERY_TURN = env_bool("PIN_FRAME_EVERY_TURN", True)
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
 camera_viewers: Set[WebSocket] = set()
@@ -3640,7 +3649,9 @@ async def _gemini_image_pump_loop(holder: dict, event: asyncio.Event) -> None:
             continue
         if not trial_recorder.enabled:
             try:
-                await gemini_live.send_image(data)
+                await gemini_live.send_image(
+                    data, turn_id=holder.get("turn"), sequence=holder.get("seq")
+                )
             except Exception as e:
                 if DEBUG:
                     print(f"[Gemini Live] send_image failed: {e}")
@@ -3697,11 +3708,11 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
         if now - _last_gemini_video_submit >= GEMINI_VIDEO_INTERVAL_SEC:
             _last_gemini_video_submit = now
             gemini_frame_holder["data"] = data
-            if trial_recorder.enabled:
-                # Tag at hand-off: the turn and frame this was when chosen.
-                gemini_frame_holder["turn"] = latency_tracker.active_turn_id
-                gemini_frame_holder["seq"] = rgb_frame.sequence
-                gemini_frame_holder["received_at"] = rgb_frame.timestamp
+            # Tag at hand-off: the turn and frame this was when chosen. Logged
+            # on every pump send so repeats are distinguishable from fresh frames.
+            gemini_frame_holder["turn"] = latency_tracker.active_turn_id
+            gemini_frame_holder["seq"] = rgb_frame.sequence
+            gemini_frame_holder["received_at"] = rgb_frame.timestamp
             gemini_frame_event.set()
 
     global _last_research_frame_sample
@@ -4639,6 +4650,8 @@ async def _gemini_keepalive_loop() -> None:
     keepalive frame structurally cannot show up as a turn's gemini_rgb_frame_id
     or any other per-turn telemetry field.
     """
+    last_sequence: Optional[int] = None
+    consecutive_repeats = 0
     while True:
         await asyncio.sleep(5.0)
         if AI_BACKEND != "gemini_live":
@@ -4657,9 +4670,15 @@ async def _gemini_keepalive_loop() -> None:
         )
         if sent:
             trial_recorder.frame_sent(None, frame.sequence, frame.data, frame.timestamp, "keepalive")
+        # A climbing count means the camera has stopped and the same frozen
+        # frame is being resent (0 = a different frame from the previous keepalive).
+        consecutive_repeats = consecutive_repeats + 1 if frame.sequence == last_sequence else 0
+        last_sequence = frame.sequence
+        frame_age_sec = max(0.0, time.monotonic() - frame.timestamp)
         print(
             f"[GEMINI-KEEPALIVE] sent={sent} bytes={len(frame.data)} "
-            f"sequence={frame.sequence}",
+            f"sequence={frame.sequence} consecutive_repeats={consecutive_repeats} "
+            f"frame_age_sec={frame_age_sec:.1f}",
             flush=True,
         )
 
