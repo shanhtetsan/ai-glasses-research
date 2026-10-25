@@ -1,0 +1,15 @@
+{
+  "trial": "T02",
+  "pid": "PSIM",
+  "site": "laptop-sim",
+  "cond": "baseline",
+  "task": "describe the scene ahead",
+  "success_criterion": "names car or person, no distances",
+  "prompt_version": "v-sim",
+  "model": "gemini-3.1-flash-live-preview",
+  "prompt_sha256": "47d9b8684f098d60d7daf04717c2707327dcdece252fbdbdf26a5b76b9def550",
+  "git_sha": "92f7c8af30a18154e3eeae0c2c4cd971441d225e-dirty",
+  "session_id": "T02_PSIM",
+  "created_ts": "2026-10-24T23:21:24.020Z",
+  "schema_version": 1
+}

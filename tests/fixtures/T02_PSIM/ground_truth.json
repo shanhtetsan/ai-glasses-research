@@ -1,0 +1,23 @@
+{
+  "room": "street-corner (qvga.jpg)",
+  "present": [
+    "car",
+    "person",
+    "bicycle",
+    "tactile paving",
+    "building"
+  ],
+  "absent": [
+    "dog",
+    "bench",
+    "traffic light"
+  ],
+  "planted_unseeable": [
+    "bus stop \u2014 behind the start position"
+  ],
+  "visible_from_start": [
+    "car",
+    "person",
+    "tactile paving"
+  ]
+}
