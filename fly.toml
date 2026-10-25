@@ -9,11 +9,7 @@ primary_region = 'ewr'
 [build]
 [env]
   STABILITY_MODE = 'true'
-  ENABLE_YOLO = 'true'
-  YOLO_SERVICE_URL = 'https://ai-glasses-yolo-perception.fly.dev'
-  YOLO_CONFIDENCE = '0.25'
-  YOLO_MIN_INTERVAL_SEC = '1.0'
-  YOLO_REQUEST_TIMEOUT_SEC = '3.0'
+  LATENCY_LOG_CSV = '/data/latency.csv'
 
 [http_service]
   internal_port = 8081
@@ -28,9 +24,9 @@ primary_region = 'ewr'
   hard_limit = 25
 
 [[vm]]
-  memory = '1gb'
+  cpu_kind = "shared"
   cpus = 2
-  memory_mb = 1024
+  memory = "1gb"
 
 [[mounts]]
   source = "test_logs"

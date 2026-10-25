@@ -21,41 +21,34 @@ next step. Keep every reply concise and BLV-friendly: plain spoken language,
 no visual jargon, no filler, direct answer first.
 
 Never invent inches, centimeters, meters, or any other unit of distance or
-depth. RGB imagery and normalized 2D perception coordinates do not provide
-reliable physical depth.
+depth. A camera image does not provide reliable physical depth.
 
 Do not give forward/backward, closer/farther, or reach-further corrections
 unless a trusted depth measurement explicitly supports them.
 
-From 2D perception, prefer horizontal and vertical guidance such as:
+From the image, prefer horizontal and vertical guidance such as:
 "Move your right hand left."
 "A little higher."
 "Your hand is aligned with the book."
 
-Once the hand appears aligned with the target in 2D, say something like:
+Once the hand appears aligned with the target in the image, say something like:
 "Your hand is lined up with it. Slowly extend your hand and use touch for the
 final contact."
 
 Do not claim to know the remaining physical depth.
 
-When a message beginning with PERCEPTION_STATE arrives, its fields are
-authoritative facts for exactly what they describe — do not re-derive,
-override, or visually reinterpret those specific fields from the image.
-- MediaPipe handedness (Left/Right) is anatomical, not image position. Never
-  infer or correct handedness from which side of the image a hand appears on;
-  a Right hand can appear on the left side of the frame and vice versa.
-- The requested_target field is the user's actual target for this turn. Never
-  silently substitute a different detected object, even if another object is
-  more visually prominent or easier to describe.
-- When PERCEPTION_STATE explicitly reports that the requested target is
-  uncertain, unstable, not found, stale, or otherwise not reliable for
-  guidance, say so plainly. Do not guess, invent a location, or give
-  directional guidance until reliable target information is available.
-- Object detections may be incomplete. Do not contradict authoritative
-  PERCEPTION_STATE fields, but you may still use the RGB image for semantic
-  details that the structured perception does not provide, such as reading
-  text, distinguishing between multiple similar objects, identifying visible
-  semantic details, or describing surrounding context.
+The camera image is your only source of visual information. No object
+detector, hand tracker, or other perception system supplies you with labels,
+positions, or left/right relations. Look at the most recent frame and answer
+from what you see in it.
+- If you cannot tell whether a visible hand is the user's left or right hand,
+  say "your hand" instead of guessing.
+- The object the user asked about is the target. Never silently substitute a
+  different object, even if another one is more visually prominent or easier
+  to describe.
+- If you cannot see the target, or cannot tell which of several similar
+  objects is meant, say so plainly. Do not guess, invent a location, or give
+  directional guidance until you can actually see it.
 
 Natural follow-up requests that do not restate the object by name (such as
 "is it closer now?", "which way?", or "keep going") continue guidance toward
@@ -71,8 +64,7 @@ there") is authoritative over any visual impression of contact; when it
 conflicts with what the image seems to show, trust the user and adjust your
 guidance accordingly.
 
-Outside of structured PERCEPTION_STATE or THERMAL_MEASUREMENTS facts, you may
-still reason naturally over the RGB image for semantic scene understanding:
+Reason naturally over the RGB image for semantic scene understanding:
 identifying objects, reading text, describing nearby surroundings and
 identifying visible obstacles, and answering general visual questions. Treat
 natural and indirect questions as visually grounded whenever sight would help
@@ -119,8 +111,18 @@ class GeminiLiveClient:
         self.on_input_transcription = None
         self.on_output_transcription = None
         self.on_turn_complete = None   # called when the model has finished a full response turn
-        self.on_interrupted = None     # called when the user barges in and cuts off the model
+        self.on_interrupted = None     # async callback(reason: str) — called whenever an
+                                        # active turn is abandoned, either because the user
+                                        # barged in (reason="user_barge_in") or because the
+                                        # session itself was dropped/rotated out from under it
+                                        # (reason="receive_error"/"normal_receive_end"/"goaway"/
+                                        # other rotation reasons)
         self.on_session_transition = None  # clears app turn state without finalizing latency twice
+        # Optional sync observer: on_session_opened(reason, generation, age_sec, resumed).
+        # Called after every successful open; never allowed to raise.
+        self.on_session_opened = None
+        self._last_close_reason = None
+        self._last_close_age_sec = None
         self.turn_id_provider = None
 
         self._response_modality = "AUDIO"  # remembered so auto-reconnect uses the same mode
@@ -151,6 +153,11 @@ class GeminiLiveClient:
         self._audio_sdk_send_buckets = [
             0 for _ in range(len(AUDIO_SEND_BUCKET_LIMITS_MS) + 1)
         ]
+        # Last successful send of any kind (audio/image/text, keepalive
+        # included) — lets a caller detect "this session has gone idle"
+        # without duplicating per-send-type bookkeeping. See
+        # seconds_since_last_activity().
+        self._last_activity_monotonic = 0.0
 
     def _current_turn_id(self):
         if self.turn_id_provider is None:
@@ -162,6 +169,19 @@ class GeminiLiveClient:
 
     def _has_active_turn(self) -> bool:
         return self._response_active or self._current_turn_id() is not None
+
+    def has_active_turn(self) -> bool:
+        """Public wrapper for callers (e.g. the idle keepalive loop) that
+        need to know without reaching into a private method."""
+        return self._has_active_turn()
+
+    def seconds_since_last_activity(self) -> float:
+        """Time since the last successful audio/image/text send, of any
+        kind. 0.0 before anything has ever been sent on the current
+        client instance."""
+        if not self._last_activity_monotonic:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_activity_monotonic)
 
     def _session_age_sec(self) -> float:
         if not self._session_opened_at:
@@ -308,6 +328,7 @@ class GeminiLiveClient:
             self._latest_resumption_handle = None
         self.session_generation += 1
         self._session_opened_at = time.monotonic()
+        self._last_activity_monotonic = time.monotonic()
         self._session_mode = mode
         self._response_active = False
         self._first_model_audio_seen = False
@@ -318,6 +339,18 @@ class GeminiLiveClient:
             f"config_fp={self._config_fingerprint()}",
             flush=True,
         )
+        if self.on_session_opened is not None:
+            try:
+                self.on_session_opened(
+                    self._last_close_reason or "initial",
+                    self.session_generation,
+                    self._last_close_age_sec,
+                    mode == "resumed",
+                )
+            except Exception:
+                pass
+        self._last_close_reason = None
+        self._last_close_age_sec = None
 
     def _cancel_goaway_deadline(self):
         task = self._goaway_deadline_task
@@ -339,6 +372,9 @@ class GeminiLiveClient:
                 await live_cm.__aexit__(None, None, None)
             except Exception:
                 pass
+        if had_session:
+            self._last_close_reason = reason
+            self._last_close_age_sec = age
         if generation and had_session:
             print(
                 f"[GEMINI-SESSION] generation={generation} closed "
@@ -448,6 +484,7 @@ class GeminiLiveClient:
                     ),
                     result="sent",
                 )
+                self._last_activity_monotonic = time.monotonic()
                 return True
         except asyncio.TimeoutError:
             self._log_timing(
@@ -520,6 +557,7 @@ class GeminiLiveClient:
                     self._audio_sdk_send_buckets[
                         self._audio_send_bucket(sdk_send_ms)
                     ] += 1
+            self._last_activity_monotonic = time.monotonic()
             return True
         except Exception as exc:
             print(
@@ -658,7 +696,7 @@ class GeminiLiveClient:
         )
         self._log_audio_lock_summary(turn_id, f"rotation_{reason}")
         if self._has_active_turn() and self.on_interrupted:
-            await self.on_interrupted()
+            await self.on_interrupted(reason=reason)
         self._response_active = False
         self._first_model_audio_seen = False
         await self._notify_session_transition(reason)
@@ -778,7 +816,7 @@ class GeminiLiveClient:
                         if server_content.interrupted:
                             self._log_audio_lock_summary(turn_id, "interrupted")
                             if self.on_interrupted:
-                                await self.on_interrupted()
+                                await self.on_interrupted(reason="user_barge_in")
                             self._response_active = False
                             self._first_model_audio_seen = False
                     if self._rotation_pending and not self._has_active_turn():
@@ -811,7 +849,7 @@ class GeminiLiveClient:
                     # callers (e.g. the ESP32 TTS state) don't get stuck
                     # waiting on a signal that will never arrive.
                     if self.on_interrupted:
-                        await self.on_interrupted()
+                        await self.on_interrupted(reason="normal_receive_end")
                     await self._notify_session_transition("normal_receive_end")
                     await self._reconnect_with_backoff(
                         reason="normal_receive_end"
@@ -845,7 +883,7 @@ class GeminiLiveClient:
                 # abandoned mid-stream, so fire on_interrupted for cleanup
                 # before reconnecting.
                 if self.on_interrupted:
-                    await self.on_interrupted()
+                    await self.on_interrupted(reason="receive_error")
                 await self._notify_session_transition("receive_error")
                 await self._reconnect_with_backoff(reason="receive_error")
                 # loop condition re-checks self.connected — if the reconnect

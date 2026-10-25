@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Trial Archive</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/trial_viewer.css">
+  <script src="/static/trial_viewer.js" defer></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <a class="brand" href="/trials">AI Glasses · Trial Archive</a>
+      <span class="note">Private research data</span>
+    </header>
+    <hr class="rule">
+
+    <main>
+      <section id="vIndex" hidden>
+        <h1>Every test, kept and replayable</h1>
+        <p class="lede">One row per session. The rate is how often the glasses stated something they could not see — an object that wasn't there, a distance with no depth sensor, or a clear path they never measured.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Trial</th><th>Site</th><th>Condition</th><th>Prompt</th>
+              <th class="r">Turns</th><th class="r">Bad guesses</th><th>Date</th>
+            </tr></thead>
+            <tbody id="idx"></tbody>
+          </table>
+        </div>
+        <p class="state" id="indexState" role="status">Loading trials…</p>
+      </section>
+
+      <section id="vTrial" hidden>
+        <a class="back" href="/trials">← all trials</a>
+
+        <div class="head">
+          <div class="big" id="dRate">—</div>
+          <div class="cap" id="dCap"></div>
+          <div class="who" id="dWho"></div>
+        </div>
+
+        <dl class="tally">
+          <div><dt>Right</dt><dd class="c-right" id="tRight">0</dd></div>
+          <div><dt>Useful refusal</dt><dd class="c-useful" id="tUseful">0</dd></div>
+          <div><dt>Dead refusal</dt><dd class="c-dead" id="tDead">0</dd></div>
+          <div><dt>Bad guess</dt><dd class="c-bad" id="tBad">0</dd></div>
+          <div><dt>Distance flags</dt><dd class="c-bad" id="tDist">0</dd></div>
+          <div><dt>Misattributed</dt><dd id="tMis">0</dd></div>
+          <div><dt>Dropped events</dt><dd id="tDrop">0</dd></div>
+        </dl>
+
+        <div class="gt" id="gt"></div>
+
+        <h2 class="sec">Turns — click one for the evidence</h2>
+        <div id="turns"></div>
+        <p class="state" id="trialState" role="status">Loading trial…</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

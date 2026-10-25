@@ -35,3 +35,15 @@ def normalize_detection(raw: dict, image_width: int, image_height: int) -> dict:
         "bbox_norm": [x1, y1, x2, y2],
         "center_norm": [clamp01((x1 + x2) / 2), clamp01((y1 + y2) / 2)],
     }
+
+
+def normalize_segmentation(raw: dict, image_width: int, image_height: int) -> dict:
+    """Same as normalize_detection, plus mask_coverage_norm.
+
+    mask_coverage_norm is the fraction of the frame the instance mask covers
+    (mask pixel count / mask pixel total) — resolution-independent, so the
+    caller does not need to resize the mask to image_width/image_height.
+    """
+    base = normalize_detection(raw, image_width, image_height)
+    base["mask_coverage_norm"] = clamp01(raw.get("mask_coverage_norm", 0.0))
+    return base

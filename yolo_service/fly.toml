@@ -11,6 +11,11 @@ primary_region = 'ewr'
   YOLO_IMAGE_SIZE = '640'
   YOLO_TORCH_THREADS = '1'
   HAND_MODEL_PATH = '/app/hand_landmarker.task'
+  YOLO_SEG_MODEL_PATH = '/app/yolo-seg.pt'
+  YOLO_SEG_CONFIDENCE = '0.25'
+  YOLOE_MODEL_PATH = '/app/yoloe-11l-seg.pt'
+  YOLOE_EMBEDDINGS_PATH = '/app/yoloe-whitelist-embeddings.pt'
+  YOLOE_CONFIDENCE = '0.25'
 
 [http_service]
   internal_port = 8080
@@ -25,6 +30,10 @@ primary_region = 'ewr'
   hard_limit = 2
 
 [[vm]]
-  memory = '2gb'
+  # Bumped from 2gb: four resident CPU models (detect + hand + seg +
+  # obstacle) measured ~756MB RSS locally after load, before accounting for
+  # per-request inference overhead or this VM's different Python/OS baseline.
+  # Watch /healthz's process_rss_bytes after deploy and resize if needed.
+  memory = '3gb'
   cpus = 2
-  memory_mb = 2048
+  memory_mb = 3072

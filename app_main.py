@@ -1,10 +1,12 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, csv, tempfile, wave, hmac
+import os, sys, time, json, asyncio, base64, csv, tempfile, wave, hmac, logging, uuid
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
 import re
+from datetime import datetime, timezone
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -64,7 +66,7 @@ except ImportError as e:
     YOLO = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response, RedirectResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -80,18 +82,9 @@ from perception_orientation import (
     run_latest_rgb_canonicalizer,
     summarize_thermal_grid,
 )
-from perception_fusion import (
-    HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
-    HandTargetGuidanceTracker,
-    build_hand_fusion_fact,
-    compact_guidance_for_log,
-    compact_hand_facts_for_log,
-    extract_requested_target,
-    guidance_anchor_for_utterance,
-    guidance_anchor_reason,
+from vision_intent import (
     is_hand_perception_request,
     is_target_directed_request,
-    should_wait_for_explicit_target,
 )
 try:
     import audioop
@@ -292,7 +285,11 @@ _tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
 _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
-_perception_submitted_for_turn: bool = False
+_vision_declined_for_turn: bool = False  # told Gemini it cannot see; suppresses a later image this turn
+_vision_frame_sequence_for_turn: Optional[int] = None
+_frame_not_sent_logged: set = set()  # reasons already logged this turn; mutated in place, never rebound
+_vision_intent_for_turn: bool = False   # latched True if is_explicit_vision_request() ever fired this turn
+_thermal_intent_for_turn: bool = False  # latched True if is_thermal_request() ever fired this turn
 _TTS_TARGET_LEAD_SEC = 2.0      # audio allowed to sit buffered on the device
 
 # Persistent audioop.ratecv state, kept across _on_audio calls within a turn
@@ -312,20 +309,60 @@ def _log_gemini_timing(event: str, turn_id: Optional[int], **fields) -> None:
     print("[GEMINI-TIMING] " + " ".join(parts), flush=True)
 
 
+def _log_frame_not_sent(turn_id: Optional[int], reason: str, **fields) -> None:
+    """Name why no camera frame went to Gemini. Once per reason per turn."""
+    if reason in _frame_not_sent_logged:
+        return
+    _frame_not_sent_logged.add(reason)
+    parts = [
+        f"reason={reason}",
+        f"turn_id={turn_id if turn_id is not None else 'unknown'}",
+    ]
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print("[VISION] frame_not_sent " + " ".join(parts), flush=True)
+
+
+def _log_turn_without_frame_request(turn_id: Optional[int], **fields) -> None:
+    """At turn end: speech arrived but nothing in it asked for a frame."""
+    if "turn_end_checked" in _frame_not_sent_logged:
+        return
+    _frame_not_sent_logged.add("turn_end_checked")
+    if (
+        not _input_text_buf
+        or _vision_submitted_for_turn
+        or _vision_intent_for_turn
+        or _thermal_intent_for_turn
+    ):
+        return
+    _log_frame_not_sent(
+        turn_id,
+        "not_a_vision_request",
+        text=repr("".join(_input_text_buf).strip()[:160]),
+        **fields,
+    )
+
+
 def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_frame_sequence_for_turn, _vision_declined_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn
     had_state = bool(
         _input_text_buf
         or _output_text_buf
         or _vision_submitted_for_turn
         or _thermal_submitted_for_turn
     )
+    _log_turn_without_frame_request(None, cleared_by=reason)
+    _frame_not_sent_logged.clear()
     _input_text_buf.clear()
     _output_text_buf.clear()
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
-    _perception_submitted_for_turn = False
+    _vision_declined_for_turn = False
+    _vision_frame_sequence_for_turn = None
+    _vision_intent_for_turn = False
+    _thermal_intent_for_turn = False
     if had_state:
         print(
             f"[GEMINI-TURN] state_cleared reason={reason} "
@@ -543,12 +580,13 @@ async def _on_audio(pcm24k: bytes):
     so a single 24k->8k resample feeds it directly.
     """
     global _ratecv_state_8k
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
     first_audio = latency_tracker.mark("first_gemini_audio_received", turn_id)
     if first_audio:
         _log_gemini_timing(
             "on_audio_begin", turn_id, bytes=len(pcm24k)
         )
+        trial_recorder.prompt_sent(turn_id)
 
     _mark_gemini_playing()
 
@@ -570,117 +608,14 @@ async def _on_audio(pcm24k: bytes):
                 )
 
 
-def build_perception_state(utterance: str = "") -> Optional[dict]:
-    """Build fresh YOLO + hand facts for Gemini in canonical RGB coordinates."""
-    requested_target = extract_requested_target(utterance)
-    guidance_anchor = guidance_anchor_for_utterance(utterance)
-    anchor_reason = guidance_anchor_reason(utterance)
-    yolo = yolo_client.latest_perception(
-        display_rotation_deg=0,
-        requested_target=requested_target,
-    )
-    hand_state = hand_client.latest_hands()
-
-    yolo_fresh = bool(
-        yolo.get("enabled")
-        and yolo.get("available")
-        and not yolo.get("stale")
-        and yolo.get("service_healthy") is not False
-    )
-
-    hands_fresh = bool(
-        hand_state.get("enabled")
-        and hand_state.get("available")
-        and not hand_state.get("stale")
-        and hand_state.get("service_healthy") is not False
-    )
-
-    if not yolo_fresh and not hands_fresh:
-        return None
-
-    objects = []
-    if yolo_fresh:
-        for obj in (yolo.get("objects") or [])[:8]:
-            if isinstance(obj, dict):
-                objects.append(dict(obj))
-
-    hands = []
-    if hands_fresh:
-        for hand in (hand_state.get("hands") or [])[:2]:
-            compact = build_hand_fusion_fact(hand)
-            if compact is not None:
-                hands.append(compact)
-
-    target_selection = (
-        dict(yolo.get("guidance_target") or {})
-        if yolo_fresh
-        else {
-            "target_state": "uncertain",
-            "stable": False,
-            "requested_target": requested_target,
-        }
-    )
-    selected_hand = None
-    if hands:
-        def _hand_priority(item: dict) -> tuple:
-            try:
-                handedness_score = float(item.get("handedness_score", 0.0))
-            except (TypeError, ValueError):
-                handedness_score = 0.0
-            return (
-                bool(item.get("gesture_authoritative") and item.get("gesture") == "pointing"),
-                bool(item.get("gesture_authoritative")),
-                bool(item.get("handedness_authoritative")),
-                handedness_score,
-                -int(item.get("hand_index", 0)),
-            )
-        selected_hand = max(hands, key=_hand_priority)
-
-    guidance = None
-    if selected_hand is not None and yolo_fresh:
-        guidance = hand_target_guidance.build(
-            target_selection,
-            selected_hand,
-            guidance_anchor=guidance_anchor,
-            anchor_reason=anchor_reason,
-            requested_target=requested_target,
-            objects_age_ms=yolo.get("age_ms"),
-            hands_age_ms=hand_state.get("age_ms"),
-            object_frame_id=yolo.get("frame_id"),
-            hand_frame_id=hand_state.get("frame_id"),
-        )
-
-    return {
-        "coordinate_space": "canonical_rgb_normalized_2d",
-        "requested_target": requested_target,
-        "guidance_anchor": guidance_anchor,
-        "guidance_anchor_reason": anchor_reason,
-        "objects_fresh": yolo_fresh,
-        "objects_age_ms": yolo.get("age_ms") if yolo_fresh else None,
-        "object_frame_id": yolo.get("frame_id") if yolo_fresh else None,
-        "objects": objects,
-        "hands_fresh": hands_fresh,
-        "hands_age_ms": hand_state.get("age_ms") if hands_fresh else None,
-        "hand_frame_id": hand_state.get("frame_id") if hands_fresh else None,
-        "handedness_semantics": {
-            "tracker_label": "anatomical_handedness",
-            "image_position": "independent canonical RGB left/center/right fact",
-            "authoritative_score_threshold": HAND_HANDEDNESS_AUTHORITATIVE_THRESHOLD,
-            "gesture_source": "landmark_geometry",
-            "gesture_authoritative_only_when_flagged": True,
-        },
-        "hands": hands,
-        "target_selection": target_selection,
-        "guidance": guidance,
-    }
-
-
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_frame_sequence_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
     if not text:
         return
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
     latency_tracker.mark("first_input_transcription", turn_id)
     combined = append_transcription_delta(_input_text_buf, text)
     try:
@@ -692,17 +627,47 @@ async def _on_input_transcription(text: str):
         pass
     wants_vision = is_explicit_vision_request(combined)
     wants_thermal = is_thermal_request(combined)
-    if not _vision_submitted_for_turn and (wants_vision or wants_thermal):
-        _log_gemini_timing(
-            "vision_intent_detected",
-            turn_id,
-            thermal_intent="yes" if wants_thermal else "no",
-        )
-        frame = latest_rgb.snapshot()
-        if frame.data is not None:
-            frame_age_ms = max(
-                0.0, (time.monotonic() - frame.timestamp) * 1000
+    if wants_vision:
+        _vision_intent_for_turn = True
+    if wants_thermal:
+        _thermal_intent_for_turn = True
+    if wants_vision or wants_thermal:
+        if _vision_submitted_for_turn:
+            _log_frame_not_sent(turn_id, "already_sent_this_turn")
+        elif _vision_declined_for_turn:
+            _log_frame_not_sent(turn_id, "already_declined_this_turn")
+    if (
+        not _vision_submitted_for_turn
+        and not _vision_declined_for_turn
+        and (wants_vision or wants_thermal or PIN_FRAME_EVERY_TURN)
+    ):
+        if wants_vision or wants_thermal:
+            _log_gemini_timing(
+                "vision_intent_detected",
+                turn_id,
+                thermal_intent="yes" if wants_thermal else "no",
             )
+        frame = latest_rgb.snapshot()
+        frame_age_ms = max(0.0, (time.monotonic() - frame.timestamp) * 1000)
+        # Only thermal-only turns may submit a stale frame, as before. Vision
+        # turns and pinned turns require a fresh one.
+        thermal_only = _thermal_intent_for_turn and not _vision_intent_for_turn
+        frame_unavailable = frame.data is None or (
+            not thermal_only
+            and frame_age_ms > VISION_FRAME_MAX_AGE_SEC * 1000
+        )
+        if frame.data is None:
+            _log_frame_not_sent(turn_id, "no_frame")
+        elif frame_unavailable:
+            _log_frame_not_sent(
+                turn_id,
+                "frame_too_old",
+                age_ms=round(frame_age_ms, 3),
+                max_age_ms=round(VISION_FRAME_MAX_AGE_SEC * 1000),
+            )
+        if not frame_unavailable:
+            latency_tracker.mark("vision_frame_selected", turn_id)
+            _vision_frame_sequence_for_turn = frame.sequence
             _log_gemini_timing(
                 "vision_snapshot",
                 turn_id,
@@ -716,73 +681,33 @@ async def _on_input_transcription(text: str):
                 sequence=frame.sequence,
                 source="pre_response",
             )
+            if _vision_submitted_for_turn:
+                trial_recorder.frame_sent(
+                    turn_id, frame.sequence, frame.data, frame.timestamp, "pre_response"
+                )
             print(
                 f"[VISION] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
-                f"submitted={_vision_submitted_for_turn}",
+                f"submitted={_vision_submitted_for_turn} "
+                f"vision_intent={str(_vision_intent_for_turn).lower()} "
+                f"pinned={str(PIN_FRAME_EVERY_TURN and not (wants_vision or wants_thermal)).lower()}",
                 flush=True,
             )
-
-    # Send fresh specialized perception with the same RGB vision turn.
-    if _vision_submitted_for_turn and not _perception_submitted_for_turn:
-        perception = build_perception_state(combined)
-
-        if perception is None:
-            print(
-                f"[PERCEPTION] turn_id={turn_id} no fresh detector state; not submitted",
-                flush=True,
-            )
-        else:
-            perception_payload = (
-                "PERCEPTION_STATE "
-                + json.dumps(perception, separators=(",", ":"))
-                + " Use these fresh detector results as supplemental visual evidence. "
-                  "MediaPipe handedness is ANATOMICAL handedness. When "
-                  "handedness_authoritative is true, you MUST use that anatomical "
-                  "Left/Right label and MUST NOT override it by visually guessing from "
-                  "image position. A Right hand can appear at image_left and a Left "
-                  "hand can appear at image_right; image position and anatomical "
-                  "handedness are different facts. Gesture labels such as fist or open "
-                  "palm are backend landmark-geometry facts; when gesture_authoritative "
-                  "is true, you MUST use that gesture and MUST NOT override it from the "
-                  "image. When target_state is uncertain, do not guess or give directional "
-                  "guidance. When target_state is not_found, say the requested target was "
-                  "not found and NEVER substitute another detected object. The requested_target "
-                  "and guidance_anchor fields are deterministic current-turn backend facts. "
-                  "Use the selected anchor and do not substitute a different hand landmark. "
-                  "When held_through_miss is true, the bbox is the last validated fresh cached "
-                  "position held for one temporary miss, not a new visual observation. "
-                  "When target_state is stable, guidance.horizontal_relation and "
-                  "guidance.vertical_relation are deterministic backend-computed facts in "
-                  "canonical RGB coordinates: do not reverse or reinterpret them from the "
-                  "image. Convert stable relations into concise instructions such as "
-                  "'Move your right hand left.' Object detections may be incomplete. "
-                  "Normalized offsets are 2D image coordinates only; NEVER describe dx_norm "
-                  "or dy_norm as meters, inches, physical depth, forward/backward movement, "
-                  "or physical distance such as '8 inches forward'. Depth and contact are "
-                  "unavailable."
-            )
-
-            _perception_submitted_for_turn = await gemini_live.send_text(
-                perception_payload,
+        elif _vision_intent_for_turn:
+            # Without this, Gemini answers from nothing and invents a
+            # plausible scene the user has no way to check.
+            _vision_declined_for_turn = await gemini_live.send_text(
+                "SYSTEM: No camera frame is available for this turn. Tell the "
+                "user plainly that you cannot see right now. Do not describe "
+                "or guess at any visual scene.",
                 turn_id=turn_id,
-                source="perception_facts",
+                source="vision_unavailable",
             )
-
             print(
-                f"[PERCEPTION] generation={gemini_live.session_generation} "
-                f"turn_id={turn_id} "
-                f"objects={len(perception['objects'])} "
-                f"hands={len(perception['hands'])} "
-                f"hand_facts={compact_hand_facts_for_log(perception['hands'])} "
-                f"submitted={_perception_submitted_for_turn}",
+                f"[VISION] no frame available, instructed model to decline "
+                f"turn_id={turn_id}",
                 flush=True,
             )
-            if _perception_submitted_for_turn and perception.get("guidance") is not None:
-                print(
-                    "[GUIDANCE] " + compact_guidance_for_log(perception["guidance"]),
-                    flush=True,
-                )
 
     # Thermal goes as structured text, never as the colorized heatmap.
     if wants_thermal and not _thermal_submitted_for_turn:
@@ -800,11 +725,14 @@ async def _on_input_transcription(text: str):
         if facts is None:
             print("[THERMAL] no recent thermal frame; facts not submitted", flush=True)
         else:
+            thermal_text = "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":"))
             _thermal_submitted_for_turn = await gemini_live.send_text(
-                "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":")),
+                thermal_text,
                 turn_id=turn_id,
                 source="thermal_facts",
             )
+            if _thermal_submitted_for_turn:
+                trial_recorder.note_thermal_text(turn_id, thermal_text)
             print(
                 f"[THERMAL] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} facts submitted "
@@ -845,9 +773,11 @@ async def _on_turn_complete():
     Gemini at all while in a restrictive navigation state.
     """
     global omni_conversation_active, omni_previous_nav_state
-    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn, _perception_submitted_for_turn
+    global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
 
-    turn_id = latency_tracker.ensure_turn()
+    turn_id = _ensure_turn()
+    _log_turn_without_frame_request(turn_id)
     active_turn = latency_tracker.snapshot().get("current_active_turn") or {}
     integrity_degraded = bool(active_turn.get("audio_integrity_degraded"))
     if integrity_degraded:
@@ -872,7 +802,9 @@ async def _on_turn_complete():
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
-    _perception_submitted_for_turn = False
+    _vision_declined_for_turn = False
+    _vision_intent_for_turn = False
+    _thermal_intent_for_turn = False
 
 
     # Turn is over — clear the is_playing_now() marker set by _mark_gemini_playing()
@@ -886,6 +818,7 @@ async def _on_turn_complete():
     # never showed up because it was never sent as a final).
     user_text = "".join(_input_text_buf).strip()
     _input_text_buf.clear()
+    _frame_not_sent_logged.clear()
     if user_text:
         try:
             await ui_broadcast_final("(user) " + user_text)
@@ -915,10 +848,75 @@ async def _on_turn_complete():
         if DEBUG: print(f"[OMNI] Dialogue ended, restored to {omni_previous_nav_state} mode")
         omni_previous_nav_state = None
 
-async def _on_interrupted():
-    """User barged in and cut off Gemini's current response."""
+RECONNECT_APOLOGY_TIMEOUT_SEC = 30.0
+RECONNECT_APOLOGY_POLL_SEC = 0.5
+RECONNECT_APOLOGY_PROMPT = (
+    "Say exactly this and nothing else: "
+    "\"Sorry, I lost the connection there — could you say that again?\""
+)
+
+
+async def _apologize_for_dropped_turn(reason: str, turn_id: int) -> None:
+    """Best-effort notice for a turn abandoned by a session drop, not a user
+    barge-in — session resumption restores conversation context, but there's
+    no evidence (in this SDK or this app's own history — even the planned
+    goaway rotation path abandons active turns the same way) that a specific
+    in-flight generation survives a reconnect. Rather than leave the user
+    wondering whether they were heard, wait for the session to come back and
+    have Gemini say so directly, reusing the existing audio/TTS pipeline.
+
+    Never raises — a missed apology is strictly better than crashing
+    anything downstream of it. Skips quietly if the user has already moved
+    on to a fresh turn (e.g. they spoke again during the reconnect gap)
+    rather than talking over them, and gives up quietly if the session
+    doesn't come back within RECONNECT_APOLOGY_TIMEOUT_SEC.
+    """
+    try:
+        waited = 0.0
+        while not gemini_live.connected and waited < RECONNECT_APOLOGY_TIMEOUT_SEC:
+            await asyncio.sleep(RECONNECT_APOLOGY_POLL_SEC)
+            waited += RECONNECT_APOLOGY_POLL_SEC
+        if not gemini_live.connected:
+            print(
+                f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+                "gave_up=yes (session did not come back in time)",
+                flush=True,
+            )
+            return
+        if latency_tracker.active_turn_id is not None:
+            print(
+                f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+                "skipped=new_turn_already_active",
+                flush=True,
+            )
+            return
+        sent = await gemini_live.send_text(
+            RECONNECT_APOLOGY_PROMPT, source="reconnect_apology"
+        )
+        print(
+            f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+            f"waited_sec={waited:.1f} sent={sent}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[GEMINI-RECONNECT-APOLOGY] turn_id={turn_id} reason={reason} "
+            f"failed error={type(exc).__name__}",
+            flush=True,
+        )
+
+
+async def _on_interrupted(reason: str = "user_barge_in"):
+    """An active turn was cut off — either the user barged in
+    (reason="user_barge_in") or the session itself was dropped/rotated out
+    from under it (any other reason: "receive_error", "normal_receive_end",
+    "goaway", etc.). Either way the ESP32 needs the same TTS-stop cleanup so
+    tts_playing clears and the mic un-mutes; only a connection-caused
+    interruption that actually had a turn in flight also gets a spoken
+    apology once the session comes back (see _apologize_for_dropped_turn).
+    """
     global _ratecv_state_8k
-    print("[Gemini Live] Response interrupted by user", flush=True)
+    print(f"[Gemini Live] Response interrupted reason={reason}", flush=True)
     turn_id = latency_tracker.active_turn_id
 
     # Same as _on_turn_complete: tell the firmware the TTS stream is over so
@@ -934,6 +932,9 @@ async def _on_interrupted():
     _ratecv_state_8k = None
     _clear_gemini_turn_state("interrupted")
     await hard_reset_audio("gemini_interrupted")
+
+    if reason != "user_barge_in" and turn_id is not None:
+        asyncio.create_task(_apologize_for_dropped_turn(reason, turn_id))
 
 
 async def _on_gemini_session_transition(reason: str, _generation: int):
@@ -1031,8 +1032,16 @@ from stability_runtime import (
     PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
-from yolo_client import YoloClientSettings, YoloShadowClient
-from hand_client import HandClientSettings, HandTrackingClient
+from trial_recorder import TrialRecorder
+from trial_scorer import TrialScoringError, score_trial_folder
+from trial_archive import TrialArchive, TrialArchiveError, TrialNotFound
+from trial_storage import (
+    UPLOAD_RECEIPT,
+    TrialStorageError,
+    TrialStorageUnavailable,
+    build_r2_storage,
+    write_upload_receipt,
+)
 from research_exporter import (
     DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
     ResearchExporter, ResearchExporterSettings, SessionGate,
@@ -1071,25 +1080,237 @@ research_exporter = ResearchExporter(
     research_session_gate,
 )
 
-yolo_settings = YoloClientSettings.from_env()
-yolo_client = YoloShadowClient(
-    yolo_settings,
-    latest_rgb,
-    rotation_provider=lambda: 0,
-    on_event=research_exporter.publish_event,
-)
-hand_target_guidance = HandTargetGuidanceTracker(
-    deadband=yolo_settings.guidance_deadband,
-)
-hand_settings = HandClientSettings.from_env()
-hand_client = HandTrackingClient(hand_settings, latest_rgb)
 latency_tracker = LatencyTracker(history_size=200)
 latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
+
+
+# ---- Trial recorder (TRIAL_RECORDER=1; inert otherwise) ----
+# Append-only per-trial log under /data/trials. All hooks below are sync
+# put_nowait calls; disk I/O happens in trial_recorder's writer thread.
+def _trial_thermal_summary(matrix, age_sec, calibration):
+    facts = summarize_thermal_grid(matrix, age_sec, THERMAL_CENTER_FRACTION)
+    if facts is None:
+        return None
+    norm = (facts.get("hotspot") or {}).get("thermal_norm")
+    if isinstance(norm, list) and len(norm) == 2 and calibration:
+        mapped = map_thermal_to_rgb_normalized(norm[0], norm[1], **calibration)
+        facts["hotspot"]["rgb_norm_coarse"] = [round(v, 6) for v in mapped]
+    return facts
+
+
+def _trial_static_fields() -> dict:
+    import hashlib
+    import gemini_live_client as _glc
+    prompt_sha = hashlib.sha256(
+        _glc.SMART_GLASSES_SYSTEM_INSTRUCTION.encode("utf-8")
+    ).hexdigest()
+    return {
+        "model": _glc.GEMINI_LIVE_MODEL,
+        "prompt_sha256": prompt_sha,
+        "git_sha": os.getenv("GIT_SHA", "").strip() or "unknown",
+        "prompt_version_default": os.getenv("PROMPT_VERSION", "").strip() or f"sha-{prompt_sha[:8]}",
+    }
+
+
+def _trial_thermal_snapshot():
+    """Cheap reference grab at speech_start; facts are computed in the writer."""
+    matrix = latest_thermal_matrix
+    if matrix is None:
+        return None
+    calibration = {
+        "offset_x": thermal_display_config["calibration_offset_x"],
+        "offset_y": thermal_display_config["calibration_offset_y"],
+        "scale_x": thermal_display_config["calibration_scale_x"],
+        "scale_y": thermal_display_config["calibration_scale_y"],
+    }
+    return (matrix, latest_thermal.snapshot().timestamp, calibration)
+
+
+_trial_score_tasks: Set[asyncio.Task] = set()
+_trial_score_locks: Dict[str, asyncio.Lock] = {}
+_trial_upload_tasks: Set[asyncio.Task] = set()
+_trial_upload_locks: Dict[str, asyncio.Lock] = {}
+
+try:
+    trial_object_storage = build_r2_storage()
+except TrialStorageUnavailable as exc:
+    trial_object_storage = None
+    print(f"[TRIAL-UPLOAD] disabled: {exc}", flush=True)
+
+
+async def _score_closed_trial(session_id: str, directory: str) -> dict:
+    lock = _trial_score_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        # The close record is queued before the lifecycle callback. Waiting on
+        # the recorder queue ensures session_end and the last JPEG are durable.
+        await trial_recorder.flush()
+        return await asyncio.to_thread(score_trial_folder, directory)
+
+
+async def _auto_score_closed_trial(session_id: str, directory: str) -> None:
+    try:
+        result = await _score_closed_trial(session_id, directory)
+        print(f"[TRIAL-SCORE] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
+    except Exception as exc:
+        # Scoring is derived and retryable. Never compromise the source log or
+        # session close when an API call or local write fails.
+        print(f"[TRIAL-SCORE] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+        return
+    if trial_object_storage is not None:
+        try:
+            await _upload_scored_trial(session_id, directory)
+        except Exception as exc:
+            # The missing receipt causes this local folder to be retried at the
+            # next startup; source evidence is never removed on upload failure.
+            print(f"[TRIAL-UPLOAD] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+
+
+def _schedule_trial_score(session_id: str, directory: str) -> None:
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _auto_score_closed_trial(session_id, directory),
+            name=f"trial-score-{session_id}",
+        )
+    except RuntimeError as exc:
+        print(f"[TRIAL-SCORE] could not schedule id={session_id}: {exc}", flush=True)
+        return
+    _trial_score_tasks.add(task)
+    task.add_done_callback(_trial_score_tasks.discard)
+
+
+def _validated_trial_directory(session_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", session_id):
+        raise TrialStorageError("invalid trial id")
+    root = os.path.realpath(trial_recorder.root)
+    directory = os.path.realpath(os.path.join(root, session_id))
+    if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
+        raise TrialStorageError("trial not found")
+    return directory
+
+
+def _assert_trial_ready_for_upload(directory: str) -> None:
+    required = ("session.jsonl", "meta.json", "ground_truth.json", "scores.jsonl", "scores.csv", "summary.json")
+    missing = [name for name in required if not os.path.isfile(os.path.join(directory, name))]
+    if missing:
+        raise TrialStorageError("trial has not finished scoring; missing " + ", ".join(missing))
+    with open(os.path.join(directory, "session.jsonl"), encoding="utf-8") as handle:
+        closed = any(
+            json.loads(line).get("t") == "session_end"
+            for line in handle if line.strip()
+        )
+    if not closed:
+        raise TrialStorageError("trial is still open")
+
+
+async def _upload_scored_trial(session_id: str, directory: Optional[str] = None) -> dict:
+    if trial_object_storage is None:
+        raise TrialStorageUnavailable("R2 storage is not configured")
+    directory = directory or _validated_trial_directory(session_id)
+    if trial_recorder.status().get("session_id") == session_id:
+        raise TrialStorageError("trial is still open")
+    lock = _trial_upload_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        await asyncio.to_thread(_assert_trial_ready_for_upload, directory)
+        manifest = await asyncio.to_thread(trial_object_storage.put_folder, directory)
+        await asyncio.to_thread(write_upload_receipt, directory, manifest)
+        result = {key: value for key, value in manifest.items() if key != "objects"}
+        print(f"[TRIAL-UPLOAD] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
+        return result
+
+
+async def _auto_upload_scored_trial(session_id: str, directory: str) -> None:
+    try:
+        await _upload_scored_trial(session_id, directory)
+    except Exception as exc:
+        print(f"[TRIAL-UPLOAD] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+
+
+def _schedule_trial_upload(session_id: str, directory: str) -> None:
+    task = asyncio.get_running_loop().create_task(
+        _auto_upload_scored_trial(session_id, directory), name=f"trial-upload-{session_id}"
+    )
+    _trial_upload_tasks.add(task)
+    task.add_done_callback(_trial_upload_tasks.discard)
+
+
+def _schedule_pending_trial_uploads() -> None:
+    if not trial_recorder.enabled or trial_object_storage is None or not os.path.isdir(trial_recorder.root):
+        return
+    for name in os.listdir(trial_recorder.root):
+        directory = os.path.join(trial_recorder.root, name)
+        if (
+            os.path.isdir(directory)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", name)
+            and os.path.isfile(os.path.join(directory, "summary.json"))
+            and not os.path.isfile(os.path.join(directory, UPLOAD_RECEIPT))
+            and trial_recorder.status().get("session_id") != name
+        ):
+            _schedule_trial_upload(name, directory)
+
+
+trial_recorder = TrialRecorder(
+    thermal_summarizer=_trial_thermal_summary,
+    static_fields=_trial_static_fields,
+    on_session_ended=_schedule_trial_score,
+)
+trial_archive = TrialArchive(trial_recorder.root, trial_object_storage)
+gemini_live.on_session_opened = trial_recorder.session_rotate
 audio_freshness_tracker = AudioFreshnessTracker(
     stale_after_ms=float(os.getenv("AUDIO_STALE_AFTER_MS", "500")),
     recent_window_sec=2.0,
 )
 _latency_csv_lock = threading.Lock()
+
+# Free-text label for a block of turns under manual test (e.g. "far-room-walking"),
+# set via POST /api/session/start and cleared via POST /api/session/stop. Not
+# related to research_session_gate above — that's an external research-platform
+# activation gate; this is purely a label carried on this app's own turn telemetry.
+_telemetry_session_id: Optional[str] = None
+_telemetry_session_label: Optional[str] = None
+
+# Snapshot of (session_id, session_label) taken the moment each turn_id is first
+# created, so a turn started mid-session keeps that session's tag even if
+# /api/session/stop (or a new /api/session/start) fires before the turn finishes —
+# the transition itself is what a labeled test block is trying to capture.
+_turn_session_tags: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+
+
+def _tag_turn_session(turn_id: int) -> int:
+    _turn_session_tags.setdefault(turn_id, (_telemetry_session_id, _telemetry_session_label))
+    return turn_id
+
+
+def _ensure_turn() -> int:
+    return _tag_turn_session(latency_tracker.ensure_turn())
+
+
+def _start_turn(turn_id: Optional[int] = None) -> int:
+    return _tag_turn_session(latency_tracker.start_turn(turn_id))
+
+# Persisted per-turn telemetry (latency timestamps, tts stats, and the
+# perception record) as JSONL on the Fly volume, alongside backend.log.
+# Rotating handler caps disk usage; a missing /data (e.g. local dev outside
+# Docker) disables this with one warning instead of failing every turn.
+_TURN_TELEMETRY_PATH = os.getenv("TURN_TELEMETRY_PATH", "/data/turn_telemetry.jsonl")
+_TURN_TELEMETRY_MAX_BYTES = int(os.getenv("TURN_TELEMETRY_MAX_BYTES", str(20 * 1024 * 1024)))
+_TURN_TELEMETRY_BACKUP_COUNT = int(os.getenv("TURN_TELEMETRY_BACKUP_COUNT", "3"))
+_turn_telemetry_logger = logging.getLogger("turn_telemetry")
+_turn_telemetry_logger.setLevel(logging.INFO)
+_turn_telemetry_logger.propagate = False
+_turn_telemetry_enabled = False
+try:
+    _turn_telemetry_handler = RotatingFileHandler(
+        _TURN_TELEMETRY_PATH,
+        maxBytes=_TURN_TELEMETRY_MAX_BYTES,
+        backupCount=_TURN_TELEMETRY_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _turn_telemetry_handler.setFormatter(logging.Formatter("%(message)s"))
+    _turn_telemetry_logger.addHandler(_turn_telemetry_handler)
+    _turn_telemetry_enabled = True
+except OSError as exc:
+    print(f"[TURN-TELEMETRY] disabled, cannot open {_TURN_TELEMETRY_PATH}: {exc}", flush=True)
+
 # Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
 latest_thermal_matrix: Optional[np.ndarray] = None
 latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
@@ -1110,10 +1331,60 @@ thermal_display_config: Dict[str, Any] = {
     "calibration_scale_y": 1.0,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
+# Pin the latest fresh frame (source=pre_response) on every turn, not only on
+# turns matching _VISION_PHRASES. Without it Gemini answers spatial follow-ups
+# ("what side is the bottle") from conversation history instead of the camera.
+# is_explicit_vision_request() stays as the logged vision_intent signal.
+PIN_FRAME_EVERY_TURN = env_bool("PIN_FRAME_EVERY_TURN", True)
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
 camera_viewers: Set[WebSocket] = set()
 thermal_viewers: Set[WebSocket] = set()
+
+# Browser fan-out is fire-and-forget: producers only enqueue, and each viewer
+# drains its own small queue from its own task. A stalled tab fills its queue
+# and loses its oldest frames; it never delays the producer or another viewer.
+VIEWER_QUEUE_MAX = 2
+VIEWER_SEND_TIMEOUT_SEC = 2.0
+_viewer_queues: Dict[WebSocket, asyncio.Queue] = {}
+
+
+def _viewer_publish(viewers: Set[WebSocket], *messages) -> None:
+    """Queue one frame (bytes and/or text parts, sent in order) for every viewer."""
+    for viewer_ws in viewers:
+        queue = _viewer_queues.get(viewer_ws)
+        if queue is None:
+            continue
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(messages)
+
+
+async def _viewer_sender(ws: WebSocket, viewers: Set[WebSocket], queue: asyncio.Queue) -> None:
+    try:
+        while True:
+            for message in await queue.get():
+                send = ws.send_text if isinstance(message, str) else ws.send_bytes
+                await asyncio.wait_for(send(message), timeout=VIEWER_SEND_TIMEOUT_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        viewers.discard(ws)
+        _viewer_queues.pop(ws, None)
+
+
+def _viewer_attach(ws: WebSocket, viewers: Set[WebSocket]) -> asyncio.Task:
+    queue: asyncio.Queue = asyncio.Queue(maxsize=VIEWER_QUEUE_MAX)
+    _viewer_queues[ws] = queue
+    viewers.add(ws)
+    return asyncio.create_task(_viewer_sender(ws, viewers, queue))
+
+
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
@@ -1127,6 +1398,17 @@ GEMINI_VIDEO_INTERVAL_SEC = max(
     0.25, float(os.getenv("GEMINI_VIDEO_INTERVAL_SEC", "0.75"))
 )
 _last_gemini_video_submit = 0.0
+
+# The video pump above only runs while mic_streaming is true, so any gap
+# between conversations longer than that leaves the Gemini Live session with
+# nothing at all being sent. Gemini's server closes such idle sessions with
+# WS close code 1008 after ~150s (measured empirically from backend.log —
+# not documented). This loop sends an occasional frame during those gaps to
+# keep the session alive; see _gemini_keepalive_loop().
+GEMINI_KEEPALIVE_INTERVAL_SEC = max(
+    30.0, float(os.getenv("GEMINI_KEEPALIVE_INTERVAL_SEC", "60"))
+)
+_gemini_keepalive_task: Optional[asyncio.Task] = None
 
 # Same drop-to-latest / rate-limited shape as the Gemini video pump above,
 # decoupled to its own interval so research sampling never competes with
@@ -1159,6 +1441,7 @@ def _append_latency_csv(record: dict) -> None:
     if not csv_path:
         return
     fields = (
+        "logged_at",
         "turn_id", "status",
         "speech_end_to_first_gemini_audio_ms",
         "speech_end_to_first_tts_send_ms",
@@ -1167,8 +1450,10 @@ def _append_latency_csv(record: dict) -> None:
         "backend_turn_total_ms",
         "speech_end_to_first_i2s_ms",
         "tts_chunks", "tts_bytes", "max_queue_depth",
+        "input_transcription", "response_text",
     )
     row = {field: record.get(field) for field in fields}
+    row["logged_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _latency_csv_lock:
         needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
         with open(csv_path, "a", newline="", encoding="utf-8") as handle:
@@ -1185,13 +1470,39 @@ async def _append_latency_csv_safely(record: dict) -> None:
         print(f"[LATENCY] CSV append failed: {exc}", flush=True)
 
 
+def _append_turn_telemetry(record: dict) -> None:
+    _turn_telemetry_logger.info(json.dumps(record, separators=(",", ":")))
+
+
+async def _append_turn_telemetry_safely(record: dict) -> None:
+    try:
+        await asyncio.to_thread(_append_turn_telemetry, record)
+    except Exception as exc:
+        print(f"[TURN-TELEMETRY] append failed: {exc}", flush=True)
+
+
 async def _finalize_latency_turn(status: str, turn_id: int) -> None:
     record = latency_tracker.finish(status, turn_id)
     if record is None:
         return
+    # Read here rather than at turn-start: these buffers/flags are still the
+    # ones for `turn_id` at every call site (all four call this before the
+    # buffers/flags get cleared), so this is the full-turn content.
+    record["input_transcription"] = "".join(_input_text_buf).strip() or None
+    record["response_text"] = "".join(_output_text_buf).strip() or None
+    record["vision_intent"] = _vision_intent_for_turn
+    record["thermal_intent"] = _thermal_intent_for_turn
+    # Unlike the above, session tag IS taken at turn-start (see _tag_turn_session)
+    # so a session boundary crossed mid-turn doesn't erase which block it was in.
+    session_id, session_label = _turn_session_tags.pop(turn_id, (None, None))
+    record["session_id"] = session_id
+    record["session_label"] = session_label
     print("[LATENCY] " + json.dumps(record, separators=(",", ":")), flush=True)
-    if status == "completed" and os.getenv("LATENCY_LOG_CSV", "").strip():
+    trial_recorder.turn_end(turn_id, record, gemini_live.session_generation)
+    if os.getenv("LATENCY_LOG_CSV", "").strip():
         asyncio.create_task(_append_latency_csv_safely(record))
+    if _turn_telemetry_enabled:
+        asyncio.create_task(_append_turn_telemetry_safely(record))
 
 recording_pipeline = RecordingPipeline(
     sync_recorder.record_frame,
@@ -1225,15 +1536,10 @@ _VISION_PHRASES = (
 
 def is_explicit_vision_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
-    if should_wait_for_explicit_target(normalized):
-        return False
     return (
         any(phrase in normalized for phrase in _VISION_PHRASES)
         or is_hand_perception_request(normalized)
-        or (
-            is_target_directed_request(normalized)
-            and extract_requested_target(normalized) is not None
-        )
+        or is_target_directed_request(normalized)
     )
 
 # ---- Thermal facts for Gemini ----
@@ -1903,7 +2209,7 @@ async def start_ai_with_text(user_text: str):
                         # and writes to i2sOut.
                         _ws = esp32_audio_ws
                         if _ws and _ws.client_state == WebSocketState.CONNECTED:
-                            turn_id = latency_tracker.ensure_turn()
+                            turn_id = _ensure_turn()
                             _CHUNK = 2040  # fits TTSChunk.data[2048] on the firmware side
                             for _i in range(0, len(pcm8k), _CHUNK):
                                 _enqueue_tts_chunk(pcm8k[_i:_i + _CHUNK], turn_id)
@@ -2012,8 +2318,6 @@ def health():
             "audio": recording_audio_pipeline.health(),
         },
         "vision": dict(vision_controller.metrics),
-        "yolo": yolo_client.health(),
-        "hands": hand_client.health(),
         "thermal_calibration": thermal_calibration_diagnostics(),
         "research": research_exporter.health(),
         "audio": {"last_activity": backend_metrics["last_audio_activity"]},
@@ -2037,6 +2341,28 @@ def camera_freshness():
     })
 
 
+@app.get("/api/camera-frame.jpg")
+def camera_frame_jpeg():
+    """The newest canonical RGB JPEG, byte-for-byte what Gemini is sent.
+
+    For checking orientation by eye: these bytes pass through no browser
+    canvas or CSS, so what the saved file shows is what the model sees.
+    """
+    rgb = latest_rgb.snapshot()
+    if rgb.data is None:
+        return JSONResponse({"error": "no camera frame received yet"}, status_code=404)
+    age_ms = round(max(0.0, time.monotonic() - rgb.timestamp) * 1000.0, 1)
+    return Response(
+        content=rgb.data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Sequence": str(rgb.sequence),
+            "X-Frame-Age-Ms": str(age_ms),
+        },
+    )
+
+
 @app.get("/api/audio-freshness")
 def audio_freshness():
     """Compact read-only socket/gate/PCM freshness state for the browser."""
@@ -2048,25 +2374,12 @@ def latency_metrics():
     return JSONResponse(latency_tracker.snapshot())
 
 
-@app.get("/api/yolo/detections")
-def yolo_detections():
-    """Read-only Phase 2.1 shadow cache; never feeds Gemini or navigation."""
-    return JSONResponse({
-        "enabled": yolo_settings.enabled,
-        **yolo_client.latest_detections(),
-    })
-
-
-@app.get("/api/perception/latest")
-def latest_perception():
-    """Read-only browser view of the latest YOLO shadow result."""
-    return JSONResponse(yolo_client.latest_perception(display_rotation_deg=0))
-
-
-@app.get("/api/perception/hands/latest")
-def latest_hands():
-    """Read-only hand cache in the canonical RGB source coordinate space."""
-    return JSONResponse(hand_client.latest_hands())
+@app.get("/latency.csv")
+def latency_csv():
+    csv_path = os.getenv("LATENCY_LOG_CSV", "").strip()
+    if not csv_path or not os.path.isfile(csv_path):
+        return JSONResponse({"error": "latency csv not available"}, status_code=404)
+    return FileResponse(csv_path, media_type="text/csv", filename="latency.csv")
 
 
 class RecordingCommand(BaseModel):
@@ -2112,6 +2425,299 @@ async def vision_request(request: Request, payload: VisionRequest):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     result = await request_gemini_vision(f"api:{payload.reason[:80]}")
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+class SessionStartRequest(BaseModel):
+    label: str
+
+
+@app.post("/api/session/start")
+async def session_start(payload: SessionStartRequest):
+    """Tag every turn recorded from now until /api/session/stop with a label
+    (e.g. "far-room-walking") for manual test blocks. In-memory only, no auth —
+    same trust boundary as the rest of this app's local-network control plane."""
+    global _telemetry_session_id, _telemetry_session_label
+    _telemetry_session_id = uuid.uuid4().hex
+    _telemetry_session_label = payload.label
+    return JSONResponse({
+        "session_id": _telemetry_session_id,
+        "session_label": _telemetry_session_label,
+    })
+
+
+@app.post("/api/session/stop")
+async def session_stop():
+    global _telemetry_session_id, _telemetry_session_label
+    _telemetry_session_id = None
+    _telemetry_session_label = None
+    return JSONResponse({"stopped": True})
+
+
+def _trial_auth_failed(request: Request) -> Optional[JSONResponse]:
+    """If TRIAL_TOKEN is set, /internal/trial* require a matching X-Trial-Token."""
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected:
+        return None
+    supplied = request.headers.get("x-trial-token", "")
+    if hmac.compare_digest(supplied, expected):
+        return None
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+async def _set_trial_safely(payload: Any, reason: str) -> Optional[dict]:
+    try:
+        if not isinstance(payload, dict):
+            raise ValueError("trial payload must be a JSON object")
+        ground_truth = payload.get("ground_truth")
+        if ground_truth is not None and not isinstance(ground_truth, dict):
+            raise ValueError("ground_truth must be a JSON object")
+        return await trial_recorder.set_trial(payload, ground_truth, reason=reason)
+    except Exception as exc:
+        print(f"[TRIAL] set_trial failed reason={reason} error={exc}", flush=True)
+        trial_recorder.error("set_trial", exc)
+        return None
+
+
+@app.get("/internal/trial")
+async def trial_status():
+    return JSONResponse(trial_recorder.status())
+
+
+@app.post("/internal/trial")
+async def trial_set(request: Request):
+    """Set trial metadata (and optional ground_truth) before a run.
+
+    Body: {"trial","pid","site","cond","task","success_criterion",
+    "prompt_version"?, "ground_truth"?}. Posting the same trial+pid again
+    resumes that session; a different one closes the current session first.
+    """
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    ground_truth = payload.get("ground_truth")
+    if ground_truth is not None and not isinstance(ground_truth, dict):
+        return JSONResponse({"error": "ground_truth must be a JSON object"}, status_code=400)
+    try:
+        status = await trial_recorder.set_trial(payload, ground_truth, reason="internal_trial")
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(status)
+
+
+@app.post("/internal/trial/end")
+async def trial_end(request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    ended = trial_recorder.end_session(reason="internal_end")
+    return JSONResponse({"ended": ended, **trial_recorder.status()})
+
+
+@app.post("/internal/trial/{trial_id}/score")
+async def trial_score(trial_id: str, request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", trial_id):
+        return JSONResponse({"error": "invalid trial id"}, status_code=400)
+    if trial_recorder.status().get("session_id") == trial_id:
+        return JSONResponse({"error": "trial is still open"}, status_code=409)
+    root = os.path.realpath(trial_recorder.root)
+    directory = os.path.realpath(os.path.join(root, trial_id))
+    if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    try:
+        result = await _score_closed_trial(trial_id, directory)
+    except TrialScoringError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        print(f"[TRIAL-SCORE] failed id={trial_id} error={type(exc).__name__}: {exc}", flush=True)
+        return JSONResponse({"error": "trial scoring failed"}, status_code=502)
+    if trial_object_storage is not None:
+        try:
+            result["upload"] = await _upload_scored_trial(trial_id, directory)
+        except Exception as exc:
+            result["upload"] = {"status": "failed", "error": str(exc)[:300]}
+    else:
+        result["upload"] = {"status": "not_configured"}
+    return JSONResponse(result)
+
+
+@app.post("/internal/trial/{trial_id}/upload")
+async def trial_upload(trial_id: str, request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    if trial_object_storage is None:
+        return JSONResponse({"error": "R2 storage is not configured"}, status_code=409)
+    try:
+        directory = _validated_trial_directory(trial_id)
+        result = await _upload_scored_trial(trial_id, directory)
+    except TrialStorageError as exc:
+        status = 404 if str(exc) == "trial not found" else 422
+        return JSONResponse({"error": str(exc)}, status_code=status)
+    return JSONResponse(result)
+
+
+_TRIAL_COOKIE = "trial_token"
+
+
+def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
+    """Fail-closed auth for every team-facing trial data route."""
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected:
+        return JSONResponse({"error": "trial viewer is not configured"}, status_code=401)
+    authorization = request.headers.get("authorization", "")
+    bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    supplied = (
+        request.headers.get("x-trial-token", "")
+        or bearer
+        or request.cookies.get(_TRIAL_COOKIE, "")
+        or request.query_params.get("token", "")
+    )
+    if supplied and hmac.compare_digest(supplied, expected):
+        return None
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+@app.get("/api/trials")
+async def trial_list_api(request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        rows = await asyncio.to_thread(trial_archive.list_trials)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse({"trials": rows})
+
+
+@app.get("/api/trials/{trial_id}")
+async def trial_detail_api(trial_id: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        detail = await asyncio.to_thread(trial_archive.get_trial, trial_id)
+    except TrialNotFound:
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(detail)
+
+
+@app.get("/trials/{trial_id}/frames/{seq}.jpg")
+async def trial_frame(trial_id: str, seq: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    if not re.fullmatch(r"[0-9]+(?:_[0-9]+)?", seq):
+        return JSONResponse({"error": "frame not found"}, status_code=404)
+    try:
+        body, _, _ = await asyncio.to_thread(trial_archive.get_bytes, trial_id, f"frames/{seq}.jpg")
+    except TrialNotFound:
+        return JSONResponse({"error": "frame not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return Response(body, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/trials/{trial_id}.zip")
+async def trial_zip(trial_id: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        body = await asyncio.to_thread(trial_archive.zip_bytes, trial_id)
+    except TrialNotFound:
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return Response(
+        body,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{trial_id}.zip"'},
+    )
+
+
+_TRIAL_DENIED_PAGE = """<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Trial Archive</title>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:0 16px;line-height:1.5">
+<h1 style="font-size:20px">Trial Archive is private</h1>
+<p>Open this page once as <code>/trials?token=&lt;TRIAL_TOKEN&gt;</code>. The token is kept in a
+cookie for 12 hours and removed from the address bar.</p></body>"""
+
+
+def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        # Same 401 as the API, but readable for someone who clicked the Trials tab.
+        return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
+    supplied_in_query = request.query_params.get("token", "")
+    if supplied_in_query:
+        expected = os.getenv("TRIAL_TOKEN", "")
+        if not expected or not hmac.compare_digest(supplied_in_query, expected):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        clean_path = "/trials" if trial_id is None else f"/trials/{trial_id}"
+        response = RedirectResponse(clean_path, status_code=303)
+        response.set_cookie(
+            _TRIAL_COOKIE,
+            supplied_in_query,
+            max_age=12 * 60 * 60,
+            secure=request.url.scheme == "https",
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+    try:
+        with open("templates/trial_viewer.html", encoding="utf-8") as handle:
+            content = handle.read()
+        # Version the viewer assets by mtime so a deploy never serves stale JS/CSS.
+        for asset in ("trial_viewer.js", "trial_viewer.css"):
+            version = int(os.path.getmtime(os.path.join("static", asset)))
+            content = content.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+    except OSError:
+        return JSONResponse({"error": "trial viewer template unavailable"}, status_code=500)
+    return HTMLResponse(content, headers={
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; img-src 'self' data:; "
+            "script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        ),
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.get("/trials", response_class=HTMLResponse)
+async def trial_list_page(request: Request):
+    return _trial_viewer_page(request)
+
+
+@app.get("/trials/{trial_id}", response_class=HTMLResponse)
+async def trial_detail_page(trial_id: str, request: Request):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", trial_id):
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    return _trial_viewer_page(request, trial_id)
 
 
 class ResearchSessionCommand(BaseModel):
@@ -2741,7 +3347,12 @@ async def ws_audio(ws: WebSocket):
                         await _finalize_latency_turn("interrupted", active_turn_id)
                     if active_turn_id != turn_id:
                         _clear_gemini_turn_state("speech_start")
-                    latency_tracker.start_turn(turn_id)
+                    server_turn_id = _start_turn(turn_id)
+                    if trial_recorder.enabled:
+                        trial_recorder.speech_start(
+                            turn_id, server_turn_id,
+                            _trial_thermal_snapshot(), dict(latest_imu),
+                        )
                     continue
 
                 if raw.startswith("SPEECH_END:"):
@@ -2750,14 +3361,27 @@ async def ws_audio(ws: WebSocket):
                     except ValueError:
                         continue
                     if latency_tracker.active_turn_id is None:
-                        latency_tracker.start_turn(turn_id)
+                        _start_turn(turn_id)
                     latency_tracker.mark("speech_end_detected", turn_id)
+                    trial_recorder.speech_end(turn_id, latency_tracker.active_turn_id)
                     continue
 
-                if cmd == "START":
+                if cmd == "START" or (trial_recorder.enabled and cmd.startswith("START:")):
+                    if trial_recorder.enabled:
+                        # START:<json> carries trial metadata (future iOS);
+                        # parse from raw, since cmd is upper-cased.
+                        if cmd.startswith("START:"):
+                            try:
+                                trial_payload = json.loads(raw[len("START:"):])
+                                asyncio.create_task(_set_trial_safely(trial_payload, "ws_start"))
+                            except ValueError as exc:
+                                trial_recorder.error("start_json", exc)
+                        else:
+                            trial_recorder.ensure_session("ws_start")
                     print("[MIC] Listening — waiting for speech...")
                     streaming            = True
                     mic_streaming         = AI_BACKEND == "gemini_live"
+                    trial_recorder.mic_streaming(mic_streaming, "start", connection_generation)
                     pcm_buffer           = bytearray()
                     vad_silent_chunks    = 0
                     vad_speech_chunks    = 0
@@ -2773,6 +3397,7 @@ async def ws_audio(ws: WebSocket):
                     if AI_BACKEND == "gemini_live":
                         print("[MIC] Stopped streaming")
                         mic_streaming = False
+                        trial_recorder.mic_streaming(False, "stop", connection_generation)
                         await _send_esp32_audio_text(ws, "OK:STOPPED")
                     else:
                         print("[MIC] Transcribing...")
@@ -2818,6 +3443,7 @@ async def ws_audio(ws: WebSocket):
                     # of the way (it would otherwise fire its own transcription
                     # off the same audio and double-dispatch commands).
                     if streaming and not is_playing_now():
+                        trial_recorder.note_audio(len(chunk))
                         # Firmware may aggregate two 20 ms chunks into one
                         # WebSocket frame. Normalize at ingress so queue age,
                         # Gemini pacing, and drop counters retain 20 ms units.
@@ -2910,8 +3536,13 @@ async def ws_audio(ws: WebSocket):
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
+        trial_recorder.error("ws_audio", e)
     finally:
         streaming  = False
+        if mic_streaming:
+            # Shared global: an old socket's finally can clear the flag the
+            # new socket just set (known race, recorded here, not fixed).
+            trial_recorder.mic_streaming(False, "socket_closed", connection_generation)
         mic_streaming = False
         pcm_buffer = None
         _emit_audio_health(force=True)
@@ -3008,6 +3639,41 @@ def _process_camera_frame_blocking(data: bytes):
     return (None, None)
 
 
+async def _gemini_image_pump_loop(holder: dict, event: asyncio.Event) -> None:
+    """Single-slot Gemini video feed shared by /ws/camera and /ws/camera_thermal."""
+    while True:
+        await event.wait()
+        event.clear()
+        data = holder["data"]
+        if data is None:
+            continue
+        if not trial_recorder.enabled:
+            try:
+                await gemini_live.send_image(
+                    data, turn_id=holder.get("turn"), sequence=holder.get("seq")
+                )
+            except Exception as e:
+                if DEBUG:
+                    print(f"[Gemini Live] send_image failed: {e}")
+            continue
+        turn_id = holder.get("turn")
+        seq = holder.get("seq")
+        received_at = holder.get("received_at")
+        sent = False
+        try:
+            sent = await gemini_live.send_image(
+                data, turn_id=turn_id, sequence=seq, source="pump"
+            )
+        except Exception as e:
+            trial_recorder.error("gemini_pump", e, turn_id)
+            if DEBUG:
+                print(f"[Gemini Live] send_image failed: {e}")
+        if sent:
+            trial_recorder.frame_sent(turn_id, seq, data, received_at, "pump")
+        else:
+            trial_recorder.frame_not_sent()
+
+
 # 1-byte type prefix used on the merged /ws/camera_thermal socket (see
 # ws_camera_thermal_esp below) — must match MSG_TYPE_CAM/MSG_TYPE_THERMAL in
 # compile.ino exactly.
@@ -3020,7 +3686,7 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
     (ws_camera_esp) and the merged /ws/camera_thermal (ws_camera_thermal_esp)
     so both stay on identical processing logic."""
     frame_counter += 1
-    latest_rgb.update(data, received_at)
+    rgb_frame = latest_rgb.update(data, received_at)
     recording_pipeline.enqueue_latest(data)
 
     # Cheap per-frame bookkeeping stays here; recording runs in the worker.
@@ -3042,6 +3708,11 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
         if now - _last_gemini_video_submit >= GEMINI_VIDEO_INTERVAL_SEC:
             _last_gemini_video_submit = now
             gemini_frame_holder["data"] = data
+            # Tag at hand-off: the turn and frame this was when chosen. Logged
+            # on every pump send so repeats are distinguishable from fresh frames.
+            gemini_frame_holder["turn"] = latency_tracker.active_turn_id
+            gemini_frame_holder["seq"] = rgb_frame.sequence
+            gemini_frame_holder["received_at"] = rgb_frame.timestamp
             gemini_frame_event.set()
 
     global _last_research_frame_sample
@@ -3086,15 +3757,7 @@ async def _handle_thermal_frame(data: bytes, thermal_frame_count: int) -> int:
     if ok and thermal_viewers:
         jpeg_bytes = enc.tobytes()
         stats = json.dumps({"max": float(frame.max()), "min": float(frame.min())})
-        dead = []
-        for viewer_ws in list(thermal_viewers):
-            try:
-                await viewer_ws.send_bytes(jpeg_bytes)
-                await viewer_ws.send_text(stats)
-            except Exception:
-                dead.append(viewer_ws)
-        for d in dead:
-            thermal_viewers.discard(d)
+        _viewer_publish(thermal_viewers, jpeg_bytes, stats)
     return thermal_frame_count
 
 
@@ -3187,14 +3850,7 @@ async def ws_camera_esp(ws: WebSocket):
 
             # Broadcast the annotated frame to browser viewers
             if out_jpeg and camera_viewers:
-                dead = []
-                for viewer_ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
-                    except Exception:
-                        dead.append(viewer_ws)
-                for d in dead:
-                    camera_viewers.discard(d)
+                _viewer_publish(camera_viewers, out_jpeg)
 
     processor_task = asyncio.create_task(_processor())
 
@@ -3208,17 +3864,7 @@ async def ws_camera_esp(ws: WebSocket):
     gemini_frame_event = asyncio.Event()
 
     async def _gemini_image_pump():
-        while True:
-            await gemini_frame_event.wait()
-            gemini_frame_event.clear()
-            data = gemini_frame_holder["data"]
-            if data is None:
-                continue
-            try:
-                await gemini_live.send_image(data)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[Gemini Live] send_image failed: {e}")
+        await _gemini_image_pump_loop(gemini_frame_holder, gemini_frame_event)
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
@@ -3369,15 +4015,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
             if jpeg_bytes is None:
                 continue
             thermal_frame_count += 1
-            dead = []
-            for viewer_ws in list(thermal_viewers):
-                try:
-                    await asyncio.wait_for(viewer_ws.send_bytes(jpeg_bytes), timeout=0.25)
-                    await asyncio.wait_for(viewer_ws.send_text(stats), timeout=0.25)
-                except Exception:
-                    dead.append(viewer_ws)
-            for viewer_ws in dead:
-                thermal_viewers.discard(viewer_ws)
+            _viewer_publish(thermal_viewers, jpeg_bytes, stats)
             latency_ms = (time.monotonic() - received_at) * 1000
             if thermal_frame_count == 1 or thermal_frame_count % 20 == 0:
                 print(
@@ -3429,14 +4067,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                     pass
 
             if out_jpeg and camera_viewers:
-                dead = []
-                for viewer_ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(viewer_ws.send_bytes(out_jpeg), timeout=0.25)
-                    except Exception:
-                        dead.append(viewer_ws)
-                for d in dead:
-                    camera_viewers.discard(d)
+                _viewer_publish(camera_viewers, out_jpeg)
 
     processor_task = asyncio.create_task(_processor())
 
@@ -3445,17 +4076,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     gemini_frame_event = asyncio.Event()
 
     async def _gemini_image_pump():
-        while True:
-            await gemini_frame_event.wait()
-            gemini_frame_event.clear()
-            data = gemini_frame_holder["data"]
-            if data is None:
-                continue
-            try:
-                await gemini_live.send_image(data)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[Gemini Live] send_image failed: {e}")
+        await _gemini_image_pump_loop(gemini_frame_holder, gemini_frame_event)
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
@@ -3534,6 +4155,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                         "sequence": imu_data["sequence"],
                         "data": imu_data,
                     })
+                    trial_recorder.imu_sample(latest_imu)
                     process_imu_and_maybe_store(imu_data)
                     imu_event.set()
                 elif msg_type == MSG_TYPE_STATUS:
@@ -3544,6 +4166,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         pass
     except Exception as e:
         print(f"[CAMERA-THERMAL ERROR] {e}")
+        trial_recorder.error("ws_camera_thermal", e)
     finally:
         canonicalizer_health_task.cancel()
         try:
@@ -3604,7 +4227,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 @app.websocket("/ws/viewer")
 async def ws_viewer(ws: WebSocket):
     await ws.accept()
-    camera_viewers.add(ws)
+    sender_task = _viewer_attach(ws, camera_viewers)
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
         while True:
@@ -3613,6 +4236,8 @@ async def ws_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[VIEWER] Browser disconnected", flush=True)
     finally:
+        sender_task.cancel()
+        _viewer_queues.pop(ws, None)
         try:
             camera_viewers.remove(ws)
         except Exception:
@@ -3685,7 +4310,7 @@ async def ws_thermal_esp(ws: WebSocket):
 @app.websocket("/ws/thermal_viewer")
 async def ws_thermal_viewer(ws: WebSocket):
     await ws.accept()
-    thermal_viewers.add(ws)
+    sender_task = _viewer_attach(ws, thermal_viewers)
     print(f"[THERMAL-VIEWER] Browser connected. Total viewers: {len(thermal_viewers)}", flush=True)
     try:
         while True:
@@ -3693,6 +4318,8 @@ async def ws_thermal_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[THERMAL-VIEWER] Browser disconnected", flush=True)
     finally:
+        sender_task.cancel()
+        _viewer_queues.pop(ws, None)
         thermal_viewers.discard(ws)
         print(f"[THERMAL-VIEWER] Removed. Total viewers: {len(thermal_viewers)}", flush=True)
 
@@ -3903,18 +4530,14 @@ class UDPProto(asyncio.DatagramProtocol):
 
 # === New: register a send callback for bridge_io (broadcast JPEG to /ws/viewer) ===
 @app.on_event("startup")
-async def startup_yolo_shadow():
-    await yolo_client.start()
-
-
-@app.on_event("startup")
-async def startup_hand_tracking():
-    await hand_client.start()
-
-
-@app.on_event("startup")
 async def startup_research_exporter():
     await research_exporter.start()
+
+
+@app.on_event("startup")
+async def startup_trial_recorder():
+    await trial_recorder.start()
+    _schedule_pending_trial_uploads()
 
 
 @app.on_event("startup")
@@ -3936,19 +4559,7 @@ async def on_startup_register_bridge_sender():
                 if DEBUG: print("[YOLOMEDIA] Starting to send processed frames", flush=True)
             
             async def _broadcast():
-                if not camera_viewers:
-                    return
-                dead = []
-                for ws in list(camera_viewers):
-                    try:
-                        await asyncio.wait_for(ws.send_bytes(jpeg_bytes), timeout=0.25)
-                    except Exception as e:
-                        dead.append(ws)
-                for ws in dead:
-                    try:
-                        camera_viewers.remove(ws)
-                    except Exception:
-                        pass
+                _viewer_publish(camera_viewers, jpeg_bytes)
             
             # Use the saved main-thread event loop
             future = asyncio.run_coroutine_threadsafe(_broadcast(), main_loop)
@@ -4025,6 +4636,62 @@ async def startup_gemini():
     # gemini_regular/qwen don't touch Gemini Live at all — they use local
     # Whisper ASR instead (see the AI_BACKEND != "gemini_live" branch above).
 
+
+async def _gemini_keepalive_loop() -> None:
+    """Sends an occasional idle-time video frame so the Gemini Live session
+    never sits long enough to hit its ~150s no-activity close (code 1008).
+
+    Only fires when there's genuinely nothing else going on: no active turn,
+    and no real send (audio/image/text) in the last GEMINI_KEEPALIVE_INTERVAL_SEC.
+    Tagged source="keepalive" end to end (GEMINI-TIMING lines, this print) so
+    it's never mistaken for a real vision send. It also never touches
+    latency_tracker or _vision_frame_sequence_for_turn — those are only set
+    from _on_input_transcription's own pre_response vision send — so a
+    keepalive frame structurally cannot show up as a turn's gemini_rgb_frame_id
+    or any other per-turn telemetry field.
+    """
+    last_sequence: Optional[int] = None
+    consecutive_repeats = 0
+    while True:
+        await asyncio.sleep(5.0)
+        if AI_BACKEND != "gemini_live":
+            continue
+        if not gemini_live.connected:
+            continue
+        if gemini_live.has_active_turn():
+            continue
+        if gemini_live.seconds_since_last_activity() < GEMINI_KEEPALIVE_INTERVAL_SEC:
+            continue
+        frame = latest_rgb.snapshot()
+        if frame.data is None:
+            continue
+        sent = await gemini_live.send_image(
+            frame.data, sequence=frame.sequence, source="keepalive"
+        )
+        if sent:
+            trial_recorder.frame_sent(None, frame.sequence, frame.data, frame.timestamp, "keepalive")
+        # A climbing count means the camera has stopped and the same frozen
+        # frame is being resent (0 = a different frame from the previous keepalive).
+        consecutive_repeats = consecutive_repeats + 1 if frame.sequence == last_sequence else 0
+        last_sequence = frame.sequence
+        frame_age_sec = max(0.0, time.monotonic() - frame.timestamp)
+        print(
+            f"[GEMINI-KEEPALIVE] sent={sent} bytes={len(frame.data)} "
+            f"sequence={frame.sequence} consecutive_repeats={consecutive_repeats} "
+            f"frame_age_sec={frame_age_sec:.1f}",
+            flush=True,
+        )
+
+
+@app.on_event("startup")
+async def startup_gemini_keepalive():
+    global _gemini_keepalive_task
+    if AI_BACKEND == "gemini_live" and (
+        _gemini_keepalive_task is None or _gemini_keepalive_task.done()
+    ):
+        _gemini_keepalive_task = asyncio.create_task(_gemini_keepalive_loop())
+
+
 @app.on_event("startup")
 async def on_startup():
     if STABILITY_MODE:
@@ -4037,10 +4704,8 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     """Clean up resources when the application shuts down."""
-    global _tts_sender_task
+    global _tts_sender_task, _gemini_keepalive_task
     print("[SHUTDOWN] Starting resource cleanup...")
-    await hand_client.stop()
-    await yolo_client.stop()
     await research_exporter.stop()
     await recording_pipeline.stop()
     await recording_audio_pipeline.stop()
@@ -4068,6 +4733,18 @@ async def on_shutdown():
         except asyncio.CancelledError:
             pass
         _tts_sender_task = None
+
+    if _gemini_keepalive_task is not None:
+        _gemini_keepalive_task.cancel()
+        try:
+            await _gemini_keepalive_task
+        except asyncio.CancelledError:
+            pass
+        _gemini_keepalive_task = None
+
+    # Last, so the interrupted turn above is flushed. The trial stays open:
+    # the next process resumes it from /data/trials/current.json.
+    await trial_recorder.stop()
 
     print("[SHUTDOWN] Resource cleanup complete")
 

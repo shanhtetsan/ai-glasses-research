@@ -134,12 +134,9 @@ test('stale hand state clears independently from object freshness', () => {
   }, 100, 3000), true);
 });
 
-test('Hands and Objects controls are independent and add no browser transform', async () => {
+test('viewer no longer polls removed detector endpoints and overlay adds no browser transform', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('static/main.js', 'utf8'));
-  assert.match(source, /let objectsEnabled = true;/);
-  assert.match(source, /let handsEnabled = true;/);
-  assert.match(source, /objectsToggle\.onclick/);
-  assert.match(source, /handsToggle\.onclick/);
+  assert.doesNotMatch(source, /\/api\/perception\//);
   const overlaySource = await import('node:fs/promises').then(
     fs => fs.readFile('static/perception_overlay.mjs', 'utf8'),
   );

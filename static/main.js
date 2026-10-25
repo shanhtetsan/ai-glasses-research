@@ -1,10 +1,6 @@
 // static/main.js
 import {
   containRect,
-  drawHandLandmarks,
-  drawObjectDetections,
-  isHandResultFresh,
-  isPerceptionFresh,
   resizeOverlayCanvas,
   thermalCalibrationRect,
 } from './perception_overlay.mjs';
@@ -26,30 +22,11 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
   const overlayCanvas = document.getElementById('overlayCanvas');
-  const overlayCtx = overlayCanvas.getContext('2d');
-  const objectsToggle = document.getElementById('objectsToggle');
-  const handsToggle = document.getElementById('handsToggle');
-  const yoloState = document.getElementById('yoloState');
-  const yoloObjects = document.getElementById('yoloObjects');
-  const yoloInference = document.getElementById('yoloInference');
-  const handState = document.getElementById('handState');
-  const handCount = document.getElementById('handCount');
-  const handInference = document.getElementById('handInference');
   const thermalCanvas = document.getElementById('thermalCanvas');
   const thermalCtx    = thermalCanvas.getContext('2d');
   const thermalAlignToggle = document.getElementById('thermalAlignRgb');
   let rgbFrameWidth = 0;
   let rgbFrameHeight = 0;
-  const PERCEPTION_POLL_MS = 1000;
-  const PERCEPTION_MAX_DISPLAY_AGE_MS = 3000;
-  const HAND_POLL_MS = 333;
-  const HAND_MAX_DISPLAY_AGE_MS = 1500;
-  let objectsEnabled = true;
-  let handsEnabled = true;
-  let latestPerception = null;
-  let perceptionReceivedAt = 0;
-  let latestHands = null;
-  let handsReceivedAt = 0;
   let thermalCalibration = {
     calibration_offset_x: 0,
     calibration_offset_y: 0,
@@ -286,7 +263,6 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     if (canvas.height !== backingHeight) canvas.height = backingHeight;
     resizeOverlayCanvas(overlayCanvas, fitted.width, fitted.height, dpr);
     applyThermalAlignment(fitted);
-    renderPerception();
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
   window.addEventListener('thermalcalibrationchange', event => {
@@ -306,7 +282,6 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   let wsCam, wsUI, wsThermal, thermalReconnectTimer, frames = 0, fpsTimer = 0;
   let cameraGeneration = 0;
   let freshnessTimer, backendFreshnessTimer, audioFreshnessTimer;
-  let perceptionPollTimer, handPollTimer, perceptionRenderTimer;
 
   function setAudioState(snapshot){
     const badge = audioBadgePresentation(snapshot);
@@ -346,103 +321,6 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   }
 
   let rgbFreshness;
-
-  function renderPerception(){
-    const rect = overlayCanvas.getBoundingClientRect();
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
-    overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
-    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    const elapsed = perceptionReceivedAt ? performance.now() - perceptionReceivedAt : 0;
-    const fresh = isPerceptionFresh(
-      latestPerception,
-      elapsed,
-      PERCEPTION_MAX_DISPLAY_AGE_MS,
-    );
-    if (objectsEnabled && fresh) {
-      drawObjectDetections(
-        overlayCtx,
-        latestPerception.objects,
-        {width: rect.width, height: rect.height},
-      );
-    }
-    const handElapsed = handsReceivedAt ? performance.now() - handsReceivedAt : 0;
-    const handsFresh = isHandResultFresh(
-      latestHands,
-      handElapsed,
-      HAND_MAX_DISPLAY_AGE_MS,
-    );
-    if (handsEnabled && handsFresh) {
-      drawHandLandmarks(
-        overlayCtx,
-        latestHands.hands,
-        {width: rect.width, height: rect.height},
-      );
-    }
-
-    const enabled = latestPerception ? latestPerception.enabled : true;
-    const healthy = latestPerception && latestPerception.service_healthy;
-    yoloState.textContent = !enabled
-      ? 'YOLO: disabled'
-      : fresh ? (healthy === false ? 'YOLO: degraded' : 'YOLO: healthy')
-        : latestPerception && latestPerception.stale ? 'YOLO: stale' : 'YOLO: waiting';
-    yoloObjects.textContent = `Objects: ${fresh ? latestPerception.objects.length : 0}`;
-    yoloInference.textContent = fresh
-      ? `Inference: ${Math.round(latestPerception.inference_ms)} ms`
-      : 'Inference: --';
-
-    const handFeatureEnabled = latestHands ? latestHands.enabled : true;
-    const handHealthy = latestHands && latestHands.service_healthy;
-    handState.textContent = !handFeatureEnabled
-      ? 'Hands: disabled'
-      : handsFresh ? (handHealthy === false ? 'Hands: degraded' : 'Hands: healthy')
-        : latestHands && latestHands.stale ? 'Hands: stale' : 'Hands: waiting';
-    handCount.textContent = `Hands: ${handsFresh ? latestHands.hands.length : 0}`;
-    handInference.textContent = handsFresh
-      ? `Hand inference: ${Math.round(latestHands.inference_ms)} ms`
-      : 'Hand inference: --';
-  }
-
-  async function refreshPerception(){
-    try {
-      const response = await fetch('/api/perception/latest', {cache: 'no-store'});
-      if (!response.ok) throw new Error(`http_${response.status}`);
-      latestPerception = await response.json();
-      perceptionReceivedAt = performance.now();
-    } catch (_error) {
-      latestPerception = null;
-      perceptionReceivedAt = 0;
-    }
-    renderPerception();
-  }
-
-  async function refreshHands(){
-    try {
-      const response = await fetch('/api/perception/hands/latest', {cache: 'no-store'});
-      if (!response.ok) throw new Error(`http_${response.status}`);
-      latestHands = await response.json();
-      handsReceivedAt = performance.now();
-    } catch (_error) {
-      latestHands = null;
-      handsReceivedAt = 0;
-    }
-    renderPerception();
-  }
-
-  objectsToggle.onclick = ()=>{
-    objectsEnabled = !objectsEnabled;
-    objectsToggle.textContent = `Objects: ${objectsEnabled ? 'ON' : 'OFF'}`;
-    objectsToggle.classList.toggle('active', objectsEnabled);
-    renderPerception();
-  };
-
-  handsToggle.onclick = ()=>{
-    handsEnabled = !handsEnabled;
-    handsToggle.textContent = `Hands: ${handsEnabled ? 'ON' : 'OFF'}`;
-    handsToggle.classList.toggle('active', handsEnabled);
-    renderPerception();
-  };
 
   function noteRenderedFrame(){
     rgbFreshness.frameRendered();
@@ -629,9 +507,6 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
     clearInterval(freshnessTimer);
     clearInterval(backendFreshnessTimer);
     clearInterval(audioFreshnessTimer);
-    clearInterval(perceptionPollTimer);
-    clearInterval(handPollTimer);
-    clearInterval(perceptionRenderTimer);
     clearTimeout(thermalReconnectTimer);
     window.removeEventListener('resize', fitCanvas);
     document.body.classList.remove('thermal-align-rgb');
@@ -654,16 +529,11 @@ import {audioBadgePresentation} from './audio_freshness.mjs';
   connectCamera();
   connectASR();
   connectThermal();
-  refreshPerception();
-  refreshHands();
   refreshCameraBackendFreshness();
   refreshAudioFreshness();
   freshnessTimer = setInterval(()=>rgbFreshness.tick(), RGB_FRESHNESS_CHECK_MS);
   backendFreshnessTimer = setInterval(refreshCameraBackendFreshness, RGB_BACKEND_CHECK_MS);
   audioFreshnessTimer = setInterval(refreshAudioFreshness, 1000);
-  perceptionPollTimer = setInterval(refreshPerception, PERCEPTION_POLL_MS);
-  handPollTimer = setInterval(refreshHands, HAND_POLL_MS);
-  perceptionRenderTimer = setInterval(renderPerception, 250);
   window.addEventListener('pagehide', cleanupViewer);
 })();
 

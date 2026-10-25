@@ -30,6 +30,7 @@ openai==1.3.5  # For DashScope compatibility mode
 
 # Environment & Configuration
 python-dotenv==1.0.0
+boto3>=1.35,<2  # Cloudflare R2 trial archive (S3-compatible API)
 
 # Utilities
 opencv-contrib-python==4.8.1.78  # Extended OpenCV modules

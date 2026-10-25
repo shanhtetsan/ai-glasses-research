@@ -237,6 +237,7 @@ class LatencyTracker:
         "last_microphone_chunk_received",
         "speech_end_detected",
         "first_input_transcription",
+        "vision_frame_selected",
         "first_gemini_audio_received",
         "first_tts_chunk_queued",
         "tts_start_sent",
@@ -303,6 +304,7 @@ class LatencyTracker:
             "device_metrics": None,
             "audio_integrity_degraded": False,
             "mic_loss": None,
+            "perception": None,
         }
 
     def start_turn(
