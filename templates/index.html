@@ -27,6 +27,7 @@
     background:transparent; border:1px solid var(--line); color:var(--muted);
     font-size:13px; font-weight:600; padding:6px 16px; border-radius:999px; cursor:pointer;
   }
+  a.vtab{text-decoration:none; display:inline-flex; align-items:center}
   .vtab.active{background:var(--accent); border-color:var(--accent); color:#fff}
   .statusbar{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
   .chip{
@@ -256,6 +257,7 @@
   <div class="viewtabs">
     <button class="vtab active" id="tabSession">Session</button>
     <button class="vtab" id="tabDiag">Diagnostics</button>
+    <a class="vtab" id="tabTrials" href="/trials">Trials</a>
   </div>
   <div class="statusbar">
     <span class="chip" id="camStatus">camera</span>
