@@ -30,6 +30,9 @@ python-multipart
 # websockets>=13.0.0,<17.0, anyio>=4.8.0,<5.0.0, httpx>=0.28.1,<1.0.0.
 google-genai==2.10.0
 
+# Cloudflare R2 trial archive (S3-compatible API)
+boto3>=1.35,<2
+
 # Camera pipeline (JPEG decode/encode) — headless build, no GUI libs
 opencv-python-headless==4.8.1.78
 numpy==1.24.3

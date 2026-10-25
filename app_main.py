@@ -66,7 +66,7 @@ except ImportError as e:
     YOLO = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response, RedirectResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -586,6 +586,7 @@ async def _on_audio(pcm24k: bytes):
         _log_gemini_timing(
             "on_audio_begin", turn_id, bytes=len(pcm24k)
         )
+        trial_recorder.prompt_sent(turn_id)
 
     _mark_gemini_playing()
 
@@ -638,19 +639,21 @@ async def _on_input_transcription(text: str):
     if (
         not _vision_submitted_for_turn
         and not _vision_declined_for_turn
-        and (wants_vision or wants_thermal)
+        and (wants_vision or wants_thermal or PIN_FRAME_EVERY_TURN)
     ):
-        _log_gemini_timing(
-            "vision_intent_detected",
-            turn_id,
-            thermal_intent="yes" if wants_thermal else "no",
-        )
+        if wants_vision or wants_thermal:
+            _log_gemini_timing(
+                "vision_intent_detected",
+                turn_id,
+                thermal_intent="yes" if wants_thermal else "no",
+            )
         frame = latest_rgb.snapshot()
         frame_age_ms = max(0.0, (time.monotonic() - frame.timestamp) * 1000)
-        # Only vision turns treat a stale frame as unavailable; thermal-only
-        # turns keep submitting whatever latest_rgb holds, as before.
+        # Only thermal-only turns may submit a stale frame, as before. Vision
+        # turns and pinned turns require a fresh one.
+        thermal_only = _thermal_intent_for_turn and not _vision_intent_for_turn
         frame_unavailable = frame.data is None or (
-            _vision_intent_for_turn
+            not thermal_only
             and frame_age_ms > VISION_FRAME_MAX_AGE_SEC * 1000
         )
         if frame.data is None:
@@ -678,10 +681,16 @@ async def _on_input_transcription(text: str):
                 sequence=frame.sequence,
                 source="pre_response",
             )
+            if _vision_submitted_for_turn:
+                trial_recorder.frame_sent(
+                    turn_id, frame.sequence, frame.data, frame.timestamp, "pre_response"
+                )
             print(
                 f"[VISION] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} pre-response latest_rgb sequence={frame.sequence} "
-                f"submitted={_vision_submitted_for_turn}",
+                f"submitted={_vision_submitted_for_turn} "
+                f"vision_intent={str(_vision_intent_for_turn).lower()} "
+                f"pinned={str(PIN_FRAME_EVERY_TURN and not (wants_vision or wants_thermal)).lower()}",
                 flush=True,
             )
         elif _vision_intent_for_turn:
@@ -716,11 +725,14 @@ async def _on_input_transcription(text: str):
         if facts is None:
             print("[THERMAL] no recent thermal frame; facts not submitted", flush=True)
         else:
+            thermal_text = "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":"))
             _thermal_submitted_for_turn = await gemini_live.send_text(
-                "THERMAL_MEASUREMENTS " + json.dumps(facts, separators=(",", ":")),
+                thermal_text,
                 turn_id=turn_id,
                 source="thermal_facts",
             )
+            if _thermal_submitted_for_turn:
+                trial_recorder.note_thermal_text(turn_id, thermal_text)
             print(
                 f"[THERMAL] generation={gemini_live.session_generation} "
                 f"turn_id={turn_id} facts submitted "
@@ -1020,6 +1032,16 @@ from stability_runtime import (
     PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
+from trial_recorder import TrialRecorder
+from trial_scorer import TrialScoringError, score_trial_folder
+from trial_archive import TrialArchive, TrialArchiveError, TrialNotFound
+from trial_storage import (
+    UPLOAD_RECEIPT,
+    TrialStorageError,
+    TrialStorageUnavailable,
+    build_r2_storage,
+    write_upload_receipt,
+)
 from research_exporter import (
     DEFAULT_SESSION_STATE_PATH, DEFAULT_SESSION_TTL_SEC,
     ResearchExporter, ResearchExporterSettings, SessionGate,
@@ -1060,6 +1082,179 @@ research_exporter = ResearchExporter(
 
 latency_tracker = LatencyTracker(history_size=200)
 latency_tracker = LatencyTracker(history_size=200, on_event=research_exporter.publish_event)
+
+
+# ---- Trial recorder (TRIAL_RECORDER=1; inert otherwise) ----
+# Append-only per-trial log under /data/trials. All hooks below are sync
+# put_nowait calls; disk I/O happens in trial_recorder's writer thread.
+def _trial_thermal_summary(matrix, age_sec, calibration):
+    facts = summarize_thermal_grid(matrix, age_sec, THERMAL_CENTER_FRACTION)
+    if facts is None:
+        return None
+    norm = (facts.get("hotspot") or {}).get("thermal_norm")
+    if isinstance(norm, list) and len(norm) == 2 and calibration:
+        mapped = map_thermal_to_rgb_normalized(norm[0], norm[1], **calibration)
+        facts["hotspot"]["rgb_norm_coarse"] = [round(v, 6) for v in mapped]
+    return facts
+
+
+def _trial_static_fields() -> dict:
+    import hashlib
+    import gemini_live_client as _glc
+    prompt_sha = hashlib.sha256(
+        _glc.SMART_GLASSES_SYSTEM_INSTRUCTION.encode("utf-8")
+    ).hexdigest()
+    return {
+        "model": _glc.GEMINI_LIVE_MODEL,
+        "prompt_sha256": prompt_sha,
+        "git_sha": os.getenv("GIT_SHA", "").strip() or "unknown",
+        "prompt_version_default": os.getenv("PROMPT_VERSION", "").strip() or f"sha-{prompt_sha[:8]}",
+    }
+
+
+def _trial_thermal_snapshot():
+    """Cheap reference grab at speech_start; facts are computed in the writer."""
+    matrix = latest_thermal_matrix
+    if matrix is None:
+        return None
+    calibration = {
+        "offset_x": thermal_display_config["calibration_offset_x"],
+        "offset_y": thermal_display_config["calibration_offset_y"],
+        "scale_x": thermal_display_config["calibration_scale_x"],
+        "scale_y": thermal_display_config["calibration_scale_y"],
+    }
+    return (matrix, latest_thermal.snapshot().timestamp, calibration)
+
+
+_trial_score_tasks: Set[asyncio.Task] = set()
+_trial_score_locks: Dict[str, asyncio.Lock] = {}
+_trial_upload_tasks: Set[asyncio.Task] = set()
+_trial_upload_locks: Dict[str, asyncio.Lock] = {}
+
+try:
+    trial_object_storage = build_r2_storage()
+except TrialStorageUnavailable as exc:
+    trial_object_storage = None
+    print(f"[TRIAL-UPLOAD] disabled: {exc}", flush=True)
+
+
+async def _score_closed_trial(session_id: str, directory: str) -> dict:
+    lock = _trial_score_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        # The close record is queued before the lifecycle callback. Waiting on
+        # the recorder queue ensures session_end and the last JPEG are durable.
+        await trial_recorder.flush()
+        return await asyncio.to_thread(score_trial_folder, directory)
+
+
+async def _auto_score_closed_trial(session_id: str, directory: str) -> None:
+    try:
+        result = await _score_closed_trial(session_id, directory)
+        print(f"[TRIAL-SCORE] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
+    except Exception as exc:
+        # Scoring is derived and retryable. Never compromise the source log or
+        # session close when an API call or local write fails.
+        print(f"[TRIAL-SCORE] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+        return
+    if trial_object_storage is not None:
+        try:
+            await _upload_scored_trial(session_id, directory)
+        except Exception as exc:
+            # The missing receipt causes this local folder to be retried at the
+            # next startup; source evidence is never removed on upload failure.
+            print(f"[TRIAL-UPLOAD] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+
+
+def _schedule_trial_score(session_id: str, directory: str) -> None:
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _auto_score_closed_trial(session_id, directory),
+            name=f"trial-score-{session_id}",
+        )
+    except RuntimeError as exc:
+        print(f"[TRIAL-SCORE] could not schedule id={session_id}: {exc}", flush=True)
+        return
+    _trial_score_tasks.add(task)
+    task.add_done_callback(_trial_score_tasks.discard)
+
+
+def _validated_trial_directory(session_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", session_id):
+        raise TrialStorageError("invalid trial id")
+    root = os.path.realpath(trial_recorder.root)
+    directory = os.path.realpath(os.path.join(root, session_id))
+    if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
+        raise TrialStorageError("trial not found")
+    return directory
+
+
+def _assert_trial_ready_for_upload(directory: str) -> None:
+    required = ("session.jsonl", "meta.json", "ground_truth.json", "scores.jsonl", "scores.csv", "summary.json")
+    missing = [name for name in required if not os.path.isfile(os.path.join(directory, name))]
+    if missing:
+        raise TrialStorageError("trial has not finished scoring; missing " + ", ".join(missing))
+    with open(os.path.join(directory, "session.jsonl"), encoding="utf-8") as handle:
+        closed = any(
+            json.loads(line).get("t") == "session_end"
+            for line in handle if line.strip()
+        )
+    if not closed:
+        raise TrialStorageError("trial is still open")
+
+
+async def _upload_scored_trial(session_id: str, directory: Optional[str] = None) -> dict:
+    if trial_object_storage is None:
+        raise TrialStorageUnavailable("R2 storage is not configured")
+    directory = directory or _validated_trial_directory(session_id)
+    if trial_recorder.status().get("session_id") == session_id:
+        raise TrialStorageError("trial is still open")
+    lock = _trial_upload_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        await asyncio.to_thread(_assert_trial_ready_for_upload, directory)
+        manifest = await asyncio.to_thread(trial_object_storage.put_folder, directory)
+        await asyncio.to_thread(write_upload_receipt, directory, manifest)
+        result = {key: value for key, value in manifest.items() if key != "objects"}
+        print(f"[TRIAL-UPLOAD] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
+        return result
+
+
+async def _auto_upload_scored_trial(session_id: str, directory: str) -> None:
+    try:
+        await _upload_scored_trial(session_id, directory)
+    except Exception as exc:
+        print(f"[TRIAL-UPLOAD] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+
+
+def _schedule_trial_upload(session_id: str, directory: str) -> None:
+    task = asyncio.get_running_loop().create_task(
+        _auto_upload_scored_trial(session_id, directory), name=f"trial-upload-{session_id}"
+    )
+    _trial_upload_tasks.add(task)
+    task.add_done_callback(_trial_upload_tasks.discard)
+
+
+def _schedule_pending_trial_uploads() -> None:
+    if not trial_recorder.enabled or trial_object_storage is None or not os.path.isdir(trial_recorder.root):
+        return
+    for name in os.listdir(trial_recorder.root):
+        directory = os.path.join(trial_recorder.root, name)
+        if (
+            os.path.isdir(directory)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", name)
+            and os.path.isfile(os.path.join(directory, "summary.json"))
+            and not os.path.isfile(os.path.join(directory, UPLOAD_RECEIPT))
+            and trial_recorder.status().get("session_id") != name
+        ):
+            _schedule_trial_upload(name, directory)
+
+
+trial_recorder = TrialRecorder(
+    thermal_summarizer=_trial_thermal_summary,
+    static_fields=_trial_static_fields,
+    on_session_ended=_schedule_trial_score,
+)
+trial_archive = TrialArchive(trial_recorder.root, trial_object_storage)
+gemini_live.on_session_opened = trial_recorder.session_rotate
 audio_freshness_tracker = AudioFreshnessTracker(
     stale_after_ms=float(os.getenv("AUDIO_STALE_AFTER_MS", "500")),
     recent_window_sec=2.0,
@@ -1136,6 +1331,11 @@ thermal_display_config: Dict[str, Any] = {
     "calibration_scale_y": 1.0,
 }
 VISION_FRAME_MAX_AGE_SEC = float(os.getenv("VISION_FRAME_MAX_AGE_SEC", "3.0"))
+# Pin the latest fresh frame (source=pre_response) on every turn, not only on
+# turns matching _VISION_PHRASES. Without it Gemini answers spatial follow-ups
+# ("what side is the bottle") from conversation history instead of the camera.
+# is_explicit_vision_request() stays as the logged vision_intent signal.
+PIN_FRAME_EVERY_TURN = env_bool("PIN_FRAME_EVERY_TURN", True)
 VISION_MIN_INTERVAL_SEC = float(os.getenv("VISION_MIN_INTERVAL_SEC", "2.0"))
 
 camera_viewers: Set[WebSocket] = set()
@@ -1298,6 +1498,7 @@ async def _finalize_latency_turn(status: str, turn_id: int) -> None:
     record["session_id"] = session_id
     record["session_label"] = session_label
     print("[LATENCY] " + json.dumps(record, separators=(",", ":")), flush=True)
+    trial_recorder.turn_end(turn_id, record, gemini_live.session_generation)
     if os.getenv("LATENCY_LOG_CSV", "").strip():
         asyncio.create_task(_append_latency_csv_safely(record))
     if _turn_telemetry_enabled:
@@ -2252,6 +2453,273 @@ async def session_stop():
     return JSONResponse({"stopped": True})
 
 
+def _trial_auth_failed(request: Request) -> Optional[JSONResponse]:
+    """If TRIAL_TOKEN is set, /internal/trial* require a matching X-Trial-Token."""
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected:
+        return None
+    supplied = request.headers.get("x-trial-token", "")
+    if hmac.compare_digest(supplied, expected):
+        return None
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+async def _set_trial_safely(payload: Any, reason: str) -> Optional[dict]:
+    try:
+        if not isinstance(payload, dict):
+            raise ValueError("trial payload must be a JSON object")
+        ground_truth = payload.get("ground_truth")
+        if ground_truth is not None and not isinstance(ground_truth, dict):
+            raise ValueError("ground_truth must be a JSON object")
+        return await trial_recorder.set_trial(payload, ground_truth, reason=reason)
+    except Exception as exc:
+        print(f"[TRIAL] set_trial failed reason={reason} error={exc}", flush=True)
+        trial_recorder.error("set_trial", exc)
+        return None
+
+
+@app.get("/internal/trial")
+async def trial_status():
+    return JSONResponse(trial_recorder.status())
+
+
+@app.post("/internal/trial")
+async def trial_set(request: Request):
+    """Set trial metadata (and optional ground_truth) before a run.
+
+    Body: {"trial","pid","site","cond","task","success_criterion",
+    "prompt_version"?, "ground_truth"?}. Posting the same trial+pid again
+    resumes that session; a different one closes the current session first.
+    """
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    ground_truth = payload.get("ground_truth")
+    if ground_truth is not None and not isinstance(ground_truth, dict):
+        return JSONResponse({"error": "ground_truth must be a JSON object"}, status_code=400)
+    try:
+        status = await trial_recorder.set_trial(payload, ground_truth, reason="internal_trial")
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(status)
+
+
+@app.post("/internal/trial/end")
+async def trial_end(request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    ended = trial_recorder.end_session(reason="internal_end")
+    return JSONResponse({"ended": ended, **trial_recorder.status()})
+
+
+@app.post("/internal/trial/{trial_id}/score")
+async def trial_score(trial_id: str, request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", trial_id):
+        return JSONResponse({"error": "invalid trial id"}, status_code=400)
+    if trial_recorder.status().get("session_id") == trial_id:
+        return JSONResponse({"error": "trial is still open"}, status_code=409)
+    root = os.path.realpath(trial_recorder.root)
+    directory = os.path.realpath(os.path.join(root, trial_id))
+    if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    try:
+        result = await _score_closed_trial(trial_id, directory)
+    except TrialScoringError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        print(f"[TRIAL-SCORE] failed id={trial_id} error={type(exc).__name__}: {exc}", flush=True)
+        return JSONResponse({"error": "trial scoring failed"}, status_code=502)
+    if trial_object_storage is not None:
+        try:
+            result["upload"] = await _upload_scored_trial(trial_id, directory)
+        except Exception as exc:
+            result["upload"] = {"status": "failed", "error": str(exc)[:300]}
+    else:
+        result["upload"] = {"status": "not_configured"}
+    return JSONResponse(result)
+
+
+@app.post("/internal/trial/{trial_id}/upload")
+async def trial_upload(trial_id: str, request: Request):
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    if trial_object_storage is None:
+        return JSONResponse({"error": "R2 storage is not configured"}, status_code=409)
+    try:
+        directory = _validated_trial_directory(trial_id)
+        result = await _upload_scored_trial(trial_id, directory)
+    except TrialStorageError as exc:
+        status = 404 if str(exc) == "trial not found" else 422
+        return JSONResponse({"error": str(exc)}, status_code=status)
+    return JSONResponse(result)
+
+
+_TRIAL_COOKIE = "trial_token"
+
+
+def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
+    """Fail-closed auth for every team-facing trial data route."""
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected:
+        return JSONResponse({"error": "trial viewer is not configured"}, status_code=401)
+    authorization = request.headers.get("authorization", "")
+    bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    supplied = (
+        request.headers.get("x-trial-token", "")
+        or bearer
+        or request.cookies.get(_TRIAL_COOKIE, "")
+        or request.query_params.get("token", "")
+    )
+    if supplied and hmac.compare_digest(supplied, expected):
+        return None
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+@app.get("/api/trials")
+async def trial_list_api(request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        rows = await asyncio.to_thread(trial_archive.list_trials)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse({"trials": rows})
+
+
+@app.get("/api/trials/{trial_id}")
+async def trial_detail_api(trial_id: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        detail = await asyncio.to_thread(trial_archive.get_trial, trial_id)
+    except TrialNotFound:
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(detail)
+
+
+@app.get("/trials/{trial_id}/frames/{seq}.jpg")
+async def trial_frame(trial_id: str, seq: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    if not re.fullmatch(r"[0-9]+(?:_[0-9]+)?", seq):
+        return JSONResponse({"error": "frame not found"}, status_code=404)
+    try:
+        body, _, _ = await asyncio.to_thread(trial_archive.get_bytes, trial_id, f"frames/{seq}.jpg")
+    except TrialNotFound:
+        return JSONResponse({"error": "frame not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return Response(body, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/trials/{trial_id}.zip")
+async def trial_zip(trial_id: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        body = await asyncio.to_thread(trial_archive.zip_bytes, trial_id)
+    except TrialNotFound:
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    except (TrialArchiveError, TrialStorageError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return Response(
+        body,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{trial_id}.zip"'},
+    )
+
+
+_TRIAL_DENIED_PAGE = """<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Trial Archive</title>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:0 16px;line-height:1.5">
+<h1 style="font-size:20px">Trial Archive is private</h1>
+<p>Open this page once as <code>/trials?token=&lt;TRIAL_TOKEN&gt;</code>. The token is kept in a
+cookie for 12 hours and removed from the address bar.</p></body>"""
+
+
+def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        # Same 401 as the API, but readable for someone who clicked the Trials tab.
+        return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
+    supplied_in_query = request.query_params.get("token", "")
+    if supplied_in_query:
+        expected = os.getenv("TRIAL_TOKEN", "")
+        if not expected or not hmac.compare_digest(supplied_in_query, expected):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        clean_path = "/trials" if trial_id is None else f"/trials/{trial_id}"
+        response = RedirectResponse(clean_path, status_code=303)
+        response.set_cookie(
+            _TRIAL_COOKIE,
+            supplied_in_query,
+            max_age=12 * 60 * 60,
+            secure=request.url.scheme == "https",
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+    try:
+        with open("templates/trial_viewer.html", encoding="utf-8") as handle:
+            content = handle.read()
+        # Version the viewer assets by mtime so a deploy never serves stale JS/CSS.
+        for asset in ("trial_viewer.js", "trial_viewer.css"):
+            version = int(os.path.getmtime(os.path.join("static", asset)))
+            content = content.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+    except OSError:
+        return JSONResponse({"error": "trial viewer template unavailable"}, status_code=500)
+    return HTMLResponse(content, headers={
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; img-src 'self' data:; "
+            "script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        ),
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.get("/trials", response_class=HTMLResponse)
+async def trial_list_page(request: Request):
+    return _trial_viewer_page(request)
+
+
+@app.get("/trials/{trial_id}", response_class=HTMLResponse)
+async def trial_detail_page(trial_id: str, request: Request):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", trial_id):
+        return JSONResponse({"error": "trial not found"}, status_code=404)
+    return _trial_viewer_page(request, trial_id)
+
+
 class ResearchSessionCommand(BaseModel):
     active: bool
     session_id: Optional[str] = None
@@ -2879,7 +3347,12 @@ async def ws_audio(ws: WebSocket):
                         await _finalize_latency_turn("interrupted", active_turn_id)
                     if active_turn_id != turn_id:
                         _clear_gemini_turn_state("speech_start")
-                    _start_turn(turn_id)
+                    server_turn_id = _start_turn(turn_id)
+                    if trial_recorder.enabled:
+                        trial_recorder.speech_start(
+                            turn_id, server_turn_id,
+                            _trial_thermal_snapshot(), dict(latest_imu),
+                        )
                     continue
 
                 if raw.startswith("SPEECH_END:"):
@@ -2890,12 +3363,25 @@ async def ws_audio(ws: WebSocket):
                     if latency_tracker.active_turn_id is None:
                         _start_turn(turn_id)
                     latency_tracker.mark("speech_end_detected", turn_id)
+                    trial_recorder.speech_end(turn_id, latency_tracker.active_turn_id)
                     continue
 
-                if cmd == "START":
+                if cmd == "START" or (trial_recorder.enabled and cmd.startswith("START:")):
+                    if trial_recorder.enabled:
+                        # START:<json> carries trial metadata (future iOS);
+                        # parse from raw, since cmd is upper-cased.
+                        if cmd.startswith("START:"):
+                            try:
+                                trial_payload = json.loads(raw[len("START:"):])
+                                asyncio.create_task(_set_trial_safely(trial_payload, "ws_start"))
+                            except ValueError as exc:
+                                trial_recorder.error("start_json", exc)
+                        else:
+                            trial_recorder.ensure_session("ws_start")
                     print("[MIC] Listening — waiting for speech...")
                     streaming            = True
                     mic_streaming         = AI_BACKEND == "gemini_live"
+                    trial_recorder.mic_streaming(mic_streaming, "start", connection_generation)
                     pcm_buffer           = bytearray()
                     vad_silent_chunks    = 0
                     vad_speech_chunks    = 0
@@ -2911,6 +3397,7 @@ async def ws_audio(ws: WebSocket):
                     if AI_BACKEND == "gemini_live":
                         print("[MIC] Stopped streaming")
                         mic_streaming = False
+                        trial_recorder.mic_streaming(False, "stop", connection_generation)
                         await _send_esp32_audio_text(ws, "OK:STOPPED")
                     else:
                         print("[MIC] Transcribing...")
@@ -2956,6 +3443,7 @@ async def ws_audio(ws: WebSocket):
                     # of the way (it would otherwise fire its own transcription
                     # off the same audio and double-dispatch commands).
                     if streaming and not is_playing_now():
+                        trial_recorder.note_audio(len(chunk))
                         # Firmware may aggregate two 20 ms chunks into one
                         # WebSocket frame. Normalize at ingress so queue age,
                         # Gemini pacing, and drop counters retain 20 ms units.
@@ -3048,8 +3536,13 @@ async def ws_audio(ws: WebSocket):
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
+        trial_recorder.error("ws_audio", e)
     finally:
         streaming  = False
+        if mic_streaming:
+            # Shared global: an old socket's finally can clear the flag the
+            # new socket just set (known race, recorded here, not fixed).
+            trial_recorder.mic_streaming(False, "socket_closed", connection_generation)
         mic_streaming = False
         pcm_buffer = None
         _emit_audio_health(force=True)
@@ -3146,6 +3639,41 @@ def _process_camera_frame_blocking(data: bytes):
     return (None, None)
 
 
+async def _gemini_image_pump_loop(holder: dict, event: asyncio.Event) -> None:
+    """Single-slot Gemini video feed shared by /ws/camera and /ws/camera_thermal."""
+    while True:
+        await event.wait()
+        event.clear()
+        data = holder["data"]
+        if data is None:
+            continue
+        if not trial_recorder.enabled:
+            try:
+                await gemini_live.send_image(
+                    data, turn_id=holder.get("turn"), sequence=holder.get("seq")
+                )
+            except Exception as e:
+                if DEBUG:
+                    print(f"[Gemini Live] send_image failed: {e}")
+            continue
+        turn_id = holder.get("turn")
+        seq = holder.get("seq")
+        received_at = holder.get("received_at")
+        sent = False
+        try:
+            sent = await gemini_live.send_image(
+                data, turn_id=turn_id, sequence=seq, source="pump"
+            )
+        except Exception as e:
+            trial_recorder.error("gemini_pump", e, turn_id)
+            if DEBUG:
+                print(f"[Gemini Live] send_image failed: {e}")
+        if sent:
+            trial_recorder.frame_sent(turn_id, seq, data, received_at, "pump")
+        else:
+            trial_recorder.frame_not_sent()
+
+
 # 1-byte type prefix used on the merged /ws/camera_thermal socket (see
 # ws_camera_thermal_esp below) — must match MSG_TYPE_CAM/MSG_TYPE_THERMAL in
 # compile.ino exactly.
@@ -3158,7 +3686,7 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
     (ws_camera_esp) and the merged /ws/camera_thermal (ws_camera_thermal_esp)
     so both stay on identical processing logic."""
     frame_counter += 1
-    latest_rgb.update(data, received_at)
+    rgb_frame = latest_rgb.update(data, received_at)
     recording_pipeline.enqueue_latest(data)
 
     # Cheap per-frame bookkeeping stays here; recording runs in the worker.
@@ -3180,6 +3708,11 @@ async def _handle_camera_frame(data: bytes, frame_counter: int, holder: dict, fr
         if now - _last_gemini_video_submit >= GEMINI_VIDEO_INTERVAL_SEC:
             _last_gemini_video_submit = now
             gemini_frame_holder["data"] = data
+            # Tag at hand-off: the turn and frame this was when chosen. Logged
+            # on every pump send so repeats are distinguishable from fresh frames.
+            gemini_frame_holder["turn"] = latency_tracker.active_turn_id
+            gemini_frame_holder["seq"] = rgb_frame.sequence
+            gemini_frame_holder["received_at"] = rgb_frame.timestamp
             gemini_frame_event.set()
 
     global _last_research_frame_sample
@@ -3331,17 +3864,7 @@ async def ws_camera_esp(ws: WebSocket):
     gemini_frame_event = asyncio.Event()
 
     async def _gemini_image_pump():
-        while True:
-            await gemini_frame_event.wait()
-            gemini_frame_event.clear()
-            data = gemini_frame_holder["data"]
-            if data is None:
-                continue
-            try:
-                await gemini_live.send_image(data)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[Gemini Live] send_image failed: {e}")
+        await _gemini_image_pump_loop(gemini_frame_holder, gemini_frame_event)
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
@@ -3553,17 +4076,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     gemini_frame_event = asyncio.Event()
 
     async def _gemini_image_pump():
-        while True:
-            await gemini_frame_event.wait()
-            gemini_frame_event.clear()
-            data = gemini_frame_holder["data"]
-            if data is None:
-                continue
-            try:
-                await gemini_live.send_image(data)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[Gemini Live] send_image failed: {e}")
+        await _gemini_image_pump_loop(gemini_frame_holder, gemini_frame_event)
 
     gemini_pump_task = (
         asyncio.create_task(_gemini_image_pump())
@@ -3642,6 +4155,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                         "sequence": imu_data["sequence"],
                         "data": imu_data,
                     })
+                    trial_recorder.imu_sample(latest_imu)
                     process_imu_and_maybe_store(imu_data)
                     imu_event.set()
                 elif msg_type == MSG_TYPE_STATUS:
@@ -3652,6 +4166,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         pass
     except Exception as e:
         print(f"[CAMERA-THERMAL ERROR] {e}")
+        trial_recorder.error("ws_camera_thermal", e)
     finally:
         canonicalizer_health_task.cancel()
         try:
@@ -4020,6 +4535,12 @@ async def startup_research_exporter():
 
 
 @app.on_event("startup")
+async def startup_trial_recorder():
+    await trial_recorder.start()
+    _schedule_pending_trial_uploads()
+
+
+@app.on_event("startup")
 async def on_startup_register_bridge_sender():
     # Save the main thread's event loop
     main_loop = asyncio.get_event_loop()
@@ -4129,6 +4650,8 @@ async def _gemini_keepalive_loop() -> None:
     keepalive frame structurally cannot show up as a turn's gemini_rgb_frame_id
     or any other per-turn telemetry field.
     """
+    last_sequence: Optional[int] = None
+    consecutive_repeats = 0
     while True:
         await asyncio.sleep(5.0)
         if AI_BACKEND != "gemini_live":
@@ -4145,9 +4668,17 @@ async def _gemini_keepalive_loop() -> None:
         sent = await gemini_live.send_image(
             frame.data, sequence=frame.sequence, source="keepalive"
         )
+        if sent:
+            trial_recorder.frame_sent(None, frame.sequence, frame.data, frame.timestamp, "keepalive")
+        # A climbing count means the camera has stopped and the same frozen
+        # frame is being resent (0 = a different frame from the previous keepalive).
+        consecutive_repeats = consecutive_repeats + 1 if frame.sequence == last_sequence else 0
+        last_sequence = frame.sequence
+        frame_age_sec = max(0.0, time.monotonic() - frame.timestamp)
         print(
             f"[GEMINI-KEEPALIVE] sent={sent} bytes={len(frame.data)} "
-            f"sequence={frame.sequence}",
+            f"sequence={frame.sequence} consecutive_repeats={consecutive_repeats} "
+            f"frame_age_sec={frame_age_sec:.1f}",
             flush=True,
         )
 
@@ -4210,6 +4741,10 @@ async def on_shutdown():
         except asyncio.CancelledError:
             pass
         _gemini_keepalive_task = None
+
+    # Last, so the interrupted turn above is flushed. The trial stays open:
+    # the next process resumes it from /data/trials/current.json.
+    await trial_recorder.stop()
 
     print("[SHUTDOWN] Resource cleanup complete")
 

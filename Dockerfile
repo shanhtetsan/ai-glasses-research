@@ -9,6 +9,11 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
 
+# Stamped into each trial's session_start. Pass at deploy:
+#   fly deploy --build-arg GIT_SHA=$(git rev-parse HEAD)
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 WORKDIR /app
 
 # System dependencies: curl for the healthcheck; libgl1/libglib for cv2

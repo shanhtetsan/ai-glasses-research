@@ -118,6 +118,11 @@ class GeminiLiveClient:
                                         # (reason="receive_error"/"normal_receive_end"/"goaway"/
                                         # other rotation reasons)
         self.on_session_transition = None  # clears app turn state without finalizing latency twice
+        # Optional sync observer: on_session_opened(reason, generation, age_sec, resumed).
+        # Called after every successful open; never allowed to raise.
+        self.on_session_opened = None
+        self._last_close_reason = None
+        self._last_close_age_sec = None
         self.turn_id_provider = None
 
         self._response_modality = "AUDIO"  # remembered so auto-reconnect uses the same mode
@@ -334,6 +339,18 @@ class GeminiLiveClient:
             f"config_fp={self._config_fingerprint()}",
             flush=True,
         )
+        if self.on_session_opened is not None:
+            try:
+                self.on_session_opened(
+                    self._last_close_reason or "initial",
+                    self.session_generation,
+                    self._last_close_age_sec,
+                    mode == "resumed",
+                )
+            except Exception:
+                pass
+        self._last_close_reason = None
+        self._last_close_age_sec = None
 
     def _cancel_goaway_deadline(self):
         task = self._goaway_deadline_task
@@ -355,6 +372,9 @@ class GeminiLiveClient:
                 await live_cm.__aexit__(None, None, None)
             except Exception:
                 pass
+        if had_session:
+            self._last_close_reason = reason
+            self._last_close_age_sec = age
         if generation and had_session:
             print(
                 f"[GEMINI-SESSION] generation={generation} closed "
