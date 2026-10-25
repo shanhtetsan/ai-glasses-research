@@ -1131,6 +1131,41 @@ _trial_score_locks: Dict[str, asyncio.Lock] = {}
 _trial_upload_tasks: Set[asyncio.Task] = set()
 _trial_upload_locks: Dict[str, asyncio.Lock] = {}
 
+# In-process scoring job records, keyed by trial id. Derived state only: the
+# recording on disk is the source of truth, so losing these on a restart costs
+# nothing but the progress display. States: queued, scoring, scored, failed.
+_TRIAL_JOB_STATES = ("queued", "scoring", "scored", "failed")
+_trial_jobs: Dict[str, dict] = {}
+_TRIAL_JOB_RETRY_BASE_SEC = 60.0
+_TRIAL_JOB_MAX_RETRIES = int(os.getenv("TRIAL_SCORE_MAX_RETRIES", "3") or 3)
+
+
+def _trial_job_set(trial_id: str, state: str, *, error: Optional[str] = None,
+                   bump_attempt: bool = False, next_retry_in: Optional[float] = None,
+                   **extra) -> dict:
+    job = _trial_jobs.setdefault(trial_id, {
+        "trial_id": trial_id, "state": "queued", "attempts": 0,
+        "last_error": None, "next_retry_ts": None,
+    })
+    if bump_attempt:
+        job["attempts"] = int(job.get("attempts") or 0) + 1
+    job["state"] = state if state in _TRIAL_JOB_STATES else "failed"
+    job["last_error"] = None if error is None else str(error)[:300]
+    job["next_retry_ts"] = None if next_retry_in is None else time.time() + float(next_retry_in)
+    job["updated_ts"] = time.time()
+    job.update(extra)
+    return job
+
+
+def _trial_job(trial_id: str) -> Optional[dict]:
+    job = _trial_jobs.get(trial_id)
+    return dict(job) if job else None
+
+
+# The trial most recently handed to the scorer, so the page can keep showing
+# "scoring…" for the run that just ended once no session is open any more.
+_trial_last_job_id: Optional[str] = None
+
 try:
     trial_object_storage = build_r2_storage()
 except TrialStorageUnavailable as exc:
@@ -1148,14 +1183,36 @@ async def _score_closed_trial(session_id: str, directory: str) -> dict:
 
 
 async def _auto_score_closed_trial(session_id: str, directory: str) -> None:
-    try:
-        result = await _score_closed_trial(session_id, directory)
+    """Score a closed trial in the background, retrying the whole run a few times.
+
+    Per-window rate-limit retries live in trial_scorer; this outer loop only
+    covers a run that failed outright (unreadable folder, judge unavailable for
+    every window). Scoring is resumable, so a retry re-judges only what is
+    still missing rather than burning quota on windows already scored.
+    """
+    for attempt in range(1, _TRIAL_JOB_MAX_RETRIES + 1):
+        _trial_job_set(session_id, "scoring", bump_attempt=True)
+        try:
+            result = await _score_closed_trial(session_id, directory)
+        except Exception as exc:
+            # Scoring is derived and retryable. Never compromise the source log
+            # or session close when an API call or local write fails.
+            print(f"[TRIAL-SCORE] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
+            if attempt >= _TRIAL_JOB_MAX_RETRIES:
+                _trial_job_set(session_id, "failed", error=f"{type(exc).__name__}: {exc}")
+                return
+            delay = _TRIAL_JOB_RETRY_BASE_SEC * (2 ** (attempt - 1))
+            _trial_job_set(session_id, "queued", error=f"{type(exc).__name__}: {exc}",
+                           next_retry_in=delay)
+            await asyncio.sleep(delay)
+            continue
         print(f"[TRIAL-SCORE] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
-    except Exception as exc:
-        # Scoring is derived and retryable. Never compromise the source log or
-        # session close when an API call or local write fails.
-        print(f"[TRIAL-SCORE] failed id={session_id} error={type(exc).__name__}: {exc}", flush=True)
-        return
+        _trial_job_set(
+            session_id, "scored",
+            scored_windows=result.get("scored_windows"),
+            unscored_windows=result.get("unscored_windows") or [],
+        )
+        break
     if trial_object_storage is not None:
         try:
             await _upload_scored_trial(session_id, directory)
@@ -1166,6 +1223,9 @@ async def _auto_score_closed_trial(session_id: str, directory: str) -> None:
 
 
 def _schedule_trial_score(session_id: str, directory: str) -> None:
+    global _trial_last_job_id
+    _trial_last_job_id = session_id
+    _trial_job_set(session_id, "queued")
     try:
         task = asyncio.get_running_loop().create_task(
             _auto_score_closed_trial(session_id, directory),
@@ -1173,6 +1233,7 @@ def _schedule_trial_score(session_id: str, directory: str) -> None:
         )
     except RuntimeError as exc:
         print(f"[TRIAL-SCORE] could not schedule id={session_id}: {exc}", flush=True)
+        _trial_job_set(session_id, "failed", error=f"could not schedule: {exc}")
         return
     _trial_score_tasks.add(task)
     task.add_done_callback(_trial_score_tasks.discard)
@@ -2453,15 +2514,36 @@ async def session_stop():
     return JSONResponse({"stopped": True})
 
 
+_TRIAL_COOKIE = "trial_token"
+
+
 def _trial_auth_failed(request: Request) -> Optional[JSONResponse]:
-    """If TRIAL_TOKEN is set, /internal/trial* require a matching X-Trial-Token."""
+    """If TRIAL_TOKEN is set, /internal/trial* require a matching token.
+
+    Accepted as the X-Trial-Token header (what the field curl commands send) or
+    as the same httponly trial_token cookie /trials already sets, so the control
+    block on the page can call these without anyone pasting a token into a
+    phone. Neither one present is still 401 — this only widens where the same
+    secret may be carried, never what counts as authorised.
+    """
     expected = os.getenv("TRIAL_TOKEN", "")
     if not expected:
         return None
-    supplied = request.headers.get("x-trial-token", "")
-    if hmac.compare_digest(supplied, expected):
+    supplied = request.headers.get("x-trial-token", "") or request.cookies.get(_TRIAL_COOKIE, "")
+    if supplied and hmac.compare_digest(supplied, expected):
         return None
     return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+async def _wants_background(request: Request) -> bool:
+    """background=1 as a query parameter, or {"background": true} in the body."""
+    if request.query_params.get("background", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        payload = await request.json()
+    except Exception:
+        return False
+    return isinstance(payload, dict) and bool(payload.get("background"))
 
 
 async def _set_trial_safely(payload: Any, reason: str) -> Optional[dict]:
@@ -2480,7 +2562,10 @@ async def _set_trial_safely(payload: Any, reason: str) -> Optional[dict]:
 
 @app.get("/internal/trial")
 async def trial_status():
-    return JSONResponse(trial_recorder.status())
+    status = trial_recorder.status()
+    status["job"] = _trial_job(status.get("session_id")) if status.get("session_id") else None
+    status["last_job"] = _trial_job(_trial_last_job_id) if _trial_last_job_id else None
+    return JSONResponse(status)
 
 
 @app.post("/internal/trial")
@@ -2519,8 +2604,13 @@ async def trial_end(request: Request):
         return denied
     if not trial_recorder.enabled:
         return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    # end_session queues the close record and hands the folder to the scorer as
+    # a background task (see _schedule_trial_score). This returns straight away:
+    # the judge is never on the critical path of ending a run in the field.
     ended = trial_recorder.end_session(reason="internal_end")
-    return JSONResponse({"ended": ended, **trial_recorder.status()})
+    status = trial_recorder.status()
+    status["job"] = _trial_job(ended) if ended else None
+    return JSONResponse({"ended": ended, **status})
 
 
 @app.post("/internal/trial/{trial_id}/score")
@@ -2538,13 +2628,32 @@ async def trial_score(trial_id: str, request: Request):
     directory = os.path.realpath(os.path.join(root, trial_id))
     if os.path.commonpath((root, directory)) != root or not os.path.isdir(directory):
         return JSONResponse({"error": "trial not found"}, status_code=404)
+
+    # Default stays synchronous so the existing field curl keeps working.
+    # background=1 enqueues instead and returns 202 — what the /trials page
+    # uses, because a paced re-score of a long trial outlives any HTTP timeout.
+    if await _wants_background(request):
+        _schedule_trial_score(trial_id, directory)
+        return JSONResponse(
+            {"trial_id": trial_id, "queued": True, "job": _trial_job(trial_id)},
+            status_code=202,
+        )
+    _trial_job_set(trial_id, "scoring", bump_attempt=True)
     try:
         result = await _score_closed_trial(trial_id, directory)
     except TrialScoringError as exc:
+        _trial_job_set(trial_id, "failed", error=str(exc))
         return JSONResponse({"error": str(exc)}, status_code=422)
     except Exception as exc:
         print(f"[TRIAL-SCORE] failed id={trial_id} error={type(exc).__name__}: {exc}", flush=True)
+        _trial_job_set(trial_id, "failed", error=f"{type(exc).__name__}: {exc}")
         return JSONResponse({"error": "trial scoring failed"}, status_code=502)
+    _trial_job_set(
+        trial_id, "scored",
+        scored_windows=result.get("scored_windows"),
+        unscored_windows=result.get("unscored_windows") or [],
+    )
+    result["job"] = _trial_job(trial_id)
     if trial_object_storage is not None:
         try:
             result["upload"] = await _upload_scored_trial(trial_id, directory)
@@ -2573,9 +2682,6 @@ async def trial_upload(trial_id: str, request: Request):
     return JSONResponse(result)
 
 
-_TRIAL_COOKIE = "trial_token"
-
-
 def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
     """Fail-closed auth for every team-facing trial data route."""
     expected = os.getenv("TRIAL_TOKEN", "")
@@ -2594,6 +2700,20 @@ def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
+def _trial_row_status(trial_id: str, scored: bool, open_session_id: Optional[str]) -> str:
+    """recording / queued / scoring / scored / failed for one trial-list row."""
+    if trial_id == open_session_id:
+        return "recording"
+    job = _trial_jobs.get(trial_id)
+    if job and job.get("state") in {"queued", "scoring"}:
+        return str(job["state"])
+    if scored:
+        return "scored"
+    if job and job.get("state") == "failed":
+        return "failed"
+    return "unscored"
+
+
 @app.get("/api/trials")
 async def trial_list_api(request: Request):
     denied = _trial_view_auth_failed(request)
@@ -2603,6 +2723,10 @@ async def trial_list_api(request: Request):
         rows = await asyncio.to_thread(trial_archive.list_trials)
     except (TrialArchiveError, TrialStorageError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
+    open_session_id = trial_recorder.status().get("session_id")
+    for row in rows:
+        row["status"] = _trial_row_status(row.get("id"), bool(row.get("scored")), open_session_id)
+        row["job"] = _trial_job(row.get("id"))
     return JSONResponse({"trials": rows})
 
 
@@ -2617,6 +2741,10 @@ async def trial_detail_api(trial_id: str, request: Request):
         return JSONResponse({"error": "trial not found"}, status_code=404)
     except (TrialArchiveError, TrialStorageError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
+    detail["job"] = _trial_job(trial_id)
+    detail["status"] = _trial_row_status(
+        trial_id, bool(detail.get("scored")), trial_recorder.status().get("session_id")
+    )
     return JSONResponse(detail)
 
 

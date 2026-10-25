@@ -11,17 +11,30 @@ import csv
 import hashlib
 import json
 import os
+import random
 import re
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 
 RUBRIC_VERSION = "blind-visibility-v2"  # v2: judge sees thermal evidence
 LABELS = ("right", "bad_guess", "dead_refusal", "useful_refusal")
 SPATIAL_FRAMES = ("body-relative", "object-relative", "room-relative", "mixed", "none")
 DEFAULT_JUDGE_MODEL = "gemini-2.5-flash"
+
+# Free-tier gemini-2.5-flash is 5 requests/minute. One judge call per question
+# window with no pacing exhausts that partway through a 9-window trial, so the
+# scorer paces itself to this ceiling and honours the server's own retryDelay.
+DEFAULT_JUDGE_RPM = 5.0
+DEFAULT_JUDGE_MAX_ATTEMPTS = 5
+MAX_RETRY_SLEEP_SEC = 120.0
+_RETRY_STATUSES = ("RESOURCE_EXHAUSTED", "UNAVAILABLE")
+_RETRY_CODES = (429, 503)
+_RETRY_DELAY_RE = re.compile(r"retry[-_]?delay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s?", re.I)
 
 JUDGE_INSTRUCTION = """You are scoring one spoken smart-glasses question independently.
 The user is blind or has low vision, so an unsupported confident claim is more harmful than
@@ -69,6 +82,140 @@ _WORDS_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
 
 class TrialScoringError(RuntimeError):
     """The recording is incomplete or cannot be scored safely."""
+
+
+class JudgeRetryableError(TrialScoringError):
+    """A judge call failed in a way that is worth retrying (429 / 503).
+
+    ``retry_after`` is the server's own requested delay in seconds when it
+    supplied one, otherwise None and the caller backs off exponentially.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _error_code(exc: BaseException) -> Optional[int]:
+    for attribute in ("code", "status_code", "http_status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def _error_status(exc: BaseException) -> str:
+    value = getattr(exc, "status", None)
+    return value.upper() if isinstance(value, str) else ""
+
+
+def is_retryable_judge_error(exc: BaseException) -> bool:
+    """429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE are transient; retry those."""
+    if isinstance(exc, JudgeRetryableError):
+        return True
+    if _error_code(exc) in _RETRY_CODES or _error_status(exc) in _RETRY_STATUSES:
+        return True
+    text = str(exc).upper()
+    if any(status in text for status in _RETRY_STATUSES):
+        return True
+    # Bare "429"/"503" only when it reads as a status, not as part of a number.
+    return bool(re.search(r"(?<!\d)(?:429|503)(?!\d)", text))
+
+
+def retry_delay_seconds(exc: BaseException) -> Optional[float]:
+    """The server's requested retryDelay, from a structured field or the text."""
+    if isinstance(exc, JudgeRetryableError) and exc.retry_after is not None:
+        return exc.retry_after
+
+    def _walk(value: Any, depth: int = 0) -> Optional[float]:
+        if depth > 6:
+            return None
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if isinstance(key, str) and key.lower().replace("_", "") == "retrydelay":
+                    parsed = _parse_delay(inner)
+                    if parsed is not None:
+                        return parsed
+                found = _walk(inner, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for inner in value:
+                found = _walk(inner, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    for attribute in ("details", "response_json", "error", "body"):
+        found = _walk(getattr(exc, attribute, None))
+        if found is not None:
+            return found
+    match = _RETRY_DELAY_RE.search(str(exc))
+    return _parse_delay(match.group(1)) if match else None
+
+
+def _parse_delay(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*s?\s*", value)
+        if match:
+            return max(0.0, float(match.group(1)))
+    return None
+
+
+def _judge_rpm() -> float:
+    raw = os.getenv("TRIAL_JUDGE_RPM", "").strip()
+    if not raw:
+        return DEFAULT_JUDGE_RPM
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_JUDGE_RPM
+
+
+def _judge_max_attempts() -> int:
+    raw = os.getenv("TRIAL_JUDGE_MAX_ATTEMPTS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_JUDGE_MAX_ATTEMPTS
+    except ValueError:
+        return DEFAULT_JUDGE_MAX_ATTEMPTS
+
+
+class RateLimiter:
+    """Spaces calls to at most ``rpm`` per minute. rpm <= 0 disables pacing."""
+
+    def __init__(self, rpm: Optional[float] = None, sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self.rpm = _judge_rpm() if rpm is None else float(rpm)
+        self._interval = 60.0 / self.rpm if self.rpm > 0 else 0.0
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def acquire(self) -> float:
+        if self._interval <= 0:
+            return 0.0
+        with self._lock:
+            now = self._monotonic()
+            wait = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self._interval
+        if wait > 0:
+            self._sleep(wait)
+        return wait
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with full jitter, in seconds."""
+    ceiling = min(MAX_RETRY_SLEEP_SEC, 2.0 ** attempt)
+    return random.uniform(0.0, ceiling)
 
 
 class WindowJudge(Protocol):
@@ -338,8 +485,54 @@ class GeminiWindowJudge:
         except TrialScoringError:
             raise
         except Exception as exc:
+            # Preserve retryability: wrapping a 429 in a plain TrialScoringError
+            # would hide the quota signal (and the server's retryDelay) from the
+            # retry loop in judge_window.
+            if is_retryable_judge_error(exc):
+                raise JudgeRetryableError(
+                    f"Gemini judge failed: {type(exc).__name__}: {exc}",
+                    retry_delay_seconds(exc),
+                ) from exc
             raise TrialScoringError(f"Gemini judge failed: {type(exc).__name__}: {exc}") from exc
         return _validate_judgment(result)
+
+
+def judge_window(
+    judge: WindowJudge,
+    question: str,
+    answer: str,
+    frame_paths: list[Path],
+    ground_truth: dict,
+    thermal: dict,
+    *,
+    limiter: Optional[RateLimiter] = None,
+    max_attempts: Optional[int] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[dict, int]:
+    """Call the judge with pacing and bounded retries. Returns (judgment, attempts)."""
+    attempts_allowed = _judge_max_attempts() if max_attempts is None else max(1, int(max_attempts))
+    last: BaseException = TrialScoringError("judge was never called")
+    attempt = 0
+    for attempt in range(1, attempts_allowed + 1):
+        if limiter is not None:
+            limiter.acquire()
+        try:
+            return _validate_judgment(judge.judge(question, answer, frame_paths, ground_truth, thermal)), attempt
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts_allowed or not is_retryable_judge_error(exc):
+                break
+            requested = retry_delay_seconds(exc)
+            delay = _backoff_delay(attempt) if requested is None else min(requested, MAX_RETRY_SLEEP_SEC)
+            print(
+                f"[TRIAL-SCORE] judge retry {attempt}/{attempts_allowed} in {delay:.1f}s: "
+                f"{type(exc).__name__}: {str(exc)[:160]}",
+                flush=True,
+            )
+            sleep(delay)
+    raise TrialScoringError(
+        f"judge failed after {attempt} attempt(s): {type(last).__name__}: {last}"
+    ) from last
 
 
 def _validate_judgment(result: Any) -> dict:
@@ -362,6 +555,10 @@ def score_window(
     trial_dir: Path,
     ground_truth: dict,
     judge: WindowJudge,
+    *,
+    limiter: Optional[RateLimiter] = None,
+    max_attempts: Optional[int] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict:
     distance = detect_distance_units(window.answer)
     consulted = distance is None
@@ -373,9 +570,10 @@ def score_window(
         }
     else:
         frame_paths = [trial_dir / str(frame["file"]) for frame in window.frames]
-        judgment = _validate_judgment(judge.judge(
-            window.question, window.answer, frame_paths, ground_truth, thermal_evidence(window)
-        ))
+        judgment, _ = judge_window(
+            judge, window.question, window.answer, frame_paths, ground_truth,
+            thermal_evidence(window), limiter=limiter, max_attempts=max_attempts, sleep=sleep,
+        )
 
     return {
         "window": window.index,
@@ -416,10 +614,10 @@ def _csv_text(scores: list[dict]) -> str:
     return output.getvalue()
 
 
-def _summary(scores: list[dict], events: list[dict]) -> dict:
+def _summary(scores: list[dict], events: list[dict], unscored: Optional[list[dict]] = None) -> dict:
     counts = Counter(score["label"] for score in scores)
     total = len(scores)
-    return {
+    summary = {
         "turn_count": total,
         "counts": {label: counts[label] for label in LABELS},
         "bad_guess_rate": counts["bad_guess"] / total if total else 0.0,
@@ -430,6 +628,59 @@ def _summary(scores: list[dict], events: list[dict]) -> dict:
             int(event.get("dropped_count") or 0) for event in events if event.get("t") == "drop"
         ),
     }
+    # Added only when something actually failed, so a clean trial's summary.json
+    # keeps exactly the keys (and the rates' denominators) it has always had.
+    if unscored:
+        summary["unscored"] = unscored
+        summary["unscored_count"] = len(unscored)
+        summary["window_count"] = total + len(unscored)
+    return summary
+
+
+def _window_fingerprint(window: QuestionWindow) -> tuple:
+    """What a stored score must still match for it to be reusable."""
+    return (window.turn_uid, window.question, window.answer, len(window.frames))
+
+
+def _score_fingerprint(score: dict) -> tuple:
+    return (
+        score.get("turn_uid"),
+        score.get("question") or "",
+        score.get("answer") or "",
+        int(score.get("frame_count") or 0),
+    )
+
+
+def load_existing_scores(trial_dir: Path) -> dict[int, dict]:
+    """Previously written per-window scores, keyed by window index.
+
+    Only records produced by this rubric and judge prompt are returned, so a
+    rubric change still re-judges everything.
+    """
+    path = trial_dir / "scores.jsonl"
+    existing: dict[int, dict] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return existing
+    except OSError:
+        return existing
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("label") not in LABELS:
+            continue
+        if record.get("rubric_version") != RUBRIC_VERSION or record.get("prompt_sha256") != PROMPT_SHA256:
+            continue
+        try:
+            existing[int(record["window"])] = record
+        except (KeyError, TypeError, ValueError):
+            continue
+    return existing
 
 
 def _prune_unscored_frames(trial_dir: Path, windows: list[QuestionWindow]) -> list[str]:
@@ -455,8 +706,20 @@ def score_trial_folder(
     *,
     judge: Optional[WindowJudge] = None,
     prune_frames: bool = True,
+    resume: bool = True,
+    limiter: Optional[RateLimiter] = None,
+    max_attempts: Optional[int] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict:
-    """Score one closed trial and atomically replace its derived score files."""
+    """Score one closed trial and atomically replace its derived score files.
+
+    Judge calls are paced to TRIAL_JUDGE_RPM and retried on 429/503. A window
+    that still cannot be judged is recorded in ``summary["unscored"]`` with the
+    reason and scoring continues, so a trial is never left half-scored with no
+    record of why. With ``resume`` (the default) a window whose stored score
+    still matches the log is reused instead of re-judged, which makes a re-run
+    after a quota failure cost only the windows that are actually missing.
+    """
     directory = Path(trial_dir)
     if not directory.is_dir():
         raise TrialScoringError(f"trial not found: {directory.name}")
@@ -469,8 +732,36 @@ def score_trial_folder(
         raise TrialScoringError("session contains no question windows")
 
     active_judge = judge or GeminiWindowJudge()
-    scores = [score_window(window, directory, ground_truth, active_judge) for window in windows]
-    summary = _summary(scores, events)
+    active_limiter = limiter if limiter is not None else RateLimiter(sleep=sleep)
+    previous = load_existing_scores(directory) if resume else {}
+
+    scores: list[dict] = []
+    unscored: list[dict] = []
+    reused = 0
+    for window in windows:
+        carried = previous.get(window.index)
+        if carried is not None and _score_fingerprint(carried) == _window_fingerprint(window):
+            scores.append(carried)
+            reused += 1
+            continue
+        try:
+            scores.append(score_window(
+                window, directory, ground_truth, active_judge,
+                limiter=active_limiter, max_attempts=max_attempts, sleep=sleep,
+            ))
+        except Exception as exc:
+            # Permanent for this window only. Record why and keep going: losing
+            # the remaining windows to one bad call is what this guards against.
+            reason = f"{type(exc).__name__}: {exc}"
+            print(f"[TRIAL-SCORE] window {window.index} unscored — {reason[:200]}", flush=True)
+            unscored.append({
+                "window": window.index,
+                "turn_uid": window.turn_uid,
+                "question": window.question,
+                "reason": reason[:500],
+            })
+
+    summary = _summary(scores, events, unscored)
 
     jsonl = "".join(json.dumps(score, ensure_ascii=False, separators=(",", ":")) + "\n" for score in scores)
     _atomic_write_text(directory / "scores.jsonl", jsonl)
@@ -480,5 +771,12 @@ def score_trial_folder(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
     removed = _prune_unscored_frames(directory, windows) if prune_frames else []
-    return {"trial_id": directory.name, "summary": summary, "pruned_frames": removed}
+    return {
+        "trial_id": directory.name,
+        "summary": summary,
+        "pruned_frames": removed,
+        "scored_windows": len(scores),
+        "reused_windows": reused,
+        "unscored_windows": unscored,
+    }
 

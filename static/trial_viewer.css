@@ -64,6 +64,48 @@ h2.sec{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transf
 .why{font-size:14px;color:var(--dim);margin:0 0 14px}.dets{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px}.det{font-family:var(--mono);font-size:11px;padding:3px 8px;border:1px solid var(--line);color:var(--faint)}.det.hit{border-color:var(--bad);color:var(--bad);font-weight:500}
 .meta2{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 14px;font-size:12.5px;margin-bottom:14px}.meta2 dt{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);padding-top:2px}.meta2 dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--dim);overflow-wrap:anywhere}
 pre.pr{font-family:var(--mono);font-size:11.5px;color:var(--dim);background:var(--sunk);border:1px solid var(--line);padding:11px;margin:0;white-space:pre-wrap;max-height:150px;overflow:auto}
+/* ---- trial start/end control block (index page, phone-first) ---- */
+.ctl{margin:26px 0 0;border:1px solid var(--line);background:var(--panel);padding:16px}
+.ctl-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.ctl-dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
+.ctl-dot.live{background:var(--bad);animation:ctlpulse 1.8s ease-in-out infinite}
+.ctl-dot.work{background:var(--dead)}
+.ctl-dot.done{background:var(--right)}
+@keyframes ctlpulse{0%,100%{opacity:1}50%{opacity:.35}}
+.ctl-state{font-family:var(--mono);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--fg);font-weight:500}
+.ctl-sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-left:auto}
+.ctl-live{display:flex;flex-wrap:wrap;gap:0;margin:14px 0 0;border:1px solid var(--line);background:var(--sunk)}
+.ctl-live div{flex:1 1 92px;padding:10px 13px;border-right:1px solid var(--line);min-width:0}
+.ctl-live div:last-child{border-right:0}
+.ctl-live dt{font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint);margin:0}
+.ctl-live dd{margin:4px 0 0;font-family:var(--mono);font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.btn{font-family:var(--mono);font-size:12px;letter-spacing:.07em;text-transform:uppercase;font-weight:500;
+  min-height:46px;padding:12px 20px;border:1px solid var(--line2);background:var(--sunk);color:var(--fg);
+  cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.btn:hover{border-color:var(--fg)}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn[disabled]{opacity:.5;cursor:default}
+.btn.go{border-color:var(--right);color:var(--right)}
+.btn.stop{border-color:var(--bad);color:var(--bad)}
+.ctl form{margin-top:14px}
+.ctl .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.ctl .grid .wide{grid-column:1/-1}
+.ctl label{display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint)}
+.ctl input{display:block;width:100%;margin-top:5px;min-height:44px;padding:10px 11px;
+  font-family:var(--mono);font-size:16px; /* 16px: stops iOS Safari zooming on focus */
+  background:var(--bg);color:var(--fg);border:1px solid var(--line2);border-radius:0}
+.ctl input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.ctl-legend{font-family:var(--mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint);margin:18px 0 8px}
+.ctl-hint{font-size:12.5px;color:var(--faint);margin:10px 0 0}
+.ctl-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.ctl-err{font-family:var(--mono);font-size:12px;color:var(--bad);margin:12px 0 0}
+.st{font-family:var(--mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;padding:3px 7px;border:1px solid currentColor;white-space:nowrap;color:var(--faint)}
+.st-recording{color:var(--bad)}.st-scoring,.st-queued{color:var(--dead)}.st-scored{color:var(--right)}.st-failed{color:var(--bad)}
+@media(max-width:760px){
+  .ctl .grid{grid-template-columns:1fr}
+  .ctl-sub{margin-left:0;flex-basis:100%}
+  .ctl-actions .btn{flex:1 1 100%}
+}
 [hidden]{display:none!important}
 @media(max-width:760px){.ev{grid-template-columns:1fr;padding-left:0}.head .big{font-size:48px}.turn>button{grid-template-columns:28px 1fr}.verd{grid-column:2;margin-top:0;justify-self:start}.note{display:none}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
