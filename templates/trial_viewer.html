@@ -20,13 +20,61 @@
 
     <main>
       <section id="vIndex" hidden>
+        <div class="ctl" id="ctl" hidden>
+          <div class="ctl-head">
+            <span class="ctl-dot" id="ctlDot"></span>
+            <span class="ctl-state" id="ctlState">checking…</span>
+            <span class="ctl-sub" id="ctlSub"></span>
+          </div>
+
+          <div id="ctlIdle" hidden>
+            <button type="button" class="btn go" id="btnOpen">Start trial</button>
+          </div>
+
+          <div id="ctlOpen" hidden>
+            <dl class="ctl-live">
+              <div><dt>Trial</dt><dd id="liveId">—</dd></div>
+              <div><dt>Turns</dt><dd id="liveTurns">0</dd></div>
+              <div><dt>Queue</dt><dd id="liveQueue">—</dd></div>
+            </dl>
+            <button type="button" class="btn stop" id="btnEnd">End trial</button>
+          </div>
+
+          <form id="ctlForm" hidden autocomplete="off">
+            <div class="grid">
+              <label>Trial<input id="fTrial" name="trial" required placeholder="T09" inputmode="text"></label>
+              <label>Participant<input id="fPid" name="pid" required placeholder="PSIM"></label>
+              <label>Site<input id="fSite" name="site" placeholder="VISIONS NYC"></label>
+              <label>Condition<input id="fCond" name="cond" placeholder="thermal-on"></label>
+              <label class="wide">Task<input id="fTask" name="task" placeholder="find the microwave"></label>
+              <label class="wide">Success criterion<input id="fCrit" name="success_criterion" placeholder="names it and gives a usable direction"></label>
+              <label>Prompt version<input id="fPrompt" name="prompt_version" placeholder="leave blank for default"></label>
+            </div>
+            <p class="ctl-legend">Ground truth — written before the run</p>
+            <div class="grid">
+              <label class="wide">Room<input id="gRoom" name="room" placeholder="VISIONS room 2"></label>
+              <label class="wide">In the room<input id="gPresent" name="present" placeholder="table, cup, microwave"></label>
+              <label class="wide">Not here<input id="gAbsent" name="absent" placeholder="plant, dog"></label>
+              <label class="wide">Planted as unseeable<input id="gPlanted" name="planted_unseeable" placeholder="door — behind the start position"></label>
+              <label class="wide">Visible from start<input id="gVisible" name="visible_from_start" placeholder="table, cup, wall ahead"></label>
+            </div>
+            <p class="ctl-hint">Comma-separated lists. Site, condition and prompt version are remembered on this device.</p>
+            <div class="ctl-actions">
+              <button type="submit" class="btn go" id="btnStart">Start recording</button>
+              <button type="button" class="btn" id="btnCancel">Cancel</button>
+            </div>
+          </form>
+
+          <p class="ctl-err" id="ctlErr" role="alert" hidden></p>
+        </div>
+
         <h1>Every test, kept and replayable</h1>
         <p class="lede">One row per session. The rate is how often the glasses stated something they could not see — an object that wasn't there, a distance with no depth sensor, or a clear path they never measured.</p>
         <div class="table-wrap">
           <table>
             <thead><tr>
               <th>Trial</th><th>Site</th><th>Condition</th><th>Prompt</th>
-              <th class="r">Turns</th><th class="r">Bad guesses</th><th>Date</th>
+              <th class="r">Turns</th><th class="r">Bad guesses</th><th>Status</th><th>Date</th>
             </tr></thead>
             <tbody id="idx"></tbody>
           </table>

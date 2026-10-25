@@ -41,6 +41,39 @@ class TrialRecorderTests(unittest.IsolatedAsyncioTestCase):
         await rec.stop()
         self.assertEqual(os.listdir(self.root), [])
 
+    async def test_turn_count_tracks_questions_and_survives_a_restart(self):
+        rec = _rec(self.root)
+        await rec.start()
+        await rec.set_trial({"trial": "T08", "pid": "PSIM"}, None)
+        self.assertEqual(rec.status()["turn_count"], 0)
+        for n in (1, 2, 3):
+            rec.speech_start(n, n, None, None)
+            rec.speech_end(n, n)
+        self.assertEqual(rec.status()["turn_count"], 3)
+        await rec.stop()
+
+        # A restart resumes the open session: the count comes back from the log
+        # rather than restarting at zero under the researcher's eyes.
+        resumed = _rec(self.root)
+        await resumed.start()
+        self.assertEqual(resumed.status()["session_id"], "T08_PSIM")
+        self.assertEqual(resumed.status()["turn_count"], 3)
+        resumed.speech_start(4, 4, None, None)
+        self.assertEqual(resumed.status()["turn_count"], 4)
+        await resumed.stop()
+
+    async def test_turn_count_and_meta_are_none_when_no_session_is_open(self):
+        rec = _rec(self.root)
+        await rec.start()
+        self.assertIsNone(rec.status()["turn_count"])
+        self.assertIsNone(rec.status()["meta"])
+        await rec.set_trial({"trial": "T09", "pid": "PSIM", "site": "VISIONS"}, None)
+        self.assertEqual(rec.status()["meta"]["site"], "VISIONS")
+        rec.end_session(reason="internal_end")
+        self.assertIsNone(rec.status()["turn_count"])
+        self.assertIsNone(rec.status()["meta"])
+        await rec.stop()
+
     async def test_full_turn_schema_and_layout(self):
         rec = _rec(self.root)
         await rec.start()

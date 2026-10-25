@@ -26,6 +26,21 @@
     return response.json();
   }
 
+  // The trial_token cookie the page already holds authorises these; nothing is
+  // typed or pasted on the phone.
+  async function postJSON(url, body) {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {Accept: "application/json", "Content-Type": "application/json"},
+      body: JSON.stringify(body || {})
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) {}
+    if (!response.ok) throw new Error((payload && payload.error) || `Request failed (${response.status})`);
+    return payload || {};
+  }
+
   function percent(rate) {
     const value = Number(rate);
     return Number.isFinite(value) ? Math.round(value * 100) : 0;
@@ -67,6 +82,12 @@
         rateCell.append(node("span", "num sub", "not scored"));
       }
       row.append(rateCell);
+      const status = trial.status || (trial.scored ? "scored" : "unscored");
+      const statusCell = node("td");
+      const badge = node("span", `st st-${status}`, status === "unscored" ? "not scored" : status);
+      if (status === "failed" && trial.job && trial.job.last_error) badge.title = trial.job.last_error;
+      statusCell.append(badge);
+      row.append(statusCell);
       row.append(node("td", "num sub", dateLabel(trial.date)));
       const open = () => { window.location.href = `/trials/${encodeURIComponent(trial.id)}`; };
       row.addEventListener("click", open);
@@ -331,10 +352,167 @@
     state.hidden = Boolean(data.windows?.length);
   }
 
+  /* ---------------- start / end controls ---------------- */
+
+  const STICKY_KEY = "trialControls.sticky";
+  const POLL_MS = 3000;
+
+  const readSticky = () => {
+    try { return JSON.parse(localStorage.getItem(STICKY_KEY)) || {}; } catch (_) { return {}; }
+  };
+  const writeSticky = value => {
+    try { localStorage.setItem(STICKY_KEY, JSON.stringify(value)); } catch (_) {}
+  };
+  // "a, b , ,c" -> ["a","b","c"]; the viewer reads these four keys as arrays.
+  const toList = text => String(text || "").split(",").map(item => item.trim()).filter(Boolean);
+
+  function controlError(message) {
+    const host = $("#ctlErr");
+    host.textContent = message || "";
+    host.hidden = !message;
+  }
+
+  function showForm(show) {
+    $("#ctlForm").hidden = !show;
+    $("#ctlIdle").hidden = show;
+    if (!show) return;
+    const sticky = readSticky();
+    for (const [id, key] of [["#fSite", "site"], ["#fCond", "cond"], ["#fPrompt", "prompt_version"]]) {
+      if (!$(id).value && sticky[key]) $(id).value = sticky[key];
+    }
+    $("#fTrial").focus();
+  }
+
+  function renderControls(status) {
+    $("#ctl").hidden = false;
+    const open = Boolean(status.session_id);
+    const job = status.job || status.last_job || null;
+    const dot = $("#ctlDot");
+    const state = $("#ctlState");
+    dot.className = "ctl-dot";
+
+    if (open) {
+      dot.classList.add("live");
+      state.textContent = "recording";
+      $("#liveId").textContent = status.session_id;
+      $("#liveTurns").textContent = status.turn_count == null ? "—" : String(status.turn_count);
+      $("#liveQueue").textContent = status.queue_depth == null
+        ? "—" : `${status.queue_depth}/${status.queue_maxsize ?? "—"}`;
+      $("#ctlSub").textContent = status.untitled ? "untitled session — set a trial id to name it" : "";
+    } else if (job && (job.state === "queued" || job.state === "scoring")) {
+      dot.classList.add("work");
+      state.textContent = job.state;
+      $("#ctlSub").textContent = `${job.trial_id} · attempt ${job.attempts || 1}`;
+    } else if (job && job.state === "failed") {
+      dot.classList.add("work");
+      state.textContent = "scoring failed";
+      $("#ctlSub").textContent = `${job.trial_id} · ${job.last_error || "no reason recorded"}`;
+    } else if (job && job.state === "scored") {
+      dot.classList.add("done");
+      state.textContent = "idle";
+      const left = (job.unscored_windows || []).length;
+      $("#ctlSub").textContent = `${job.trial_id} scored${left ? ` · ${left} window(s) unscored` : ""}`;
+    } else {
+      state.textContent = "idle";
+      $("#ctlSub").textContent = status.enabled === false ? "recorder disabled (TRIAL_RECORDER=1)" : "";
+    }
+
+    $("#ctlOpen").hidden = !open;
+    if (open) { $("#ctlForm").hidden = true; $("#ctlIdle").hidden = true; }
+    else if ($("#ctlForm").hidden) $("#ctlIdle").hidden = false;
+    $("#btnOpen").disabled = status.enabled === false;
+  }
+
+  async function refreshControls() {
+    try {
+      renderControls(await getJSON("/internal/trial"));
+    } catch (error) {
+      $("#ctl").hidden = false;
+      $("#ctlState").textContent = "unavailable";
+      $("#ctlSub").textContent = error.message;
+    }
+  }
+
+  async function refreshIndex() {
+    try {
+      renderIndex((await getJSON("/api/trials")).trials || []);
+    } catch (error) {
+      const state = $("#indexState");
+      state.hidden = false; state.classList.add("error"); state.textContent = error.message;
+    }
+  }
+
+  async function submitStart(event) {
+    event.preventDefault();
+    controlError("");
+    const button = $("#btnStart");
+    const groundTruth = {room: $("#gRoom").value.trim()};
+    for (const [id, key] of [["#gPresent", "present"], ["#gAbsent", "absent"],
+                             ["#gPlanted", "planted_unseeable"], ["#gVisible", "visible_from_start"]]) {
+      groundTruth[key] = toList($(id).value);
+    }
+    const body = {
+      trial: $("#fTrial").value.trim(),
+      pid: $("#fPid").value.trim(),
+      site: $("#fSite").value.trim(),
+      cond: $("#fCond").value.trim(),
+      task: $("#fTask").value.trim(),
+      success_criterion: $("#fCrit").value.trim(),
+      prompt_version: $("#fPrompt").value.trim(),
+      ground_truth: groundTruth
+    };
+    if (!body.trial || !body.pid) { controlError("Trial and participant are required."); return; }
+    button.disabled = true;
+    try {
+      const status = await postJSON("/internal/trial", body);
+      writeSticky({site: body.site, cond: body.cond, prompt_version: body.prompt_version});
+      $("#ctlForm").reset();
+      renderControls(status);
+      refreshIndex();
+    } catch (error) {
+      controlError(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function endTrial() {
+    controlError("");
+    const button = $("#btnEnd");
+    const open = $("#liveId").textContent;
+    if (!window.confirm(`End ${open}? Scoring starts in the background.`)) return;
+    button.disabled = true;
+    try {
+      const status = await postJSON("/internal/trial/end", {});
+      renderControls(status);
+      refreshIndex();
+    } catch (error) {
+      controlError(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function wireControls() {
+    $("#btnOpen").addEventListener("click", () => { controlError(""); showForm(true); });
+    $("#btnCancel").addEventListener("click", () => { controlError(""); showForm(false); });
+    $("#ctlForm").addEventListener("submit", submitStart);
+    $("#btnEnd").addEventListener("click", endTrial);
+    refreshControls();
+    // Keep the open trial's turn count and the scoring job live, but stop
+    // polling while the tab is hidden so a phone in a pocket is left alone.
+    let timer = window.setInterval(refreshControls, POLL_MS);
+    document.addEventListener("visibilitychange", () => {
+      window.clearInterval(timer);
+      if (!document.hidden) { refreshControls(); timer = window.setInterval(refreshControls, POLL_MS); }
+    });
+  }
+
   async function start() {
     const parts = window.location.pathname.split("/").filter(Boolean);
     const detail = parts.length === 2 && parts[0] === "trials";
     $(detail ? "#vTrial" : "#vIndex").hidden = false;
+    if (!detail) wireControls();
     try {
       if (detail) renderTrial(await getJSON(`/api/trials/${encodeURIComponent(parts[1])}`));
       else renderIndex((await getJSON("/api/trials")).trials || []);

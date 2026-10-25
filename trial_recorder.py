@@ -202,11 +202,12 @@ class TrialRecorder:
 
     async def _open_session(self, session_id, meta, ground_truth, reason) -> None:
         directory = os.path.join(self.root, session_id)
-        used_uids, existed = await asyncio.to_thread(self._scan_existing, directory)
+        used_uids, existed, turns = await asyncio.to_thread(self._scan_existing, directory)
         self._begin_session(session_id, meta, ground_truth, reason, used_uids=used_uids,
-                            untitled=False, resumed=existed)
+                            untitled=False, resumed=existed, turns=turns)
 
-    def _begin_session(self, session_id, meta, ground_truth, reason, *, used_uids, untitled, resumed) -> None:
+    def _begin_session(self, session_id, meta, ground_truth, reason, *, used_uids, untitled, resumed,
+                       turns: int = 0) -> None:
         directory = os.path.join(self.root, session_id)
         static = {}
         try:
@@ -227,6 +228,9 @@ class TrialRecorder:
             "server_turn_seq": 0,
             "last_event_mono": time.monotonic(),
             "meta": start_fields,
+            # Questions asked so far: one per speech_start, seeded from the log
+            # on resume so a restart does not reset the count the UI shows.
+            "turns": int(turns),
         }
         self._turn_uids.clear()
         self._turn_agg.clear()
@@ -280,6 +284,7 @@ class TrialRecorder:
                                               "speech_ended": False}
             self._current_turn = server_turn_id
             self._n_to_server[int(n)] = server_turn_id
+            self._session["turns"] += 1
             self._emit("speech_start", uid, n=int(n))
             matrix, captured_at, calibration = thermal if thermal else (None, None, None)
             age_sec = None if captured_at is None else max(0.0, time.monotonic() - captured_at)
@@ -606,11 +611,13 @@ class TrialRecorder:
     # ------------------------------------------------------------------ restore
 
     @staticmethod
-    def _scan_existing(directory: str) -> tuple[set, bool]:
+    def _scan_existing(directory: str) -> tuple[set, bool, int]:
+        """Returns (turn uids already used, the folder existed, speech_start count)."""
         used: set = set()
+        turns = 0
         path = os.path.join(directory, "session.jsonl")
         if not os.path.exists(path):
-            return used, os.path.isdir(directory)
+            return used, os.path.isdir(directory), turns
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
                 try:
@@ -619,7 +626,9 @@ class TrialRecorder:
                     continue
                 if event.get("turn"):
                     used.add(event["turn"])
-        return used, True
+                if event.get("t") == "speech_start":
+                    turns += 1
+        return used, True, turns
 
     async def _restore_current(self) -> None:
         def _read():
@@ -636,12 +645,12 @@ class TrialRecorder:
         if not session_id or not meta:
             return
         directory = os.path.join(self.root, session_id)
-        used, _ = await asyncio.to_thread(self._scan_existing, directory)
+        used, _, turns = await asyncio.to_thread(self._scan_existing, directory)
         untitled = str(session_id).startswith("untitled_")
         trial_meta = {"trial": meta.get("trial"), "pid": meta.get("pid")}
         trial_meta.update({key: meta.get(key) for key in _TRIAL_TEXT_FIELDS})
         self._begin_session(session_id, trial_meta, None, "process_restart",
-                            used_uids=used, untitled=untitled, resumed=True)
+                            used_uids=used, untitled=untitled, resumed=True, turns=turns)
 
     # ------------------------------------------------------------------ status
 
@@ -656,6 +665,9 @@ class TrialRecorder:
             "root": self.root,
             "session_id": None if session is None else session["id"],
             "untitled": None if session is None else session["untitled"],
+            # Questions asked in the open session, for the live count on /trials.
+            "turn_count": None if session is None else session["turns"],
+            "meta": None if session is None else dict(session["meta"]),
             "queue_depth": None if self._queue is None else self._queue.qsize(),
             "queue_maxsize": self._queue_maxsize,
             "pending_drops": self._pending_drops,
