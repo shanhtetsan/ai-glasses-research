@@ -46,6 +46,10 @@ class RgbCanonicalizerTelemetry:
         self._canonical_pending_replaced = 0
         self._canonical_failures = 0
         self._worker_state = "stopped"
+        # One telemetry object is shared by every camera socket's worker. A
+        # replaced socket's worker stops after the new one has started, so the
+        # state follows how many are running, not whichever reported last.
+        self._running_workers = 0
         self._last_failure_stage: str | None = None
         self._last_failure_reason: str | None = None
 
@@ -69,15 +73,20 @@ class RgbCanonicalizerTelemetry:
 
     def mark_running(self) -> None:
         with self._lock:
+            self._running_workers += 1
             self._worker_state = "running"
 
     def mark_stopped(self) -> None:
         with self._lock:
-            self._worker_state = "stopped"
+            self._running_workers = max(0, self._running_workers - 1)
+            if self._running_workers == 0:
+                self._worker_state = "stopped"
 
     def mark_unexpected_exit(self, reason: str) -> None:
         with self._lock:
-            self._worker_state = "unexpected_exit"
+            self._running_workers = max(0, self._running_workers - 1)
+            if self._running_workers == 0:
+                self._worker_state = "unexpected_exit"
             self._last_failure_stage = "worker"
             self._last_failure_reason = reason
 

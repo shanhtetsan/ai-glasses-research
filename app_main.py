@@ -1580,6 +1580,39 @@ esp32_camera_ws: Optional[WebSocket] = None
 # disconnect, so it is the source of the most recent frames.
 CAMERA_SOURCES = ("glasses", "phone")
 camera_source: Optional[str] = None
+# The /ws/camera_thermal connection holding the camera slot:
+# {"ws", "source", "device", "peer", "replaced"}. esp32_camera_ws is always
+# this record's ws while it is set. A handler only clears shared state while
+# its own record is still the one held (same idea as `esp32_audio_ws is ws`).
+_camera_conn: Optional[dict] = None
+_CAMERA_DEVICE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_camera_close_tasks: Set[asyncio.Task] = set()
+
+
+def _camera_slot_decision(held: Optional[dict], source: str, device: Optional[str]) -> str:
+    """"take", "replace", or a refusal reason, for a new /ws/camera_thermal socket.
+
+    A reconnect of the device already holding the slot wins: after a WiFi
+    drop the old socket is dead but still held. Another source, or another
+    device of the same source (when both sides name one), is refused so two
+    devices cannot keep knocking each other off.
+    """
+    if esp32_camera_ws is None:
+        return "take"
+    if held is None or held["ws"] is not esp32_camera_ws:
+        return "slot_busy"              # held by the legacy /ws/camera route
+    if held["source"] != source:
+        return "other_source_holds_slot"
+    if held["device"] and device and held["device"] != device:
+        return "other_device_holds_slot"
+    return "replace"
+
+
+async def _close_replaced_camera(ws: WebSocket) -> None:
+    try:
+        await ws.close(code=1000, reason="replaced_by_reconnect")
+    except Exception:
+        pass
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
 _esp32_audio_send_lock: Optional[asyncio.Lock] = None
@@ -4409,24 +4442,59 @@ async def ws_camera_esp(ws: WebSocket):
 @app.websocket("/ws/camera_thermal")
 async def ws_camera_thermal_esp(ws: WebSocket):
     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
-    global camera_source
+    global camera_source, _camera_conn
     # ?source=phone|glasses. No param means glasses, so the ESP32 is unchanged.
     # Anything else is refused rather than recorded as glasses.
     source = ws.query_params.get("source") or "glasses"
     if source not in CAMERA_SOURCES:
         await ws.close(code=1008, reason="source must be phone or glasses")
         return
-    if esp32_camera_ws is not None:
+    # ?device=<id>: optional, names the physical device (the ESP32 sends none).
+    device = ws.query_params.get("device") or None
+    if device is not None and not _CAMERA_DEVICE_ID.match(device):
+        await ws.close(code=1008, reason="device must be 1-64 of A-Z a-z 0-9 . _ : -")
+        return
+    device_id = _device_id(ws)
+    # Decide and take over the slot with no await in between, so two
+    # reconnects arriving together cannot both win.
+    held = _camera_conn
+    decision = _camera_slot_decision(held, source, device)
+    if decision not in ("take", "replace"):
+        print(
+            f"[WS-INGEST] device={device_id} socket=camera_thermal event=refused "
+            f"source={source} device_param={device} reason={decision}",
+            flush=True,
+        )
         await ws.close(code=1013)
         return
+    conn = {"ws": ws, "source": source, "device": device, "peer": device_id, "replaced": False}
+    if decision == "replace":
+        held["replaced"] = True
+        # Not awaited: on a dead socket the close handshake can hang for the
+        # websockets close timeout, and the reconnecting device must not wait.
+        task = asyncio.create_task(_close_replaced_camera(held["ws"]))
+        _camera_close_tasks.add(task)
+        task.add_done_callback(_camera_close_tasks.discard)
+    _camera_conn = conn
     esp32_camera_ws = ws
     await ws.accept()
     camera_source = source
+    if decision == "replace":
+        print(
+            f"[WS-INGEST] device={device_id} socket=camera_thermal event=replaced "
+            f"source={source} device_param={device} old_device={held['peer']} "
+            f"old_device_param={held['device']} reason=replaced_by_reconnect",
+            flush=True,
+        )
+        trial_recorder.camera_replaced(source, held["device"], device, held["peer"], device_id)
     trial_recorder.sensor_source(source)
-    device_id = _device_id(ws)
     connected_at = time.monotonic()
     backend_metrics["camera_sensor_connects"] += 1
-    print(f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect source={source}", flush=True)
+    print(
+        f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect "
+        f"source={source} device_param={device}",
+        flush=True,
+    )
 
     # Initialize the blind-path navigator
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -4544,6 +4612,8 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 
     async def _publish_canonical(data: bytes, received_at: float):
         nonlocal frame_counter
+        if conn["replaced"]:
+            return      # a stale frame must not land after the new socket's
         frame_counter = await _handle_camera_frame(
             data, frame_counter, holder, frame_event,
             gemini_frame_holder, gemini_frame_event, gemini_pump_task,
@@ -4573,6 +4643,8 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive()
+            if conn["replaced"]:
+                break       # anything still buffered here belongs to a dead socket
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 try:
@@ -4637,8 +4709,9 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[CAMERA-THERMAL ERROR] {e}")
-        trial_recorder.error("ws_camera_thermal", e)
+        if not conn["replaced"]:    # a replaced socket failing is expected
+            print(f"[CAMERA-THERMAL ERROR] {e}")
+            trial_recorder.error("ws_camera_thermal", e)
     finally:
         canonicalizer_health_task.cancel()
         try:
@@ -4676,24 +4749,32 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                 await ws.close(code=1000)
         except Exception:
             pass
-        esp32_camera_ws = None
+        # Shared state is cleared only while this socket still holds the slot:
+        # after a replace, the new socket owns it and this finally runs late.
+        still_held = _camera_conn is conn
+        if still_held:
+            _camera_conn = None
+            esp32_camera_ws = None
         backend_metrics["camera_sensor_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=camera_thermal event=disconnect "
-            f"source={source} reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
+            f"source={source} device_param={device} "
+            f"reason={'replaced_by_reconnect' if conn['replaced'] else 'client_or_receive_end'} "
+            f"connected_s={time.monotonic() - connected_at:.1f} "
             f"camera_frames={frame_counter} thermal_frames={thermal_frame_count} "
             f"thermal_dropped={thermal_dropped}",
             flush=True,
         )
 
         # Clean up navigation state
-        if blind_path_navigator:
-            blind_path_navigator.reset()
-        if cross_street_navigator:
-            cross_street_navigator.reset()
-        if orchestrator:
-            orchestrator.reset()
-            if DEBUG: print("[NAV MASTER] Master reset")
+        if still_held:
+            if blind_path_navigator:
+                blind_path_navigator.reset()
+            if cross_street_navigator:
+                cross_street_navigator.reset()
+            if orchestrator:
+                orchestrator.reset()
+                if DEBUG: print("[NAV MASTER] Master reset")
 
 # ---------- WebSocket: browser subscribes to camera frames ----------
 @app.websocket("/ws/viewer")

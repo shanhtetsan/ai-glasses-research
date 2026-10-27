@@ -529,6 +529,18 @@ class TrialRecorder:
         except Exception as exc:
             self._note_internal_error("sensor_source", exc)
 
+    def camera_replaced(self, source: str, old_device: Optional[str], new_device: Optional[str],
+                        old_peer: str, new_peer: str) -> None:
+        """A same-device reconnect took the camera slot from a stale socket.
+
+        Not a sensor_source_change: the source is the same. device is the
+        ?device= id (None when the client sends none); peer is host:port.
+        """
+        if not self.enabled or self._session is None:
+            return
+        self._emit("camera_replaced", None, source=source, old_device=old_device,
+                   device=new_device, old_peer=old_peer, peer=new_peer)
+
     def error(self, where: str, exc: Any, turn: Optional[int] = None) -> None:
         if not self.enabled or self._session is None:
             return

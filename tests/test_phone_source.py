@@ -12,7 +12,11 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import app_main
-from perception_orientation import canonicalize_phone_rgb_jpeg, canonicalize_rgb_jpeg
+from perception_orientation import (
+    RgbCanonicalizerTelemetry,
+    canonicalize_phone_rgb_jpeg,
+    canonicalize_rgb_jpeg,
+)
 from stability_runtime import MSG_TYPE_CAM
 from trial_archive import sensor_source_changes
 from trial_recorder import TrialRecorder
@@ -159,6 +163,120 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         rec = TrialRecorder(enabled=False, root=self.root)
         rec.sensor_source("phone")
         self.assertEqual(os.listdir(self.root), [])
+
+
+class ReconnectTests(unittest.TestCase):
+    """A stale socket from a WiFi drop must not lock its own device out."""
+
+    def setUp(self):
+        self.published = 0
+        self.lock = threading.Lock()
+        self.frame = threading.Event()
+
+        async def capture(data, frame_counter, *args, **kwargs):
+            with self.lock:
+                self.published += 1
+            self.frame.set()
+            return frame_counter + 1
+
+        self.recorder = mock.Mock()
+        self.telemetry = RgbCanonicalizerTelemetry()
+        self.patches = [
+            mock.patch.object(app_main, "_handle_camera_frame", capture),
+            mock.patch.object(app_main, "trial_recorder", self.recorder),
+            mock.patch.object(app_main, "rgb_canonicalizer_telemetry", self.telemetry),
+            mock.patch.object(app_main, "esp32_camera_ws", None),
+            mock.patch.object(app_main, "_camera_conn", None),
+            mock.patch.object(app_main, "camera_source", None),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(self.patches)])
+        self.client = TestClient(app_main.app)
+
+    def _send_frame(self, ws):
+        self.frame.clear()
+        ws.send_bytes(bytes([MSG_TYPE_CAM]) + _jpeg())
+        self.assertTrue(self.frame.wait(5), "frame never reached fan-out")
+
+    def _replaces(self, first, second, old_device, new_device):
+        with self.client.websocket_connect(first) as old:
+            self._send_frame(old)
+            with self.client.websocket_connect(second) as new:
+                # The old socket is told why it was dropped.
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    old.receive_bytes()
+                self.assertEqual(closed.exception.code, 1000)
+                self.assertEqual(closed.exception.reason, "replaced_by_reconnect")
+                old.__exit__(None, None, None)       # old handler runs its finally now
+                # Its cleanup left the new socket's state alone ...
+                held = app_main._camera_conn
+                self.assertIsNotNone(held)
+                self.assertIs(app_main.esp32_camera_ws, held["ws"])
+                self.assertEqual(held["device"], new_device)
+                self.assertFalse(held["replaced"])
+                self.assertEqual(self.telemetry.health()["worker_state"], "running")
+                # ... and frames keep flowing on the new one.
+                before = self.published
+                self._send_frame(new)
+                self.assertEqual(self.published, before + 1)
+        self.assertIsNone(app_main._camera_conn)
+        self.assertIsNone(app_main.esp32_camera_ws)
+        args = self.recorder.camera_replaced.call_args.args
+        self.assertEqual(args[:3], ("phone", old_device, new_device))
+
+    def test_same_device_reconnect_replaces_the_stale_socket(self):
+        self._replaces("/ws/camera_thermal?source=phone&device=iphone-A",
+                       "/ws/camera_thermal?source=phone&device=iphone-A", "iphone-A", "iphone-A")
+
+    def test_missing_device_on_either_side_still_replaces(self):
+        self._replaces("/ws/camera_thermal?source=phone",
+                       "/ws/camera_thermal?source=phone&device=iphone-A", None, "iphone-A")
+        self.recorder.reset_mock()
+        self._replaces("/ws/camera_thermal?source=phone&device=iphone-A",
+                       "/ws/camera_thermal?source=phone", "iphone-A", None)
+
+    def _refused(self, first, second):
+        with self.client.websocket_connect(first) as held:
+            with self.assertRaises(WebSocketDisconnect) as caught:
+                with self.client.websocket_connect(second) as ws:
+                    ws.receive_bytes()
+            self.assertEqual(caught.exception.code, 1013)
+            self._send_frame(held)          # the holder is untouched
+            self.assertFalse(app_main._camera_conn["replaced"])
+        self.recorder.camera_replaced.assert_not_called()
+
+    def test_different_phone_gets_1013(self):
+        self._refused("/ws/camera_thermal?source=phone&device=iphone-A",
+                      "/ws/camera_thermal?source=phone&device=iphone-B")
+
+    def test_different_source_still_gets_1013(self):
+        self._refused("/ws/camera_thermal?source=phone", "/ws/camera_thermal")
+
+    def test_bad_device_param_is_refused(self):
+        with self.assertRaises(WebSocketDisconnect) as caught:
+            with self.client.websocket_connect("/ws/camera_thermal?source=phone&device=a/b") as ws:
+                ws.receive_bytes()
+        self.assertEqual(caught.exception.code, 1008)
+
+
+class ReplacedRecordingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_camera_replaced_is_logged_and_is_not_a_source_change(self):
+        root = tempfile.mkdtemp()
+        with mock.patch.object(app_main, "camera_source", "phone"):
+            rec = _rec(root)
+            await rec.start()
+            await rec.set_trial({"trial": "T13", "pid": "PSIM"}, None)
+            rec.camera_replaced("phone", "iphone-A", "iphone-A", "1.2.3.4:1", "1.2.3.4:2")
+            rec.sensor_source("phone")     # what the new connect calls next
+            await rec.stop()
+        _, events = _read(root, "T13_PSIM")
+        replaced = [e for e in events if e["t"] == "camera_replaced"]
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual((replaced[0]["source"], replaced[0]["old_device"], replaced[0]["device"],
+                          replaced[0]["old_peer"], replaced[0]["peer"]),
+                         ("phone", "iphone-A", "iphone-A", "1.2.3.4:1", "1.2.3.4:2"))
+        self.assertFalse([e for e in events if e["t"] == "sensor_source_change"])
 
 
 class ArchiveTests(unittest.TestCase):

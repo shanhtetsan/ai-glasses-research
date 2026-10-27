@@ -101,6 +101,11 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   `meta.json` and `session_start`, not a `session_config` knob. It is `null` until a device first
   connects. A phone<->glasses switch in an open trial writes `sensor_source_change`; the first
   connect after `null`, and a same-device reconnect, do not.
+- One device holds the `/ws/camera_thermal` slot (`_camera_conn`). A reconnect with the same
+  `source` takes it from the held socket (a WiFi drop leaves that one dead but held): the old
+  socket is closed with `replaced_by_reconnect` and `camera_replaced` is recorded. If both sides
+  send `?device=` and they differ, or the source differs, the newcomer gets 1013. The old
+  handler's `finally` clears shared state only `if _camera_conn is conn`.
 - Every camera frame on `/ws/camera_thermal` logs `frame_recv` on arrival (only while a trial is
   open). For `source=phone` it carries `phone_seq`, read from the JPEG's `seq=<n>` COM segment
   *before* `canonicalize_phone_rgb_jpeg`, whose re-encode drops it; glasses log `phone_seq: null`.
