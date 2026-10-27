@@ -21,6 +21,11 @@ from typing import Any, Callable, Optional, Protocol
 TRIAL_PREFIX = "trials"
 UPLOAD_RECEIPT = ".upload.json"
 COMPLETE_OBJECT = "_complete.json"
+# Folders inside a trial that are uploaded on their own, each with its own
+# <name>/_complete.json, and never as part of the trial's own upload: they can
+# arrive before or after the trial is scored, and must not rewrite (or wait
+# for) the trial's completion marker.
+SUBFOLDERS = ("phone",)
 _SAFE_TRIAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,64}$")
 
 
@@ -47,6 +52,9 @@ class StoredObject:
 
 class TrialObjectStorage(Protocol):
     def put_folder(self, folder: str | os.PathLike[str]) -> dict:
+        ...
+
+    def put_subfolder(self, folder: str | os.PathLike[str], name: str) -> dict:
         ...
 
     def get_object(self, key: str) -> StoredObject:
@@ -86,6 +94,16 @@ class S3StorageConfig:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _uploadable(directory: Path, path: Path, *, skip_subfolders: bool) -> bool:
+    """Files that belong in R2: no dot-named receipts or staging, no .tmp files."""
+    if not path.is_file() or path.name.endswith(".tmp"):
+        return False
+    parts = path.relative_to(directory).parts
+    if any(part.startswith(".") for part in parts):
+        return False
+    return not (skip_subfolders and parts[0] in SUBFOLDERS)
 
 
 def _content_type(path: Path) -> str:
@@ -181,12 +199,68 @@ class S3TrialStorage:
 
         files = sorted(
             path for path in directory.rglob("*")
-            if path.is_file() and path.name != UPLOAD_RECEIPT and not path.name.endswith(".tmp")
+            if _uploadable(directory, path, skip_subfolders=True)
         )
         if not files:
             raise TrialStorageError(f"trial folder is empty: {trial_id}")
 
         prefix = f"{TRIAL_PREFIX}/{trial_id}/"
+        manifest = self._put_files(directory, files, prefix)
+        manifest["trial_id"] = trial_id
+        manifest["prefix"] = prefix
+        manifest_key = prefix + COMPLETE_OBJECT
+        self._put_manifest(manifest_key, manifest)
+        return manifest
+
+    def put_subfolder(self, folder: str | os.PathLike[str], name: str) -> dict:
+        """Upload <trial>/<name>/ with its own <name>/_complete.json marker.
+
+        Keys stay relative to the trial (``phone/frames/1.jpg``), so the archive
+        reads them like any other trial object. A re-upload that drops objects
+        deletes the stale ones, after the new marker is confirmed.
+        """
+        directory = Path(folder)
+        trial_id = directory.name
+        if name not in SUBFOLDERS:
+            raise TrialStorageError(f"unknown trial subfolder: {name!r}")
+        if not _SAFE_TRIAL_ID.fullmatch(trial_id):
+            raise TrialStorageError(f"unsafe trial id: {trial_id!r}")
+        sub = directory / name
+        if not sub.is_dir():
+            raise TrialStorageError(f"subfolder not found: {trial_id}/{name}")
+        files = sorted(path for path in sub.rglob("*") if _uploadable(directory, path, skip_subfolders=False))
+        if not files:
+            raise TrialStorageError(f"subfolder is empty: {trial_id}/{name}")
+
+        prefix = f"{TRIAL_PREFIX}/{trial_id}/"
+        manifest_key = f"{prefix}{name}/{COMPLETE_OBJECT}"
+        previous: set[str] = set()
+        try:
+            old = json.loads(self.get_object(manifest_key).body)
+            previous = {str(item.get("key", "")) for item in old.get("objects", [])}
+        except TrialObjectNotFound:
+            pass
+        except (ValueError, TypeError, AttributeError):
+            previous = set()
+
+        manifest = self._put_files(directory, files, prefix)
+        manifest["trial_id"] = trial_id
+        manifest["prefix"] = f"{prefix}{name}/"
+        self._put_manifest(manifest_key, manifest)
+
+        current = {item["key"] for item in manifest["objects"]}
+        stale = sorted(key for key in previous - current if key.startswith(name + "/"))
+        for relative in stale:
+            self._retry(
+                f"delete {prefix}{relative}",
+                lambda key=prefix + relative: self._get_client().delete_object(
+                    Bucket=self.config.bucket, Key=key
+                ),
+            )
+        manifest["stale_deleted"] = len(stale)
+        return manifest
+
+    def _put_files(self, directory: Path, files: list[Path], prefix: str) -> dict:
         objects: list[dict] = []
         for path in files:
             relative = path.relative_to(directory).as_posix()
@@ -201,20 +275,18 @@ class S3TrialStorage:
         for item in objects:
             self._verify(prefix + item["key"], item["size"], item["sha256"])
 
-        manifest = {
-            "trial_id": trial_id,
-            "prefix": prefix,
+        return {
             "uploaded_at": _utc_now(),
             "object_count": len(objects),
             "total_bytes": sum(item["size"] for item in objects),
             "objects": objects,
         }
+
+    def _put_manifest(self, manifest_key: str, manifest: dict) -> None:
         manifest_body = (json.dumps(manifest, separators=(",", ":")) + "\n").encode("utf-8")
         manifest_sha = hashlib.sha256(manifest_body).hexdigest()
-        manifest_key = prefix + COMPLETE_OBJECT
         self._put_bytes(manifest_key, manifest_body, "application/json", manifest_sha)
         self._verify(manifest_key, len(manifest_body), manifest_sha)
-        return manifest
 
     def get_object(self, key: str) -> StoredObject:
         clean = str(key).strip().lstrip("/")
@@ -240,7 +312,10 @@ class S3TrialStorage:
             pages = paginator.paginate(Bucket=self.config.bucket, Prefix=TRIAL_PREFIX + "/")
             keys = [
                 item.get("Key") for page in pages for item in page.get("Contents", [])
+                # Only trials/<id>/_complete.json: a subfolder's own marker
+                # (trials/<id>/phone/_complete.json) is not a trial.
                 if str(item.get("Key", "")).endswith("/" + COMPLETE_OBJECT)
+                and len(str(item.get("Key", "")).split("/")) == 3
             ]
             for key in keys:
                 try:

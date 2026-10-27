@@ -122,6 +122,7 @@
       row.setAttribute("aria-label", `Open trial ${trial.trial || trial.id}`);
       const trialCell = node("td");
       trialCell.append(node("span", "tid", trial.trial || trial.id));
+      if (trial.phone_copy) trialCell.append(node("span", "pc", "phone copy"));
       trialCell.append(node("div", "sub", [`participant ${trial.participant || "—"}`, trial.sensor_source]
         .filter(Boolean).join(" · ")));
       const condCell = node("td", null, trial.condition || "—");
@@ -228,6 +229,32 @@
       lines.push(`Source switched from ${change.from} to ${change.to}${change.ts ? ` at ${change.ts}` : ""}.`);
     }
     for (const line of lines) host.append(node("p", null, line));
+    host.hidden = false;
+  }
+
+  // The phone's own copy against what reached the server (frame_recv).
+  function addPhoneCopy(phone) {
+    const host = $("#dPhone");
+    host.replaceChildren();
+    if (!phone) {
+      host.hidden = true;
+      return;
+    }
+    const count = value => (value == null ? "—" : String(value));
+    host.append(node("b", null, `Phone copy: ${count(phone.frames)} frames captured · `
+      + `${count(phone.reached)} reached server · gap ${count(phone.gap)}`));
+    let detail;
+    if (!phone.linked) {
+      detail = "Missing frames not listed: frames reached the server without a phone seq.";
+    } else if (!phone.missing_total) {
+      detail = "No captured frame is missing on the server.";
+    } else {
+      const ranges = (phone.missing_ranges || []).map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`));
+      const more = (phone.missing_range_count || 0) - ranges.length;
+      detail = `missing ${ranges.join(", ")}${more > 0 ? `, … ${more} more ranges` : ""}`
+        + ` (${phone.missing_total} frames)`;
+    }
+    host.append(node("p", null, detail));
     host.hidden = false;
   }
 
@@ -454,6 +481,7 @@
     $("#tDrop").textContent = judged(summary.dropped_events);
     addWarnings(data.condition_mismatch, data.config_drift, data.sensor_source_changes);
     addConfig(data.config || {}, meta.config_overridden);
+    addPhoneCopy(data.phone_copy);
     addGroundTruth(data.ground_truth || {});
 
     const host = $("#turns"); host.replaceChildren();

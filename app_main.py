@@ -69,6 +69,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response, RedirectResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
@@ -1042,6 +1043,8 @@ from trial_config import SessionConfig, parse_bool
 from trial_recorder import TrialRecorder
 from trial_scorer import TrialScoringError, score_trial_folder
 from trial_archive import _SAFE_TRIAL_ID, TrialArchive, TrialArchiveError, TrialNotFound
+import phone_capture
+from phone_capture import PhoneCaptureInvalid, PhoneCaptureNoSpace, jpeg_comment_seq
 from trial_storage import (
     UPLOAD_RECEIPT,
     TrialStorageError,
@@ -1359,12 +1362,48 @@ async def _upload_scored_trial(session_id: str, directory: Optional[str] = None)
         raise TrialStorageError("trial is still open")
     lock = _trial_upload_locks.setdefault(session_id, asyncio.Lock())
     async with lock:
+        # A phone copy whose R2 push failed is retried here, before (and
+        # regardless of) the scoring check: it never depended on scoring.
+        phone = None
+        if await asyncio.to_thread(phone_capture.push_pending, directory):
+            phone = await _push_phone_copy(session_id, directory)
         await asyncio.to_thread(_assert_trial_ready_for_upload, directory)
         manifest = await asyncio.to_thread(trial_object_storage.put_folder, directory)
         await asyncio.to_thread(write_upload_receipt, directory, manifest)
         result = {key: value for key, value in manifest.items() if key != "objects"}
+        if phone is not None:
+            result["phone"] = phone
         print(f"[TRIAL-UPLOAD] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
         return result
+
+
+async def _push_phone_copy(session_id: str, directory: str) -> dict:
+    """Push phone/ to R2; on confirmation, prune the local frames. Caller holds the lock.
+
+    A failure is written to the trial's push state, so the next /upload for
+    this trial retries it; the local copy stays complete until R2 confirms.
+    """
+    try:
+        manifest = await asyncio.to_thread(
+            trial_object_storage.put_subfolder, directory, phone_capture.PHONE_DIR
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:300]
+        await asyncio.to_thread(
+            phone_capture.write_push_state, directory, {"status": "failed", "error": error}
+        )
+        print(f"[PHONE-CAPTURE] r2 push failed id={session_id} error={error}", flush=True)
+        return {"status": "failed", "error": error}
+    result = {
+        "status": "uploaded",
+        "object_count": manifest["object_count"],
+        "total_bytes": manifest["total_bytes"],
+        "stale_deleted": manifest.get("stale_deleted", 0),
+    }
+    await asyncio.to_thread(phone_capture.write_push_state, directory, {**result, "status": "done"})
+    await asyncio.to_thread(phone_capture.prune_after_push, directory)
+    print(f"[PHONE-CAPTURE] r2 push done id={session_id} {json.dumps(result, separators=(',', ':'))}", flush=True)
+    return result
 
 
 async def _auto_upload_scored_trial(session_id: str, directory: str) -> None:
@@ -2839,6 +2878,116 @@ async def trial_upload(trial_id: str, request: Request):
     return JSONResponse(result)
 
 
+# The ZIP streams to the container's own disk, never the 1 GB /data volume and
+# never memory; only the extracted copy lands on /data (beside the trial, so
+# the final rename is atomic).
+PHONE_CAPTURE_TMP = os.getenv("PHONE_CAPTURE_TMP", "/tmp")
+PHONE_CAPTURE_WRITE_CHUNK = 1024 * 1024
+
+
+def _free_bytes(path: str) -> int:
+    return shutil.disk_usage(path).free
+
+
+@app.post("/internal/trial/{trial_id}/phone_capture")
+async def trial_phone_capture(trial_id: str, request: Request):
+    """The phone's own copy of an ended trial, as one ZIP. See phone_capture.py."""
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    try:
+        directory = _validated_trial_directory(trial_id)
+    except TrialStorageError as exc:
+        status = 404 if str(exc) == "trial not found" else 422
+        return JSONResponse({"error": str(exc)}, status_code=status)
+    open_error = {"error": "trial is still open; upload the phone copy after it ends"}
+    if trial_recorder.status().get("session_id") == trial_id:
+        return JSONResponse(open_error, status_code=409)
+
+    limit = phone_capture.MAX_BYTES
+    declared: Optional[int] = None
+    if request.headers.get("content-length"):
+        try:
+            declared = int(request.headers["content-length"])
+        except ValueError:
+            return JSONResponse({"error": "invalid Content-Length"}, status_code=400)
+        if declared > limit:
+            return JSONResponse({"error": f"phone capture is limited to {limit} bytes"}, status_code=413)
+    needed = (declared if declared is not None else limit) + phone_capture.FREE_SPACE_MARGIN
+    for label, path in (("temp disk", PHONE_CAPTURE_TMP), ("trial volume", trial_recorder.root)):
+        free = await asyncio.to_thread(_free_bytes, path)
+        if free < needed:
+            return JSONResponse(
+                {"error": f"not enough free space on the {label}: {free} bytes free, {needed} needed"},
+                status_code=507,
+            )
+
+    zip_path: Optional[str] = None
+    handle = None
+    try:
+        fd, zip_path = await asyncio.to_thread(
+            tempfile.mkstemp, prefix=f"phone-{trial_id}-", suffix=".zip", dir=PHONE_CAPTURE_TMP
+        )
+        handle = os.fdopen(fd, "wb")
+        total = 0
+        buffer = bytearray()
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                return JSONResponse({"error": f"phone capture is limited to {limit} bytes"}, status_code=413)
+            buffer += chunk
+            if len(buffer) >= PHONE_CAPTURE_WRITE_CHUNK:
+                await asyncio.to_thread(handle.write, bytes(buffer))
+                buffer.clear()
+        if buffer:
+            await asyncio.to_thread(handle.write, bytes(buffer))
+        await asyncio.to_thread(handle.close)
+        handle = None
+
+        lock = _trial_upload_locks.setdefault(trial_id, asyncio.Lock())
+        async with lock:
+            # The trial could have been reopened while the body streamed.
+            if trial_recorder.status().get("session_id") == trial_id:
+                return JSONResponse(open_error, status_code=409)
+            manifest = await asyncio.to_thread(
+                phone_capture.install, zip_path, directory, trial_id, limit
+            )
+            if trial_object_storage is None:
+                r2 = {"status": "not_configured"}
+            else:
+                r2 = await _push_phone_copy(trial_id, directory)
+    except PhoneCaptureInvalid as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except PhoneCaptureNoSpace as exc:
+        return JSONResponse({"error": str(exc)}, status_code=507)
+    finally:
+        if handle is not None:
+            await asyncio.to_thread(handle.close)
+        if zip_path is not None:
+            await asyncio.to_thread(_remove_quietly, zip_path)
+    print(
+        f"[PHONE-CAPTURE] installed id={trial_id} frames={manifest['frames']} "
+        f"imu_samples={manifest['imu_samples']} bytes={total} r2={r2['status']}",
+        flush=True,
+    )
+    return JSONResponse({
+        "trial_id": trial_id,
+        "frames": manifest["frames"],
+        "imu_samples": manifest["imu_samples"],
+        "bytes": total,
+        "r2": r2,
+    })
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
     """Fail-closed auth for every team-facing trial data route."""
     expected = os.getenv("TRIAL_TOKEN", "")
@@ -2926,16 +3075,28 @@ async def trial_zip(trial_id: str, request: Request):
     denied = _trial_view_auth_failed(request)
     if denied:
         return denied
+    # Built on the container's temp disk, not in memory: with the phone copy a
+    # trial ZIP can be a few hundred MB on a 1 GB VM.
+    zip_path: Optional[str] = None
     try:
-        body = await asyncio.to_thread(trial_archive.zip_bytes, trial_id)
+        fd, zip_path = await asyncio.to_thread(
+            tempfile.mkstemp, prefix="trial-", suffix=".zip", dir=PHONE_CAPTURE_TMP
+        )
+        os.close(fd)
+        await asyncio.to_thread(trial_archive.zip_to_file, trial_id, zip_path)
     except TrialNotFound:
+        if zip_path:
+            await asyncio.to_thread(_remove_quietly, zip_path)
         return JSONResponse({"error": "trial not found"}, status_code=404)
     except (TrialArchiveError, TrialStorageError) as exc:
+        if zip_path:
+            await asyncio.to_thread(_remove_quietly, zip_path)
         return JSONResponse({"error": str(exc)}, status_code=502)
-    return Response(
-        body,
+    return FileResponse(
+        zip_path,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{trial_id}.zip"'},
+        filename=f"{trial_id}.zip",
+        background=BackgroundTask(_remove_quietly, zip_path),
     )
 
 
@@ -4424,6 +4585,13 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                 if msg_type == MSG_TYPE_CAM:
                     received_at = time.monotonic()
                     camera_received_count += 1
+                    # Read before canonicalize_phone_rgb_jpeg: the re-encode drops COM.
+                    trial_recorder.frame_recv(
+                        source,
+                        jpeg_comment_seq(payload) if source == "phone" else None,
+                        camera_received_count,
+                        len(payload),
+                    )
                     queue_latest_raw_rgb(
                         payload, received_at, raw_holder, raw_event,
                         rgb_canonicalizer_telemetry,

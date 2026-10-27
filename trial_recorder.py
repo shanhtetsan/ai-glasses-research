@@ -393,6 +393,17 @@ class TrialRecorder:
             "age_ms": round((time.monotonic() - stamp) * 1000, 1) if stamp else None,
         }
 
+    def frame_recv(self, source: str, phone_seq: Optional[int], n: int, size: int) -> None:
+        """Every camera frame on arrival, before drop-to-latest or the re-encode.
+
+        Counts what reached the server, so the phone's own copy can show the
+        gap. phone_seq is the phone's frame number (None for glasses). Never
+        opens the untitled fallback: frames arrive on an idle box too.
+        """
+        if not self.enabled or self._session is None:
+            return
+        self._emit("frame_recv", None, source=source, phone_seq=phone_seq, n=n, bytes=size)
+
     def frame_sent(self, server_turn_id: Optional[int], seq: Optional[int], jpeg: bytes,
                    captured_at: Optional[float], source: str) -> None:
         if not self.enabled or self._session is None:

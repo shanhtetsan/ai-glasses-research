@@ -101,6 +101,16 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   `meta.json` and `session_start`, not a `session_config` knob. It is `null` until a device first
   connects. A phone<->glasses switch in an open trial writes `sensor_source_change`; the first
   connect after `null`, and a same-device reconnect, do not.
+- Every camera frame on `/ws/camera_thermal` logs `frame_recv` on arrival (only while a trial is
+  open). For `source=phone` it carries `phone_seq`, read from the JPEG's `seq=<n>` COM segment
+  *before* `canonicalize_phone_rgb_jpeg`, whose re-encode drops it; glasses log `phone_seq: null`.
+- `POST /internal/trial/{session_id}/phone_capture` (ZIP, max 300 MB, ended trials only; see
+  `phone_capture.py`) installs the phone's own copy as `<trial>/phone/`. The ZIP streams to
+  `PHONE_CAPTURE_TMP` (`/tmp`, container disk), unpacks to a dot-named staging folder, then is
+  renamed in. `phone/` goes to R2 on its own, with its own `phone/_complete.json`; the trial's
+  `put_folder` skips it and skips every dot-named path. After R2 confirms, only `manifest.json`
+  and `phone.jsonl` stay on `/data`. A failed push (`.phone_push.json`) is retried by the next
+  `/upload` for that trial. `/trials/{id}.zip` is built on `/tmp`, never in memory (1 GB VM).
 - `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds

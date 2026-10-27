@@ -52,3 +52,6 @@ fly.toml
 # Large, never needed in the image
 .git
 **/*.obj
+
+# Firmware: never needed by the backend, and compile.ino holds WiFi passwords
+compile/

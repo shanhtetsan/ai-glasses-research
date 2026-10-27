@@ -10,9 +10,10 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from phone_capture import MISSING_RANGES_SHOWN, PHONE_DIR, frame_seq, missing_ranges
 from trial_config import condition_mismatch, recorded_config, resume_drift
 from trial_scorer import build_question_windows, read_session_events
-from trial_storage import TrialObjectNotFound, TrialObjectStorage, TrialStorageError
+from trial_storage import COMPLETE_OBJECT, TrialObjectNotFound, TrialObjectStorage, TrialStorageError
 
 
 _SAFE_TRIAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,64}$")
@@ -173,6 +174,7 @@ class TrialArchive:
                 "participant": meta.get("pid"),
                 "site": meta.get("site"),
                 "condition": meta.get("cond"),
+                "phone_copy": self._has_phone_copy(trial_id, trial_id in remote_ids),
                 # None for a trial opened before any device connected, or
                 # recorded before the source was stamped: not guessed.
                 "sensor_source": meta.get("sensor_source"),
@@ -268,32 +270,139 @@ class TrialArchive:
             # Source at session open, and any device switch after it.
             "sensor_source": meta.get("sensor_source"),
             "sensor_source_changes": sensor_source_changes(events),
+            "phone_copy": self.phone_copy(trial_id, events),
             "ground_truth": ground_truth,
             "summary": summary,
             "scored": bool(summary),
             "windows": windows,
         }
 
+    # ------------------------------------------------------------ phone copy
+
+    def _remote_manifest(self, safe: str, relative: str) -> Optional[dict]:
+        if self.storage is None:
+            return None
+        try:
+            body = self.storage.get_object(f"trials/{safe}/{relative}").body
+        except TrialObjectNotFound:
+            return None
+        value = _json_bytes(body, relative)
+        return value if isinstance(value, dict) else None
+
+    def _has_phone_copy(self, trial_id: str, remote: bool) -> bool:
+        safe = self._validate_id(trial_id)
+        if (self.local_root / safe / PHONE_DIR / "manifest.json").is_file():
+            return True
+        if not remote:
+            return False
+        try:
+            return self._remote_manifest(safe, f"{PHONE_DIR}/{COMPLETE_OBJECT}") is not None
+        except (TrialArchiveError, TrialStorageError):
+            return False
+
+    def _phone_frame_seqs(self, safe: str) -> Optional[list[int]]:
+        """The phone's captured frame numbers: R2 marker first, then local frames/."""
+        try:
+            remote = self._remote_manifest(safe, f"{PHONE_DIR}/{COMPLETE_OBJECT}")
+        except (TrialArchiveError, TrialStorageError):
+            remote = None
+        prefix = PHONE_DIR + "/"
+        if remote is not None:
+            names = [str(item.get("key", ""))[len(prefix):] for item in remote.get("objects", [])
+                     if str(item.get("key", "")).startswith(prefix)]
+        else:
+            frames = self.local_root / safe / PHONE_DIR / "frames"
+            if not frames.is_dir():
+                return None
+            names = [f"frames/{path.name}" for path in frames.iterdir()]
+        return [seq for seq in (frame_seq(name) for name in names) if seq is not None]
+
+    def phone_copy(self, trial_id: str, events: list[dict]) -> Optional[dict]:
+        """N captured on the phone, M that reached the server, and what is missing."""
+        safe = self._validate_id(trial_id)
+        manifest = self.get_json(safe, f"{PHONE_DIR}/manifest.json")
+        if not isinstance(manifest, dict):
+            return None
+        received = [event for event in events
+                    if event.get("t") == "frame_recv" and event.get("source") == "phone"]
+        received_seqs = {event["phone_seq"] for event in received
+                         if isinstance(event.get("phone_seq"), int)}
+        captured = manifest.get("frames")
+        reached = len(received)
+        ranges = None
+        seqs = self._phone_frame_seqs(safe)
+        # Frames that arrived without a seq cannot be linked; listing every
+        # captured frame as missing would then be wrong, so say nothing.
+        if seqs is not None and (received_seqs or not received):
+            ranges = missing_ranges(seqs, received_seqs)
+        return {
+            "frames": captured,
+            "reached": reached,
+            "gap": captured - reached if isinstance(captured, int) else None,
+            "linked": ranges is not None,
+            "missing_total": None if ranges is None else sum(b - a + 1 for a, b in ranges),
+            "missing_range_count": None if ranges is None else len(ranges),
+            "missing_ranges": None if ranges is None else ranges[:MISSING_RANGES_SHOWN],
+            "imu_samples": manifest.get("imu_samples"),
+            "device": manifest.get("device"),
+            "app_version": manifest.get("app_version"),
+        }
+
+    # ------------------------------------------------------------ ZIP
+
     def zip_bytes(self, trial_id: str) -> bytes:
         safe = self._validate_id(trial_id)
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            if self.storage is not None:
-                try:
-                    manifest_object = self.storage.get_object(f"trials/{safe}/_complete.json")
-                    manifest = _json_bytes(manifest_object.body, "_complete.json")
-                    for item in manifest.get("objects", []):
-                        relative = str(item.get("key", ""))
-                        if relative:
-                            body, _, _ = self.get_bytes(safe, relative)
-                            archive.writestr(f"{safe}/{relative}", body)
-                    return buffer.getvalue()
-                except TrialObjectNotFound:
-                    pass
-            directory = self._local_dir(safe)
-            if not directory.is_dir():
-                raise TrialNotFound("trial not found")
-            for path in sorted(item for item in directory.rglob("*") if item.is_file()):
-                archive.write(path, f"{safe}/{path.relative_to(directory).as_posix()}")
+            self._write_zip(safe, archive)
         return buffer.getvalue()
 
+    def zip_to_file(self, trial_id: str, path: str | os.PathLike[str]) -> None:
+        """Same contents as zip_bytes, written to disk instead of memory."""
+        safe = self._validate_id(trial_id)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            self._write_zip(safe, archive)
+
+    @staticmethod
+    def _compress_type(name: str) -> int:
+        # JPEGs do not deflate; storing them saves CPU on a large phone copy.
+        return zipfile.ZIP_STORED if name.lower().endswith(".jpg") else zipfile.ZIP_DEFLATED
+
+    def _write_zip(self, safe: str, archive: zipfile.ZipFile) -> None:
+        """The trial (R2 marker first, else local), then phone/ the same way.
+
+        The two are separate because phone/ has its own R2 marker and arrives
+        on its own schedule; local-only files never include dot-named
+        receipts or staging folders.
+        """
+        directory = self._local_dir(safe)
+        main = self._remote_manifest(safe, COMPLETE_OBJECT)
+        phone = self._remote_manifest(safe, f"{PHONE_DIR}/{COMPLETE_OBJECT}")
+        if main is None and not directory.is_dir():
+            raise TrialNotFound("trial not found")
+
+        def add_remote(manifest: dict) -> None:
+            for item in manifest.get("objects", []):
+                relative = str(item.get("key", ""))
+                if relative:
+                    body, _, _ = self.get_bytes(safe, relative)
+                    name = f"{safe}/{relative}"
+                    archive.writestr(name, body, compress_type=self._compress_type(name))
+
+        def add_local(paths) -> None:
+            for path in sorted(paths):
+                relative = path.relative_to(directory)
+                if any(part.startswith(".") for part in relative.parts):
+                    continue
+                name = f"{safe}/{relative.as_posix()}"
+                archive.write(path, name, compress_type=self._compress_type(name))
+
+        if main is not None:
+            add_remote(main)
+        else:
+            add_local(item for item in directory.rglob("*")
+                      if item.is_file() and item.relative_to(directory).parts[0] != PHONE_DIR)
+        if phone is not None:
+            add_remote(phone)
+        elif (directory / PHONE_DIR).is_dir():
+            add_local(item for item in (directory / PHONE_DIR).rglob("*") if item.is_file())
