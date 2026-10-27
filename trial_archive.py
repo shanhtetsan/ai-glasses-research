@@ -42,6 +42,15 @@ def _local_json(path: Path, default=None):
         raise TrialArchiveError(f"cannot read {path.name}: {exc}") from exc
 
 
+def sensor_source_changes(events: list[dict]) -> list[dict]:
+    """Every phone<->glasses switch recorded during the trial, in order."""
+    return [
+        {"from": event.get("from"), "to": event.get("to"), "ts": event.get("ts")}
+        for event in events
+        if event.get("t") == "sensor_source_change"
+    ]
+
+
 def integrate_heading(imu_samples: list[dict]) -> list[dict]:
     """Integrate angular velocity projected onto gravity into relative heading."""
     heading = 0.0
@@ -164,6 +173,9 @@ class TrialArchive:
                 "participant": meta.get("pid"),
                 "site": meta.get("site"),
                 "condition": meta.get("cond"),
+                # None for a trial opened before any device connected, or
+                # recorded before the source was stamped: not guessed.
+                "sensor_source": meta.get("sensor_source"),
                 # The typed label against the flag that actually ran: a
                 # mislabelled trial is flagged in the list, not only on its page.
                 "condition_mismatch": condition_mismatch(
@@ -253,6 +265,9 @@ class TrialArchive:
             # A restart part-way through drops the per-trial override: this is
             # the trial saying so, from its own resume events.
             "config_drift": resume_drift(meta, events),
+            # Source at session open, and any device switch after it.
+            "sensor_source": meta.get("sensor_source"),
+            "sensor_source_changes": sensor_source_changes(events),
             "ground_truth": ground_truth,
             "summary": summary,
             "scored": bool(summary),

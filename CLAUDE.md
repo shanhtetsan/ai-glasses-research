@@ -26,6 +26,11 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   Never rotate or flip again downstream.
 - `CAMERA_ROTATION_DEG = 0` (`app_main.py`). `POST /api/settings` returns 400
   for any nonzero `camera_rotation_deg`.
+- Phone frames are the exception: `/ws/camera_thermal?source=phone` frames arrive upright and
+  go through `canonicalize_phone_rgb_jpeg` (same decode + quality-75 re-encode, no rotation).
+  No param (the ESP32) means `glasses`; any other value is refused with 1008.
+  A phone's IMU must be sent in glasses units and sign (deg/s; m/s² reading +g up at rest).
+  iOS gives rad/s and g with the opposite sign; the backend does not convert.
 - Frames are stored and shown exactly as Gemini received them.
   Do not add a display rotation to the trial viewer.
 
@@ -92,6 +97,10 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   `session_config.observed()`, never from the request body, so the typed `cond` label
   and the arm that ran can be checked against each other (`condition_mismatch()`; the
   trial page warns on a disagreement).
+- `sensor_source` (`phone`/`glasses`, from `camera_source` in `app_main.py`) is a static field in
+  `meta.json` and `session_start`, not a `session_config` knob. It is `null` until a device first
+  connects. A phone<->glasses switch in an open trial writes `sensor_source_change`; the first
+  connect after `null`, and a same-device reconnect, do not.
 - `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds

@@ -75,6 +75,7 @@ import cv2
 import numpy as np
 from perception_orientation import (
     RgbCanonicalizerTelemetry,
+    canonicalize_phone_rgb_jpeg,
     canonicalize_thermal_payload,
     log_rgb_canonicalizer_health,
     map_thermal_to_rgb_normalized,
@@ -1150,6 +1151,9 @@ def _trial_static_fields() -> dict:
     ).hexdigest()
     return {
         **session_config.observed(),
+        # Not a session_config knob: it is a property of the device connected,
+        # not an experiment arm, and a restarted process has no device yet.
+        "sensor_source": camera_source,
         # Which of those came from this trial rather than from the environment.
         "config_overridden": ",".join(sorted(session_config.overrides())) or None,
         "prompt_sha256": prompt_sha,
@@ -1532,6 +1536,11 @@ def _viewer_attach(ws: WebSocket, viewers: Set[WebSocket]) -> asyncio.Task:
 
 
 esp32_camera_ws: Optional[WebSocket] = None
+# Which device last connected to /ws/camera_thermal ("glasses" or "phone").
+# None until the first connect since boot: nothing is guessed. Kept after a
+# disconnect, so it is the source of the most recent frames.
+CAMERA_SOURCES = ("glasses", "phone")
+camera_source: Optional[str] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
 _esp32_audio_send_lock: Optional[asyncio.Lock] = None
@@ -4239,15 +4248,24 @@ async def ws_camera_esp(ws: WebSocket):
 @app.websocket("/ws/camera_thermal")
 async def ws_camera_thermal_esp(ws: WebSocket):
     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    global camera_source
+    # ?source=phone|glasses. No param means glasses, so the ESP32 is unchanged.
+    # Anything else is refused rather than recorded as glasses.
+    source = ws.query_params.get("source") or "glasses"
+    if source not in CAMERA_SOURCES:
+        await ws.close(code=1008, reason="source must be phone or glasses")
+        return
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
     esp32_camera_ws = ws
     await ws.accept()
+    camera_source = source
+    trial_recorder.sensor_source(source)
     device_id = _device_id(ws)
     connected_at = time.monotonic()
     backend_metrics["camera_sensor_connects"] += 1
-    print(f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect", flush=True)
+    print(f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect source={source}", flush=True)
 
     # Initialize the blind-path navigator
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -4371,12 +4389,22 @@ async def ws_camera_thermal_esp(ws: WebSocket):
             received_at,
         )
 
-    canonicalizer_task = asyncio.create_task(
-        run_latest_rgb_canonicalizer(
-            raw_holder, raw_event, _publish_canonical,
-            rgb_canonicalizer_telemetry,
+    if source == "phone":
+        # Phone frames are already upright: same pipeline, no rotation.
+        canonicalizer_task = asyncio.create_task(
+            run_latest_rgb_canonicalizer(
+                raw_holder, raw_event, _publish_canonical,
+                rgb_canonicalizer_telemetry,
+                transform=canonicalize_phone_rgb_jpeg,
+            )
         )
-    )
+    else:
+        canonicalizer_task = asyncio.create_task(
+            run_latest_rgb_canonicalizer(
+                raw_holder, raw_event, _publish_canonical,
+                rgb_canonicalizer_telemetry,
+            )
+        )
     canonicalizer_health_task = asyncio.create_task(
         log_rgb_canonicalizer_health(rgb_canonicalizer_telemetry)
     )
@@ -4484,7 +4512,7 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         backend_metrics["camera_sensor_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=camera_thermal event=disconnect "
-            f"reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
+            f"source={source} reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
             f"camera_frames={frame_counter} thermal_frames={thermal_frame_count} "
             f"thermal_dropped={thermal_dropped}",
             flush=True,

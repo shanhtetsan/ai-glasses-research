@@ -129,6 +129,26 @@ def canonicalize_rgb_jpeg(data: bytes) -> bytes | None:
         return None
 
 
+def canonicalize_phone_rgb_jpeg(data: bytes) -> bytes | None:
+    """Phone frames arrive upright: decode and re-encode once, never rotate.
+
+    Same decode check and JPEG quality as the glasses path, so the only
+    difference between the two sources is the rotation the glasses need.
+    """
+    try:
+        bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None or bgr.size == 0:
+            return None
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), RGB_REENCODE_QUALITY],
+        )
+        return encoded.tobytes() if ok else None
+    except Exception:
+        return None
+
+
 def queue_latest_raw_rgb(
     data: bytes,
     received_at: float,

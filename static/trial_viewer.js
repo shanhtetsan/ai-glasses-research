@@ -122,7 +122,8 @@
       row.setAttribute("aria-label", `Open trial ${trial.trial || trial.id}`);
       const trialCell = node("td");
       trialCell.append(node("span", "tid", trial.trial || trial.id));
-      trialCell.append(node("div", "sub", `participant ${trial.participant || "—"}`));
+      trialCell.append(node("div", "sub", [`participant ${trial.participant || "—"}`, trial.sensor_source]
+        .filter(Boolean).join(" · ")));
       const condCell = node("td", null, trial.condition || "—");
       if (trial.condition_mismatch) {
         const flag = node("span", "mm", "mislabelled");
@@ -208,19 +209,24 @@
     host.hidden = false;
   }
 
-  function addWarnings(mismatch, drift) {
+  function addWarnings(mismatch, drift, sourceChanges) {
     const host = $("#dWarn");
     host.replaceChildren();
-    if (!mismatch && !drift) {
+    const switches = sourceChanges || [];
+    if (!mismatch && !drift && !switches.length) {
       host.hidden = true;
       return;
     }
     host.append(node("b", null, mismatch
       ? "Condition label does not match the run"
-      : "The configuration changed during this run"));
+      : drift ? "The configuration changed during this run"
+        : "The camera source changed during this run"));
     const lines = [];
     if (mismatch) lines.push(`${mismatch} Fix the label or drop this trial from the comparison.`);
     if (drift) lines.push(`${drift} The backend restarted mid-trial and came back on the deploy default.`);
+    for (const change of switches) {
+      lines.push(`Source switched from ${change.from} to ${change.to}${change.ts ? ` at ${change.ts}` : ""}.`);
+    }
     for (const line of lines) host.append(node("p", null, line));
     host.hidden = false;
   }
@@ -438,7 +444,7 @@
     const meta = data.meta || {};
     document.title = `${meta.trial || data.id} · Trial Archive`;
     $("#dWho").textContent = [meta.trial || data.id, `participant ${meta.pid || "—"}`, meta.site, meta.cond,
-      `prompt ${meta.prompt_version || "—"}`, dateLabel(meta.created_ts)].filter(Boolean).join(" · ");
+      data.sensor_source, `prompt ${meta.prompt_version || "—"}`, dateLabel(meta.created_ts)].filter(Boolean).join(" · ");
     const judged = value => (scored ? (value ?? 0) : "—");
     $("#tRight").textContent = judged(counts.right); $("#tUseful").textContent = judged(counts.useful_refusal);
     $("#tDead").textContent = judged(counts.dead_refusal); $("#tBad").textContent = judged(counts.bad_guess);
@@ -446,7 +452,7 @@
     // Misattribution comes from the event log, not the judge, so it is known before scoring.
     $("#tMis").textContent = summary.misattributed_turns ?? windows.filter(item => item.answer_arrived_under).length;
     $("#tDrop").textContent = judged(summary.dropped_events);
-    addWarnings(data.condition_mismatch, data.config_drift);
+    addWarnings(data.condition_mismatch, data.config_drift, data.sensor_source_changes);
     addConfig(data.config || {}, meta.config_overridden);
     addGroundTruth(data.ground_truth || {});
 
