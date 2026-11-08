@@ -1034,7 +1034,7 @@ import shutil
 import signal
 import atexit
 from stability_runtime import (
-    MSG_TYPE_CAM, MSG_TYPE_THERMAL, MSG_TYPE_IMU, MSG_TYPE_STATUS,
+    MSG_TYPE_CAM, MSG_TYPE_THERMAL, MSG_TYPE_IMU, MSG_TYPE_STATUS, MSG_TYPE_HEADING,
     AudioFreshnessTracker, LatencyTracker, LatestFrameStore,
     PCM_20MS_BYTES_16K_MONO, RecordingPipeline, VisionController,
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
@@ -1503,6 +1503,9 @@ except OSError as exc:
 # Canonical 32x24 Celsius grid shared by facts, heatmap, and calibration.
 latest_thermal_matrix: Optional[np.ndarray] = None
 latest_imu: Dict[str, Any] = {"timestamp": 0.0, "sequence": 0, "data": None}
+# Phone compass heading (MSG_TYPE_HEADING), from the /test page. Cleared when
+# that phone's socket closes, so a later glasses trial never inherits it.
+latest_heading: Dict[str, Any] = {"timestamp": 0.0, "data": None}
 latest_device_status: Dict[str, Any] = {"timestamp": 0.0, "data": None}
 thermal_display_config: Dict[str, Any] = {
     "palette": "inferno",
@@ -3889,6 +3892,7 @@ async def ws_audio(ws: WebSocket):
                         trial_recorder.speech_start(
                             turn_id, server_turn_id,
                             _trial_thermal_snapshot(), dict(latest_imu),
+                            dict(latest_heading),
                         )
                     continue
 
@@ -4762,6 +4766,9 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                     imu_event.set()
                 elif msg_type == MSG_TYPE_STATUS:
                     latest_device_status.update({"timestamp": time.monotonic(), "data": payload})
+                elif msg_type == MSG_TYPE_HEADING:
+                    latest_heading.update({"timestamp": time.monotonic(), "data": payload})
+                    trial_recorder.heading_sample(latest_heading)
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
     except WebSocketDisconnect:
@@ -4813,6 +4820,8 @@ async def ws_camera_thermal_esp(ws: WebSocket):
         if still_held:
             _camera_conn = None
             esp32_camera_ws = None
+            # A heading belongs to the device that sent it; never carry it over.
+            latest_heading.update({"timestamp": 0.0, "data": None})
         backend_metrics["camera_sensor_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=camera_thermal event=disconnect "

@@ -8,6 +8,9 @@
 //   frame -> /ws/camera_thermal  0x01 + JPEG with a "seq=<n>" COM segment
 
 export const MSG_TYPE_CAM = 0x01;
+export const MSG_TYPE_HEADING = 0x05;
+export const HEADING_INTERVAL_MS = 250;        // 4 Hz to the server; it records 2 Hz in a turn
+export const HEADING_MAX_AGE_MS = 1000;        // an older reading is not sent
 export const MIC_SAMPLE_RATE = 16000;
 export const MIC_CHUNK_BYTES = 640;            // 20 ms at 16 kHz PCM16
 export const TTS_SAMPLE_RATE = 8000;
@@ -132,6 +135,40 @@ export function cameraMessage(jpeg) {
   const out = new Uint8Array(jpeg.length + 1);
   out[0] = MSG_TYPE_CAM;
   out.set(jpeg, 1);
+  return out;
+}
+
+// Compass heading in degrees from magnetic north, clockwise, in [0, 360).
+// iOS Safari gives it directly (webkitCompassHeading). Elsewhere an absolute
+// deviceorientation alpha is counter-clockwise, so it is flipped. null when
+// the event carries no absolute heading.
+export function compassHeading(event) {
+  if (typeof event.webkitCompassHeading === "number" && Number.isFinite(event.webkitCompassHeading)
+      && event.webkitCompassHeading >= 0) {
+    return normalizeDegrees(event.webkitCompassHeading);
+  }
+  if (event.absolute === true && typeof event.alpha === "number" && Number.isFinite(event.alpha)) {
+    return normalizeDegrees(360 - event.alpha);
+  }
+  return null;
+}
+
+export function normalizeDegrees(value) {
+  const wrapped = value % 360;
+  const positive = wrapped < 0 ? wrapped + 360 : wrapped;
+  return positive >= 360 ? 0 : positive;   // float edge: 359.9999… % 360 can round to 360
+}
+
+// /ws/camera_thermal heading packet: 0x05 + struct "<Iff" (seq, deg, accuracy).
+// accuracy < 0 means unknown (stability_runtime.HEADING_STRUCT).
+export function headingMessage(sequence, degrees, accuracy) {
+  const out = new Uint8Array(13);
+  const view = new DataView(out.buffer);
+  out[0] = MSG_TYPE_HEADING;
+  view.setUint32(1, sequence >>> 0, true);
+  // float32 can round 359.99999 up to 360, which the server refuses.
+  view.setFloat32(5, Math.fround(degrees) >= 360 ? 0 : degrees, true);
+  view.setFloat32(9, Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : -1, true);
   return out;
 }
 

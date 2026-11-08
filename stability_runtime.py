@@ -18,10 +18,16 @@ MSG_TYPE_CAM = 0x01
 MSG_TYPE_THERMAL = 0x02
 MSG_TYPE_IMU = 0x03
 MSG_TYPE_STATUS = 0x04
+# Phone compass heading (the /test page in Safari). Absolute degrees from
+# magnetic north, clockwise, 0 <= deg < 360; accuracy_deg < 0 means unknown.
+# Separate from MSG_TYPE_IMU on purpose: a browser cannot give raw gyro and
+# accel in the glasses' axes and signs, but the compass heading is unambiguous.
+MSG_TYPE_HEADING = 0x05
 THERMAL_PAYLOAD_BYTES = 24 * 32 * 4
 MAX_JPEG_PAYLOAD_BYTES = 300 * 1024
 IMU_STRUCT = struct.Struct("<IIffffff")
 STATUS_STRUCT = struct.Struct("<IIII")
+HEADING_STRUCT = struct.Struct("<Iff")      # seq, heading_deg, accuracy_deg
 PCM_20MS_BYTES_16K_MONO = 640
 
 
@@ -708,6 +714,19 @@ def parse_sensor_message(data: bytes):
             "free_heap": free_heap,
             "largest_internal": largest_internal,
             "free_psram": free_psram,
+        }
+    if msg_type == MSG_TYPE_HEADING:
+        if len(payload) != HEADING_STRUCT.size:
+            raise ValueError("invalid heading payload length")
+        seq, heading_deg, accuracy_deg = HEADING_STRUCT.unpack(payload)
+        if not (math.isfinite(heading_deg) and math.isfinite(accuracy_deg)):
+            raise ValueError("non-finite heading value")
+        if not 0.0 <= heading_deg < 360.0:
+            raise ValueError("heading out of range")
+        return msg_type, {
+            "sequence": seq,
+            "heading_deg": heading_deg,
+            "accuracy_deg": accuracy_deg if accuracy_deg >= 0 else None,
         }
     raise ValueError("unknown message prefix")
 

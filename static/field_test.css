@@ -91,6 +91,7 @@ button:disabled { opacity: 0.45; }
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; background: var(--line); margin-left: 8px; }
 .dot.ok { background: var(--ok); }
 .dot.bad { background: var(--bad); }
+.heading { margin-left: 10px; font-variant-numeric: tabular-nums; }
 
 .cam {
   border-radius: 14px;

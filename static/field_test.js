@@ -11,8 +11,9 @@
 // The core module is loaded with this file's own ?v= so a deploy never pairs
 // a new page script with a cached old core (the route versions both by mtime).
 const {
-  FRAME_INTERVAL_MS, MAX_JPEG_BYTES, MIC_SAMPLE_RATE, TTS_SAMPLE_RATE,
-  PcmChunker, cameraMessage, decodeServerEvent, frameSize, makeDeviceId,
+  FRAME_INTERVAL_MS, HEADING_INTERVAL_MS, HEADING_MAX_AGE_MS, MAX_JPEG_BYTES, MIC_SAMPLE_RATE,
+  TTS_SAMPLE_RATE, PcmChunker, cameraMessage, compassHeading, decodeServerEvent, frameSize,
+  headingMessage, makeDeviceId,
   newResampleState, pcm16BytesToFloat, resampleToInt16, stampJpegSequence,
   trialFormError, trialRequestBody,
 } = await import(`./field_test_core.mjs${new URL(import.meta.url).search}`);
@@ -67,6 +68,13 @@ const run = {
   pressHeld: false,
   wakeLock: null,
   cameraNote: "",
+  headingAllowed: false,
+  headingListener: null,
+  headingTimer: null,
+  headingDeg: null,
+  headingAccuracy: null,
+  headingAt: 0,
+  headingSeq: 0,
 };
 
 // ---------- small helpers ----------
@@ -135,6 +143,9 @@ function render() {
   $("#frames").textContent = String(run.framesSent);
   $("#skipped").textContent = String(run.framesSkipped);
   $("#turns").textContent = String(run.turnsAsked);
+  $("#heading").textContent = run.headingDeg === null
+    ? (run.headingAllowed ? "heading …" : "no heading")
+    : `heading ${Math.round(run.headingDeg)}°`;
   $("#camNote").textContent = run.cameraNote;
   $("#camNote").hidden = !run.cameraNote;
 }
@@ -175,7 +186,11 @@ async function startTrial(event) {
   if (formError) { showError(formError); return; }
   const button = $("#start");
   button.disabled = true;
+  // Asked first, while this tap still counts as the gesture iOS requires.
+  // A refusal is not fatal: the trial runs, just without heading.
+  const headingPermission = requestHeadingPermission();
   try {
+    run.headingAllowed = await headingPermission;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("This browser cannot open the camera here. Use Safari over https.");
     }
@@ -208,6 +223,7 @@ async function startTrial(event) {
     startMic();
     connectAudio();
     run.frameTimer = window.setInterval(sendFrame, FRAME_INTERVAL_MS);
+    startHeading();
     requestWakeLock();
     render();
   } catch (error) {
@@ -236,6 +252,7 @@ async function endTrial() {
   sendAudioText("STOP");
   run.active = false;
   window.clearInterval(run.frameTimer);
+  stopHeading();
   window.clearTimeout(run.audioTimer);
   window.clearTimeout(run.sensorTimer);
   window.clearTimeout(run.drainTimer);
@@ -268,6 +285,7 @@ function resetRun() {
     activeTurn: null, turnsAsked: 0, playbackTurn: null, frameSeq: 0,
     framesSent: 0, framesSkipped: 0, audioRetry: 0, sensorRetry: 0,
     speechEndTimes: new Map(), ttsEndPending: false, pressHeld: false, cameraNote: "",
+    headingAllowed: false, headingDeg: null, headingAccuracy: null, headingAt: 0, headingSeq: 0,
   });
 }
 
@@ -557,6 +575,51 @@ async function sendFrame() {
     run.frameBusy = false;
     render();
   }
+}
+
+// ---------- compass heading ----------
+
+async function requestHeadingPermission() {
+  const Orientation = window.DeviceOrientationEvent;
+  if (!Orientation) return false;
+  if (typeof Orientation.requestPermission === "function") {
+    try { return (await Orientation.requestPermission()) === "granted"; } catch { return false; }
+  }
+  return true;   // no prompt outside iOS
+}
+
+function startHeading() {
+  if (!run.headingAllowed) return;
+  // iOS fires "deviceorientation" with webkitCompassHeading; other browsers
+  // put the absolute reading on "deviceorientationabsolute".
+  const eventName = "ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation";
+  run.headingListener = (event) => {
+    const deg = compassHeading(event);
+    if (deg === null) return;
+    run.headingDeg = deg;
+    const accuracy = event.webkitCompassAccuracy;
+    run.headingAccuracy = typeof accuracy === "number" && accuracy >= 0 ? accuracy : null;
+    run.headingAt = performance.now();
+  };
+  window.addEventListener(eventName, run.headingListener);
+  run.headingEvent = eventName;
+  run.headingTimer = window.setInterval(sendHeading, HEADING_INTERVAL_MS);
+}
+
+function stopHeading() {
+  window.clearInterval(run.headingTimer);
+  run.headingTimer = null;
+  if (run.headingListener) window.removeEventListener(run.headingEvent, run.headingListener);
+  run.headingListener = null;
+}
+
+function sendHeading() {
+  const ws = run.sensorWs;
+  if (!run.active || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (run.headingDeg === null || performance.now() - run.headingAt > HEADING_MAX_AGE_MS) return;
+  run.headingSeq += 1;
+  ws.send(headingMessage(run.headingSeq, run.headingDeg, run.headingAccuracy ?? -1));
+  render();
 }
 
 // ---------- screen ----------

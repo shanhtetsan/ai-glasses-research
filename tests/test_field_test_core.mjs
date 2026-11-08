@@ -3,7 +3,8 @@ import test from 'node:test';
 
 import {
   DEVICE_ID_PATTERN, MIC_CHUNK_BYTES, PcmChunker, cameraMessage, decodeServerEvent,
-  floatToInt16, frameSize, makeDeviceId, newResampleState, pcm16BytesToFloat,
+  compassHeading, floatToInt16, frameSize, headingMessage, makeDeviceId, newResampleState,
+  normalizeDegrees, pcm16BytesToFloat,
   resampleToInt16, stampJpegSequence, trialFormError, trialRequestBody,
 } from '../static/field_test_core.mjs';
 
@@ -134,4 +135,28 @@ test('trial body matches the /trials form and validates ids', () => {
   assert.equal(trialRequestBody({ trial: 'T1', pid: 'e' }).ground_truth, undefined);
   assert.match(trialFormError({ trial: '', pid: 'e' }), /required/);
   assert.match(trialFormError({ trial: 'T 1', pid: 'e' }), /letters/);
+});
+
+test('compass heading: iOS value as is, absolute alpha flipped, else null', () => {
+  assert.equal(compassHeading({ webkitCompassHeading: 90 }), 90);
+  assert.equal(compassHeading({ webkitCompassHeading: 360 }), 0);
+  assert.equal(compassHeading({ webkitCompassHeading: -1, absolute: false, alpha: 10 }), null);
+  assert.equal(compassHeading({ absolute: true, alpha: 90 }), 270);
+  assert.equal(compassHeading({ absolute: true, alpha: 0 }), 0);
+  assert.equal(compassHeading({ absolute: false, alpha: 90 }), null);
+  assert.equal(compassHeading({}), null);
+  assert.equal(normalizeDegrees(-10), 350);
+  assert.equal(normalizeDegrees(725), 5);
+});
+
+test('heading packet is 0x05 + <Iff and never sends 360', () => {
+  const message = headingMessage(7, 123.5, 15);
+  const view = new DataView(message.buffer);
+  assert.equal(message.length, 13);
+  assert.equal(message[0], 0x05);
+  assert.equal(view.getUint32(1, true), 7);
+  assert.equal(view.getFloat32(5, true), 123.5);
+  assert.equal(view.getFloat32(9, true), 15);
+  assert.equal(new DataView(headingMessage(1, 10, null).buffer).getFloat32(9, true), -1);
+  assert.equal(new DataView(headingMessage(1, 359.99999999, 1).buffer).getFloat32(5, true), 0);
 });
