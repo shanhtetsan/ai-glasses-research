@@ -179,6 +179,7 @@ class NullSessionConfig:
 # asserts the two stay in step, so adding a knob means adding it here too.
 RECORDED_CONFIG_KEYS = (
     "pin_frame_every_turn",
+    "landmark_graph",
     "gemini_video_interval_sec",
     "vision_frame_max_age_sec",
     "stability_mode",

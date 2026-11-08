@@ -15,7 +15,8 @@ const {
   TTS_SAMPLE_RATE, PcmChunker, cameraMessage, compassHeading, decodeServerEvent, frameSize,
   headingMessage, makeDeviceId,
   newResampleState, pcm16BytesToFloat, resampleToInt16, stampJpegSequence,
-  trialFormError, trialRequestBody,
+  trialFormError, trialRequestBody, LANDMARK_KINDS, SITE_PATTERN, graphPayload, landmarkId,
+  parseSteps, removeLandmark, siteName,
 } = await import(`./field_test_core.mjs${new URL(import.meta.url).search}`);
 
 const $ = (selector) => document.querySelector(selector);
@@ -157,7 +158,7 @@ function setDot(selector, ok) {
 }
 
 function showPanel(name) {
-  for (const panel of ["setup", "live", "done"]) $(`#${panel}`).hidden = panel !== name;
+  for (const panel of ["setup", "map", "live", "done"]) $(`#${panel}`).hidden = panel !== name;
 }
 
 function loadSticky() {
@@ -170,7 +171,8 @@ function loadSticky() {
 
 function formValues() {
   const values = {};
-  for (const key of ["trial", "pid", "site", "cond", "task", "success_criterion", "room", "present", "absent"]) {
+  for (const key of ["trial", "pid", "site", "cond", "task", "success_criterion", "room", "present",
+    "absent", "pin", "graph"]) {
     values[key] = $(`#f_${key}`).value;
   }
   return values;
@@ -590,6 +592,7 @@ async function requestHeadingPermission() {
 
 function startHeading() {
   if (!run.headingAllowed) return;
+  if (run.headingListener) stopHeading();     // map mode may have started it
   // iOS fires "deviceorientation" with webkitCompassHeading; other browsers
   // put the absolute reading on "deviceorientationabsolute".
   const eventName = "ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation";
@@ -620,6 +623,162 @@ function sendHeading() {
   run.headingSeq += 1;
   ws.send(headingMessage(run.headingSeq, run.headingDeg, run.headingAccuracy ?? -1));
   render();
+}
+
+// ---------- map mode (landmark_graph.py) ----------
+
+const mapState = { landmarks: [], timer: null };
+
+async function getJSON(path) {
+  const response = await fetch(path, { credentials: "same-origin" });
+  let payload = {};
+  try { payload = await response.json(); } catch { /* empty */ }
+  if (!response.ok) throw new Error(payload.error || `${path} failed (${response.status})`);
+  return payload;
+}
+
+async function refreshGraphOptions(selected) {
+  const select = $("#f_graph");
+  const keep = selected ?? select.value;
+  try {
+    const { graphs } = await getJSON("/api/graphs");
+    select.replaceChildren(new Option("no map", ""));
+    for (const graph of graphs || []) {
+      select.append(new Option(`${graph.site} (${graph.landmarks} landmarks)`, graph.site));
+    }
+    if ([...select.options].some((option) => option.value === keep)) select.value = keep;
+  } catch (error) {
+    showError(`Could not load maps: ${error.message}`);
+  }
+}
+
+async function openMap() {
+  showError("");
+  // From this tap: iOS only shows the motion prompt inside a gesture.
+  run.headingAllowed = await requestHeadingPermission();
+  if (!run.headingAllowed) {
+    showError("Motion access was refused, so the compass is off. In Safari: aA → Website Settings → Motion & Orientation → Allow, then try again.");
+    return;
+  }
+  startHeading();
+  window.clearInterval(mapState.timer);
+  mapState.timer = window.setInterval(renderCompass, 200);
+  renderMap();
+  showPanel("map");
+}
+
+function leaveMap() {
+  window.clearInterval(mapState.timer);
+  mapState.timer = null;
+  stopHeading();
+  showError("");
+  refreshGraphOptions();
+  showPanel("setup");
+}
+
+function compassFresh() {
+  return run.headingDeg !== null && performance.now() - run.headingAt <= HEADING_MAX_AGE_MS;
+}
+
+function renderCompass() {
+  $("#m_heading").textContent = compassFresh()
+    ? `compass ${Math.round(run.headingDeg)}°${run.headingAccuracy !== null ? ` ±${Math.round(run.headingAccuracy)}` : ""}`
+    : "compass … (move the phone a little)";
+}
+
+function renderMap() {
+  const from = $("#m_from");
+  const keep = from.value;
+  from.replaceChildren(new Option("the start spot", "start"));
+  for (const item of mapState.landmarks) from.append(new Option(`the ${item.name}`, item.id));
+  if ([...from.options].some((option) => option.value === keep)) from.value = keep;
+
+  const names = new Map(mapState.landmarks.map((item) => [item.id, item.name]));
+  const list = $("#m_list");
+  list.replaceChildren();
+  for (const item of mapState.landmarks) {
+    const li = document.createElement("li");
+    const title = document.createElement("div");
+    title.textContent = `${item.name} (${item.kind})`;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const origin = item.from === "start" ? "start spot" : names.get(item.from);
+    meta.textContent = `from ${origin} · ${Math.round(item.bearing_deg)}°`
+      + (item.steps !== null ? ` · ${item.steps} steps` : "") + (item.note ? ` · ${item.note}` : "");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      mapState.landmarks = removeLandmark(mapState.landmarks, item.id);
+      renderMap();
+    });
+    li.append(title, meta, remove);
+    list.append(li);
+  }
+  $("#m_save").disabled = mapState.landmarks.length === 0;
+}
+
+function addLandmark() {
+  showError("");
+  const name = $("#m_name").value.trim();
+  if (!name) { showError("Give the landmark a name."); return; }
+  if (!compassFresh()) { showError("No compass reading yet. Move the phone a little and try again."); return; }
+  const steps = parseSteps($("#m_steps").value);
+  if (steps === undefined) { showError("Steps must be a whole number from 0 to 500, or empty."); return; }
+  const taken = new Set(mapState.landmarks.map((item) => item.id));
+  mapState.landmarks.push({
+    id: landmarkId(name, taken),
+    name,
+    kind: $("#m_kind").value,
+    from: $("#m_from").value || "start",
+    bearing_deg: run.headingDeg,
+    steps,
+    note: $("#m_note").value.trim(),
+  });
+  if (navigator.vibrate) navigator.vibrate(30);
+  for (const id of ["#m_name", "#m_steps", "#m_note"]) $(id).value = "";
+  renderMap();
+}
+
+async function loadMap() {
+  showError("");
+  const site = siteName($("#m_site").value);
+  if (!SITE_PATTERN.test(site)) { showError("Type the site name first (letters, digits, '-')."); return; }
+  try {
+    const graph = await getJSON(`/api/graphs/${encodeURIComponent(site)}`);
+    mapState.landmarks = graph.landmarks.map((item) => ({ ...item }));
+    $("#m_site").value = site;
+    renderMap();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function saveMap() {
+  showError("");
+  const site = siteName($("#m_site").value);
+  if (!SITE_PATTERN.test(site)) { showError("Site name: letters, digits and '-' (e.g. home, bmcc-hall)."); return; }
+  const button = $("#m_save");
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/graphs/${encodeURIComponent(site)}`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(graphPayload(mapState.landmarks)),
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch { /* empty */ }
+    if (!response.ok) throw new Error(payload.error || `save failed (${response.status})`);
+    $("#m_site").value = site;
+    await refreshGraphOptions(site);
+    leaveMap();
+    $("#f_graph").value = site;
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    button.disabled = mapState.landmarks.length === 0;
+  }
 }
 
 // ---------- screen ----------
@@ -655,6 +814,14 @@ window.addEventListener("pagehide", () => {
 
 function wire() {
   loadSticky();
+  const kinds = $("#m_kind");
+  for (const kind of LANDMARK_KINDS) kinds.append(new Option(kind, kind));
+  $("#openMap").addEventListener("click", openMap);
+  $("#m_add").addEventListener("click", addLandmark);
+  $("#m_load").addEventListener("click", loadMap);
+  $("#m_save").addEventListener("click", saveMap);
+  $("#m_back").addEventListener("click", leaveMap);
+  refreshGraphOptions();
   $("#setupForm").addEventListener("submit", startTrial);
   $("#end").addEventListener("click", endTrial);
   $("#again").addEventListener("click", () => {

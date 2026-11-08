@@ -287,6 +287,7 @@ _tts_send_queue: asyncio.Queue[Any] = asyncio.Queue()
 _tts_sender_task: Optional[asyncio.Task] = None
 _vision_submitted_for_turn: bool = False
 _thermal_submitted_for_turn: bool = False
+_graph_submitted_for_turn: bool = False
 _vision_declined_for_turn: bool = False  # told Gemini it cannot see; suppresses a later image this turn
 _vision_frame_sequence_for_turn: Optional[int] = None
 _frame_not_sent_logged: set = set()  # reasons already logged this turn; mutated in place, never rebound
@@ -346,7 +347,7 @@ def _log_turn_without_frame_request(turn_id: Optional[int], **fields) -> None:
 
 def _clear_gemini_turn_state(reason: str) -> None:
     """Drop only ephemeral per-turn grounding/transcription state."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _graph_submitted_for_turn
     global _vision_frame_sequence_for_turn, _vision_declined_for_turn
     global _vision_intent_for_turn, _thermal_intent_for_turn
     had_state = bool(
@@ -361,6 +362,7 @@ def _clear_gemini_turn_state(reason: str) -> None:
     _output_text_buf.clear()
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
+    _graph_submitted_for_turn = False
     _vision_declined_for_turn = False
     _vision_frame_sequence_for_turn = None
     _vision_intent_for_turn = False
@@ -610,9 +612,40 @@ async def _on_audio(pcm24k: bytes):
                 )
 
 
+# A heading older than this is not used to rotate the map: the tester may
+# have turned since, and a wrong left/right is worse than none.
+GRAPH_HEADING_MAX_AGE_SEC = 2.0
+
+
+def _fresh_heading_deg() -> Optional[float]:
+    data = latest_heading.get("data")
+    stamp = latest_heading.get("timestamp") or 0.0
+    if not data or time.monotonic() - stamp > GRAPH_HEADING_MAX_AGE_SEC:
+        return None
+    return float(data["heading_deg"])
+
+
+async def _send_landmark_graph(turn_id: int, site: str) -> None:
+    try:
+        graph = landmark_graph.load(site)
+    except landmark_graph.GraphError as exc:
+        print(f"[GRAPH] turn_id={turn_id} site={site} not sent: {exc}", flush=True)
+        trial_recorder.graph_context(turn_id, site, None, None, None, False, error=str(exc))
+        return
+    heading = _fresh_heading_deg()
+    text = landmark_graph.context_text(graph, heading)
+    sent = await gemini_live.send_text(text, turn_id=turn_id, source="landmark_graph")
+    trial_recorder.graph_context(turn_id, site, graph["sha256"], heading, text, sent)
+    print(
+        f"[GRAPH] turn_id={turn_id} site={site} landmarks={len(graph['landmarks'])} "
+        f"heading={'none' if heading is None else round(heading)} sent={sent}",
+        flush=True,
+    )
+
+
 async def _on_input_transcription(text: str):
     """User speech transcript, streamed incrementally by Gemini Live."""
-    global _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _vision_submitted_for_turn, _thermal_submitted_for_turn, _graph_submitted_for_turn
     global _vision_frame_sequence_for_turn
     global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
     if not text:
@@ -746,6 +779,12 @@ async def _on_input_transcription(text: str):
                 f"max={facts['scene_max_c']}C submitted={_thermal_submitted_for_turn}",
                 flush=True,
             )
+    # The landmark_graph arm: this site's map goes with each question, once,
+    # rotated to the way the tester faces now. Resolved per turn like pinning.
+    graph_site = session_config.get("landmark_graph")
+    if graph_site and not _graph_submitted_for_turn:
+        _graph_submitted_for_turn = True    # before the await: deltas arrive concurrently
+        await _send_landmark_graph(turn_id, graph_site)
     if _has_hotword(combined):
         async with interrupt_lock:
             print(f"[HOTWORD] '{combined}' -> full reset", flush=True)
@@ -780,6 +819,7 @@ async def _on_turn_complete():
     """
     global omni_conversation_active, omni_previous_nav_state
     global _ratecv_state_8k, _vision_submitted_for_turn, _thermal_submitted_for_turn
+    global _graph_submitted_for_turn
     global _vision_intent_for_turn, _thermal_intent_for_turn, _vision_declined_for_turn
 
     turn_id = _ensure_turn()
@@ -808,6 +848,7 @@ async def _on_turn_complete():
     _ratecv_state_8k = None
     _vision_submitted_for_turn = False
     _thermal_submitted_for_turn = False
+    _graph_submitted_for_turn = False
     _vision_declined_for_turn = False
     _vision_intent_for_turn = False
     _thermal_intent_for_turn = False
@@ -1040,6 +1081,7 @@ from stability_runtime import (
     append_transcription_delta, parse_mic_loss_message, parse_sensor_message,
 )
 from trial_config import SessionConfig, parse_bool
+import landmark_graph
 from trial_recorder import TrialRecorder
 from trial_scorer import TrialScoringError, score_trial_folder
 from trial_archive import _SAFE_TRIAL_ID, TrialArchive, TrialArchiveError, TrialNotFound
@@ -1129,6 +1171,11 @@ def _build_session_config() -> SessionConfig:
     config.register(
         "pin_frame_every_turn", lambda: PIN_FRAME_EVERY_TURN,
         parse=parse_bool, settable=True,
+    )
+    # Off unless a trial names a site with a saved map (landmark_graph.py).
+    config.register(
+        "landmark_graph", lambda: None,
+        parse=landmark_graph.parse_site, settable=True,
     )
     config.register("gemini_video_interval_sec", lambda: GEMINI_VIDEO_INTERVAL_SEC)
     config.register("vision_frame_max_age_sec", lambda: VISION_FRAME_MAX_AGE_SEC)
@@ -3261,6 +3308,52 @@ def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
         "X-Frame-Options": "DENY",
         "X-Content-Type-Options": "nosniff",
     })
+
+
+# Landmark maps (landmark_graph.py), made in map mode on /test. Same token as
+# /trials for reading and writing: a map steers what the model is told.
+@app.get("/api/graphs")
+async def graph_list(request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    return JSONResponse({"graphs": await asyncio.to_thread(landmark_graph.list_sites)})
+
+
+@app.get("/api/graphs/{site}")
+async def graph_get(site: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    try:
+        graph = await asyncio.to_thread(landmark_graph.load, site)
+    except landmark_graph.GraphError as exc:
+        status = 404 if str(exc).startswith("no graph") else 422
+        return JSONResponse({"error": str(exc)}, status_code=status)
+    return JSONResponse(graph)
+
+
+@app.put("/api/graphs/{site}")
+async def graph_put(site: str, request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return denied
+    # The open trial's map must not change under it: the arm would stop
+    # meaning one thing. End the trial first.
+    if session_config.get("landmark_graph") == site and trial_recorder.status().get("session_id"):
+        return JSONResponse({"error": "this map is in use by the open trial; end it first"},
+                            status_code=409)
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    try:
+        stored = await asyncio.to_thread(landmark_graph.save, site, payload)
+    except landmark_graph.GraphError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    print(f"[GRAPH] saved site={site} landmarks={len(stored['landmarks'])} sha={stored['sha256'][:12]}",
+          flush=True)
+    return JSONResponse(stored)
 
 
 # The browser stand-in for the iOS app during internal trials: a tester opens
