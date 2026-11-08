@@ -36,6 +36,11 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
 
 ## Backend (`app_main.py`, Fly app `ai-glasses-for-research`)
 
+- The machine stops when idle (`fly.toml`: `auto_stop_machines = 'stop'`,
+  `min_machines_running = 0`) and starts on the next request, to cut cost. Open websockets keep
+  it up. Background scoring cut off by a stop is resumed on the next start:
+  `_schedule_pending_trial_scores` re-queues a closed trial with questions and no `summary.json`
+  whose log is under 48 h old, once (marker `.score_resumed`, dot-named so R2 skips it).
 - `/data` is the mounted Fly volume (`fly.toml` `[[mounts]]`) and persists.
   `/app` is rebuilt on every deploy. Nothing durable goes in `/app`.
   Gotcha: `SyncRecorder` defaults to `output_dir="recordings"`, i.e. `/app/recordings`,
