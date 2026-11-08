@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="color-scheme" content="light dark">
+  <title>Field Test</title>
+  <link rel="stylesheet" href="/static/field_test.css">
+  <script type="module" src="/static/field_test.js"></script>
+</head>
+<body>
+  <main class="wrap">
+    <header class="top">
+      <span class="brand">AI Glasses · Field Test</span>
+      <a class="note" href="/trials">Trials</a>
+    </header>
+
+    <p class="error" id="error" role="alert" hidden></p>
+
+    <!-- 1. Setup: what the trial is, before anything records. -->
+    <section id="setup">
+      <form id="setupForm" autocomplete="off">
+        <label>Trial ID <span class="req">required</span>
+          <input id="f_trial" inputmode="text" autocapitalize="characters" placeholder="e.g. T03" maxlength="32" required>
+        </label>
+        <label>Tester <span class="req">required</span>
+          <input id="f_pid" placeholder="e.g. evis" maxlength="32" required>
+        </label>
+        <div class="row">
+          <label>Site
+            <input id="f_site" placeholder="e.g. BMCC">
+          </label>
+          <label>Condition
+            <input id="f_cond" placeholder="e.g. no-graph">
+          </label>
+        </div>
+        <label>Task
+          <input id="f_task" placeholder="e.g. find the door from the hallway">
+        </label>
+        <label>Success criterion
+          <input id="f_success_criterion" placeholder="e.g. reaches the door">
+        </label>
+        <fieldset>
+          <legend>Ground truth (for scoring)</legend>
+          <label>Room
+            <input id="f_room" placeholder="e.g. hallway 3rd floor">
+          </label>
+          <label>Present <span class="hint">comma separated</span>
+            <input id="f_present" placeholder="door, stairs, exit sign">
+          </label>
+          <label>Absent <span class="hint">comma separated</span>
+            <input id="f_absent" placeholder="elevator, chair">
+          </label>
+        </fieldset>
+        <button id="start" class="primary" type="submit">Start trial</button>
+        <p class="fine">Allow camera and microphone when Safari asks. Use earbuds. Keep this page open and the screen on for the whole trial.</p>
+      </form>
+    </section>
+
+    <!-- 2. Live: camera running, push-to-talk. -->
+    <section id="live" hidden>
+      <div class="status">
+        <span class="trial">Trial <b id="liveTrial"></b></span>
+        <span class="links">
+          <span class="dot" id="micDot"></span> mic
+          <span class="dot" id="camDot"></span> camera
+        </span>
+      </div>
+      <div class="cam">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="canvas" hidden></canvas>
+      </div>
+      <p class="cam-note" id="camNote" hidden></p>
+      <p class="state" id="state" data-state="disconnected" aria-live="polite">Connecting…</p>
+      <button id="ask" class="ask" type="button" disabled>Hold to ask</button>
+      <dl class="counts">
+        <div><dt>Questions</dt><dd id="turns">0</dd></div>
+        <div><dt>Frames sent</dt><dd id="frames">0</dd></div>
+        <div><dt>Skipped</dt><dd id="skipped">0</dd></div>
+      </dl>
+      <button id="end" class="danger" type="button">End trial</button>
+    </section>
+
+    <!-- 3. Done. -->
+    <section id="done" hidden>
+      <p class="done-title">Trial <b id="doneTrial"></b> ended.</p>
+      <p id="doneStats"></p>
+      <p>Scoring runs on the server. Results show up on the trial page.</p>
+      <a id="doneLink" class="primary link-button" href="/trials">Open trial</a>
+      <button id="again" type="button">New trial</button>
+    </section>
+  </main>
+</body>
+</html>

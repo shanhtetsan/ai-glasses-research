@@ -116,7 +116,15 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   `put_folder` skips it and skips every dot-named path. After R2 confirms, only `manifest.json`
   and `phone.jsonl` stay on `/data`. A failed push (`.phone_push.json`) is retried by the next
   `/upload` for that trial. `/trials/{id}.zip` is built on `/tmp`, never in memory (1 GB VM).
-- `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
+- `/test` is the browser field-test page: a tester opens `/test?token=<TRIAL_TOKEN>` in
+  Safari and the phone's camera and mic run a trial with nothing installed. It copies the iOS
+  app's wire protocol exactly (`static/field_test.js`, pure helpers in
+  `static/field_test_core.mjs`): push-to-talk `SPEECH_START`/`SPEECH_END` and 640-byte 16 kHz
+  PCM on `/ws_audio`, 8 kHz replies, `0x01`+seq-stamped JPEG at 4 fps, 640 px wide, on
+  `/ws/camera_thermal?source=phone&device=web-…`. It opens the camera socket *before*
+  `POST /internal/trial`, so `meta.json` gets `sensor_source: phone`. No IMU is sent from the
+  browser. `tests/test_field_test_page.py` pins its constants to the backend's.
+- `TRIAL_TOKEN` gates `/trials`, `/test`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds
   (`_trial_auth_failed`), so the control block on the page works without pasting a token.

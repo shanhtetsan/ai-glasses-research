@@ -3141,30 +3141,43 @@ _TRIAL_DENIED_PAGE = """<!doctype html><meta charset="utf-8">
 cookie for 12 hours and removed from the address bar.</p></body>"""
 
 
+def _token_cookie_redirect(request: Request, clean_path: str):
+    """A page opened with ?token=: set the trial_token cookie, redirect to clean_path.
+
+    None when there is no ?token= (the caller has already checked auth), so the
+    token never stays in the address bar, history or a shared screenshot.
+    """
+    supplied_in_query = request.query_params.get("token", "")
+    if not supplied_in_query:
+        return None
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected or not hmac.compare_digest(supplied_in_query, expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    response = RedirectResponse(clean_path, status_code=303)
+    response.set_cookie(
+        _TRIAL_COOKIE,
+        supplied_in_query,
+        max_age=12 * 60 * 60,
+        secure=request.url.scheme == "https",
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
     denied = _trial_view_auth_failed(request)
     if denied:
         # Same 401 as the API, but readable for someone who clicked the Trials tab.
         return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
-    supplied_in_query = request.query_params.get("token", "")
-    if supplied_in_query:
-        expected = os.getenv("TRIAL_TOKEN", "")
-        if not expected or not hmac.compare_digest(supplied_in_query, expected):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        clean_path = "/trials" if trial_id is None else f"/trials/{trial_id}"
-        response = RedirectResponse(clean_path, status_code=303)
-        response.set_cookie(
-            _TRIAL_COOKIE,
-            supplied_in_query,
-            max_age=12 * 60 * 60,
-            secure=request.url.scheme == "https",
-            httponly=True,
-            samesite="strict",
-            path="/",
-        )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        return response
+    redirect = _token_cookie_redirect(
+        request, "/trials" if trial_id is None else f"/trials/{trial_id}"
+    )
+    if redirect is not None:
+        return redirect
     try:
         with open("templates/trial_viewer.html", encoding="utf-8") as handle:
             content = handle.read()
@@ -3181,6 +3194,51 @@ def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
             "font-src https://fonts.gstatic.com; img-src 'self' data:; "
             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
         ),
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+# The browser stand-in for the iOS app during internal trials: a tester opens
+# /test?token=<TRIAL_TOKEN> once in Safari, and the phone's camera and mic
+# drive a trial with nothing installed. Same protocol as the app, see
+# static/field_test.js. Gated like /trials, which also gives it the cookie
+# that /internal/trial accepts.
+_FIELD_TEST_ASSETS = ("field_test.js", "field_test_core.mjs", "field_test.css")
+
+
+@app.get("/test", response_class=HTMLResponse)
+async def field_test_page(request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
+    redirect = _token_cookie_redirect(request, "/test")
+    if redirect is not None:
+        return redirect
+    try:
+        with open("templates/field_test.html", encoding="utf-8") as handle:
+            content = handle.read()
+        # field_test.js imports field_test_core.mjs with its own ?v=, so one
+        # version covering all three files keeps a deploy from mixing them.
+        version = max(
+            int(os.path.getmtime(os.path.join("static", asset))) for asset in _FIELD_TEST_ASSETS
+        )
+        for asset in ("field_test.js", "field_test.css"):
+            content = content.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+    except OSError:
+        return JSONResponse({"error": "field test template unavailable"}, status_code=500)
+    host = request.headers.get("host", "")
+    # 'self' alone does not cover wss: in older Safari, so the socket origin is named.
+    sockets = f" wss://{host} ws://{host}" if re.fullmatch(r"[A-Za-z0-9.:-]{1,255}", host) else ""
+    return HTMLResponse(content, headers={
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+            f"media-src 'self' blob: mediastream:; script-src 'self'; connect-src 'self'{sockets}; "
+            "frame-ancestors 'none'"
+        ),
+        "Permissions-Policy": "camera=(self), microphone=(self)",
         "Referrer-Policy": "no-referrer",
         "X-Frame-Options": "DENY",
         "X-Content-Type-Options": "nosniff",
