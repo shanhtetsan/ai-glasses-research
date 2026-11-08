@@ -69,12 +69,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse, Response, RedirectResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
 import numpy as np
 from perception_orientation import (
     RgbCanonicalizerTelemetry,
+    canonicalize_phone_rgb_jpeg,
     canonicalize_thermal_payload,
     log_rgb_canonicalizer_health,
     map_thermal_to_rgb_normalized,
@@ -1041,6 +1043,8 @@ from trial_config import SessionConfig, parse_bool
 from trial_recorder import TrialRecorder
 from trial_scorer import TrialScoringError, score_trial_folder
 from trial_archive import _SAFE_TRIAL_ID, TrialArchive, TrialArchiveError, TrialNotFound
+import phone_capture
+from phone_capture import PhoneCaptureInvalid, PhoneCaptureNoSpace, jpeg_comment_seq
 from trial_storage import (
     UPLOAD_RECEIPT,
     TrialStorageError,
@@ -1150,6 +1154,9 @@ def _trial_static_fields() -> dict:
     ).hexdigest()
     return {
         **session_config.observed(),
+        # Not a session_config knob: it is a property of the device connected,
+        # not an experiment arm, and a restarted process has no device yet.
+        "sensor_source": camera_source,
         # Which of those came from this trial rather than from the environment.
         "config_overridden": ",".join(sorted(session_config.overrides())) or None,
         "prompt_sha256": prompt_sha,
@@ -1355,12 +1362,48 @@ async def _upload_scored_trial(session_id: str, directory: Optional[str] = None)
         raise TrialStorageError("trial is still open")
     lock = _trial_upload_locks.setdefault(session_id, asyncio.Lock())
     async with lock:
+        # A phone copy whose R2 push failed is retried here, before (and
+        # regardless of) the scoring check: it never depended on scoring.
+        phone = None
+        if await asyncio.to_thread(phone_capture.push_pending, directory):
+            phone = await _push_phone_copy(session_id, directory)
         await asyncio.to_thread(_assert_trial_ready_for_upload, directory)
         manifest = await asyncio.to_thread(trial_object_storage.put_folder, directory)
         await asyncio.to_thread(write_upload_receipt, directory, manifest)
         result = {key: value for key, value in manifest.items() if key != "objects"}
+        if phone is not None:
+            result["phone"] = phone
         print(f"[TRIAL-UPLOAD] completed {json.dumps(result, separators=(',', ':'))}", flush=True)
         return result
+
+
+async def _push_phone_copy(session_id: str, directory: str) -> dict:
+    """Push phone/ to R2; on confirmation, prune the local frames. Caller holds the lock.
+
+    A failure is written to the trial's push state, so the next /upload for
+    this trial retries it; the local copy stays complete until R2 confirms.
+    """
+    try:
+        manifest = await asyncio.to_thread(
+            trial_object_storage.put_subfolder, directory, phone_capture.PHONE_DIR
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:300]
+        await asyncio.to_thread(
+            phone_capture.write_push_state, directory, {"status": "failed", "error": error}
+        )
+        print(f"[PHONE-CAPTURE] r2 push failed id={session_id} error={error}", flush=True)
+        return {"status": "failed", "error": error}
+    result = {
+        "status": "uploaded",
+        "object_count": manifest["object_count"],
+        "total_bytes": manifest["total_bytes"],
+        "stale_deleted": manifest.get("stale_deleted", 0),
+    }
+    await asyncio.to_thread(phone_capture.write_push_state, directory, {**result, "status": "done"})
+    await asyncio.to_thread(phone_capture.prune_after_push, directory)
+    print(f"[PHONE-CAPTURE] r2 push done id={session_id} {json.dumps(result, separators=(',', ':'))}", flush=True)
+    return result
 
 
 async def _auto_upload_scored_trial(session_id: str, directory: str) -> None:
@@ -1532,6 +1575,44 @@ def _viewer_attach(ws: WebSocket, viewers: Set[WebSocket]) -> asyncio.Task:
 
 
 esp32_camera_ws: Optional[WebSocket] = None
+# Which device last connected to /ws/camera_thermal ("glasses" or "phone").
+# None until the first connect since boot: nothing is guessed. Kept after a
+# disconnect, so it is the source of the most recent frames.
+CAMERA_SOURCES = ("glasses", "phone")
+camera_source: Optional[str] = None
+# The /ws/camera_thermal connection holding the camera slot:
+# {"ws", "source", "device", "peer", "replaced"}. esp32_camera_ws is always
+# this record's ws while it is set. A handler only clears shared state while
+# its own record is still the one held (same idea as `esp32_audio_ws is ws`).
+_camera_conn: Optional[dict] = None
+_CAMERA_DEVICE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_camera_close_tasks: Set[asyncio.Task] = set()
+
+
+def _camera_slot_decision(held: Optional[dict], source: str, device: Optional[str]) -> str:
+    """"take", "replace", or a refusal reason, for a new /ws/camera_thermal socket.
+
+    A reconnect of the device already holding the slot wins: after a WiFi
+    drop the old socket is dead but still held. Another source, or another
+    device of the same source (when both sides name one), is refused so two
+    devices cannot keep knocking each other off.
+    """
+    if esp32_camera_ws is None:
+        return "take"
+    if held is None or held["ws"] is not esp32_camera_ws:
+        return "slot_busy"              # held by the legacy /ws/camera route
+    if held["source"] != source:
+        return "other_source_holds_slot"
+    if held["device"] and device and held["device"] != device:
+        return "other_device_holds_slot"
+    return "replace"
+
+
+async def _close_replaced_camera(ws: WebSocket) -> None:
+    try:
+        await ws.close(code=1000, reason="replaced_by_reconnect")
+    except Exception:
+        pass
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
 _esp32_audio_send_lock: Optional[asyncio.Lock] = None
@@ -2830,6 +2911,116 @@ async def trial_upload(trial_id: str, request: Request):
     return JSONResponse(result)
 
 
+# The ZIP streams to the container's own disk, never the 1 GB /data volume and
+# never memory; only the extracted copy lands on /data (beside the trial, so
+# the final rename is atomic).
+PHONE_CAPTURE_TMP = os.getenv("PHONE_CAPTURE_TMP", "/tmp")
+PHONE_CAPTURE_WRITE_CHUNK = 1024 * 1024
+
+
+def _free_bytes(path: str) -> int:
+    return shutil.disk_usage(path).free
+
+
+@app.post("/internal/trial/{trial_id}/phone_capture")
+async def trial_phone_capture(trial_id: str, request: Request):
+    """The phone's own copy of an ended trial, as one ZIP. See phone_capture.py."""
+    denied = _trial_auth_failed(request)
+    if denied:
+        return denied
+    if not trial_recorder.enabled:
+        return JSONResponse({"error": "trial recorder disabled (TRIAL_RECORDER=1)"}, status_code=409)
+    try:
+        directory = _validated_trial_directory(trial_id)
+    except TrialStorageError as exc:
+        status = 404 if str(exc) == "trial not found" else 422
+        return JSONResponse({"error": str(exc)}, status_code=status)
+    open_error = {"error": "trial is still open; upload the phone copy after it ends"}
+    if trial_recorder.status().get("session_id") == trial_id:
+        return JSONResponse(open_error, status_code=409)
+
+    limit = phone_capture.MAX_BYTES
+    declared: Optional[int] = None
+    if request.headers.get("content-length"):
+        try:
+            declared = int(request.headers["content-length"])
+        except ValueError:
+            return JSONResponse({"error": "invalid Content-Length"}, status_code=400)
+        if declared > limit:
+            return JSONResponse({"error": f"phone capture is limited to {limit} bytes"}, status_code=413)
+    needed = (declared if declared is not None else limit) + phone_capture.FREE_SPACE_MARGIN
+    for label, path in (("temp disk", PHONE_CAPTURE_TMP), ("trial volume", trial_recorder.root)):
+        free = await asyncio.to_thread(_free_bytes, path)
+        if free < needed:
+            return JSONResponse(
+                {"error": f"not enough free space on the {label}: {free} bytes free, {needed} needed"},
+                status_code=507,
+            )
+
+    zip_path: Optional[str] = None
+    handle = None
+    try:
+        fd, zip_path = await asyncio.to_thread(
+            tempfile.mkstemp, prefix=f"phone-{trial_id}-", suffix=".zip", dir=PHONE_CAPTURE_TMP
+        )
+        handle = os.fdopen(fd, "wb")
+        total = 0
+        buffer = bytearray()
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                return JSONResponse({"error": f"phone capture is limited to {limit} bytes"}, status_code=413)
+            buffer += chunk
+            if len(buffer) >= PHONE_CAPTURE_WRITE_CHUNK:
+                await asyncio.to_thread(handle.write, bytes(buffer))
+                buffer.clear()
+        if buffer:
+            await asyncio.to_thread(handle.write, bytes(buffer))
+        await asyncio.to_thread(handle.close)
+        handle = None
+
+        lock = _trial_upload_locks.setdefault(trial_id, asyncio.Lock())
+        async with lock:
+            # The trial could have been reopened while the body streamed.
+            if trial_recorder.status().get("session_id") == trial_id:
+                return JSONResponse(open_error, status_code=409)
+            manifest = await asyncio.to_thread(
+                phone_capture.install, zip_path, directory, trial_id, limit
+            )
+            if trial_object_storage is None:
+                r2 = {"status": "not_configured"}
+            else:
+                r2 = await _push_phone_copy(trial_id, directory)
+    except PhoneCaptureInvalid as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except PhoneCaptureNoSpace as exc:
+        return JSONResponse({"error": str(exc)}, status_code=507)
+    finally:
+        if handle is not None:
+            await asyncio.to_thread(handle.close)
+        if zip_path is not None:
+            await asyncio.to_thread(_remove_quietly, zip_path)
+    print(
+        f"[PHONE-CAPTURE] installed id={trial_id} frames={manifest['frames']} "
+        f"imu_samples={manifest['imu_samples']} bytes={total} r2={r2['status']}",
+        flush=True,
+    )
+    return JSONResponse({
+        "trial_id": trial_id,
+        "frames": manifest["frames"],
+        "imu_samples": manifest["imu_samples"],
+        "bytes": total,
+        "r2": r2,
+    })
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _trial_view_auth_failed(request: Request) -> Optional[JSONResponse]:
     """Fail-closed auth for every team-facing trial data route."""
     expected = os.getenv("TRIAL_TOKEN", "")
@@ -2917,16 +3108,28 @@ async def trial_zip(trial_id: str, request: Request):
     denied = _trial_view_auth_failed(request)
     if denied:
         return denied
+    # Built on the container's temp disk, not in memory: with the phone copy a
+    # trial ZIP can be a few hundred MB on a 1 GB VM.
+    zip_path: Optional[str] = None
     try:
-        body = await asyncio.to_thread(trial_archive.zip_bytes, trial_id)
+        fd, zip_path = await asyncio.to_thread(
+            tempfile.mkstemp, prefix="trial-", suffix=".zip", dir=PHONE_CAPTURE_TMP
+        )
+        os.close(fd)
+        await asyncio.to_thread(trial_archive.zip_to_file, trial_id, zip_path)
     except TrialNotFound:
+        if zip_path:
+            await asyncio.to_thread(_remove_quietly, zip_path)
         return JSONResponse({"error": "trial not found"}, status_code=404)
     except (TrialArchiveError, TrialStorageError) as exc:
+        if zip_path:
+            await asyncio.to_thread(_remove_quietly, zip_path)
         return JSONResponse({"error": str(exc)}, status_code=502)
-    return Response(
-        body,
+    return FileResponse(
+        zip_path,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{trial_id}.zip"'},
+        filename=f"{trial_id}.zip",
+        background=BackgroundTask(_remove_quietly, zip_path),
     )
 
 
@@ -2938,30 +3141,43 @@ _TRIAL_DENIED_PAGE = """<!doctype html><meta charset="utf-8">
 cookie for 12 hours and removed from the address bar.</p></body>"""
 
 
+def _token_cookie_redirect(request: Request, clean_path: str):
+    """A page opened with ?token=: set the trial_token cookie, redirect to clean_path.
+
+    None when there is no ?token= (the caller has already checked auth), so the
+    token never stays in the address bar, history or a shared screenshot.
+    """
+    supplied_in_query = request.query_params.get("token", "")
+    if not supplied_in_query:
+        return None
+    expected = os.getenv("TRIAL_TOKEN", "")
+    if not expected or not hmac.compare_digest(supplied_in_query, expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    response = RedirectResponse(clean_path, status_code=303)
+    response.set_cookie(
+        _TRIAL_COOKIE,
+        supplied_in_query,
+        max_age=12 * 60 * 60,
+        secure=request.url.scheme == "https",
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
     denied = _trial_view_auth_failed(request)
     if denied:
         # Same 401 as the API, but readable for someone who clicked the Trials tab.
         return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
-    supplied_in_query = request.query_params.get("token", "")
-    if supplied_in_query:
-        expected = os.getenv("TRIAL_TOKEN", "")
-        if not expected or not hmac.compare_digest(supplied_in_query, expected):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        clean_path = "/trials" if trial_id is None else f"/trials/{trial_id}"
-        response = RedirectResponse(clean_path, status_code=303)
-        response.set_cookie(
-            _TRIAL_COOKIE,
-            supplied_in_query,
-            max_age=12 * 60 * 60,
-            secure=request.url.scheme == "https",
-            httponly=True,
-            samesite="strict",
-            path="/",
-        )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        return response
+    redirect = _token_cookie_redirect(
+        request, "/trials" if trial_id is None else f"/trials/{trial_id}"
+    )
+    if redirect is not None:
+        return redirect
     try:
         with open("templates/trial_viewer.html", encoding="utf-8") as handle:
             content = handle.read()
@@ -2978,6 +3194,51 @@ def _trial_viewer_page(request: Request, trial_id: Optional[str] = None):
             "font-src https://fonts.gstatic.com; img-src 'self' data:; "
             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
         ),
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+# The browser stand-in for the iOS app during internal trials: a tester opens
+# /test?token=<TRIAL_TOKEN> once in Safari, and the phone's camera and mic
+# drive a trial with nothing installed. Same protocol as the app, see
+# static/field_test.js. Gated like /trials, which also gives it the cookie
+# that /internal/trial accepts.
+_FIELD_TEST_ASSETS = ("field_test.js", "field_test_core.mjs", "field_test.css")
+
+
+@app.get("/test", response_class=HTMLResponse)
+async def field_test_page(request: Request):
+    denied = _trial_view_auth_failed(request)
+    if denied:
+        return HTMLResponse(_TRIAL_DENIED_PAGE, status_code=401, headers={"Cache-Control": "no-store"})
+    redirect = _token_cookie_redirect(request, "/test")
+    if redirect is not None:
+        return redirect
+    try:
+        with open("templates/field_test.html", encoding="utf-8") as handle:
+            content = handle.read()
+        # field_test.js imports field_test_core.mjs with its own ?v=, so one
+        # version covering all three files keeps a deploy from mixing them.
+        version = max(
+            int(os.path.getmtime(os.path.join("static", asset))) for asset in _FIELD_TEST_ASSETS
+        )
+        for asset in ("field_test.js", "field_test.css"):
+            content = content.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+    except OSError:
+        return JSONResponse({"error": "field test template unavailable"}, status_code=500)
+    host = request.headers.get("host", "")
+    # 'self' alone does not cover wss: in older Safari, so the socket origin is named.
+    sockets = f" wss://{host} ws://{host}" if re.fullmatch(r"[A-Za-z0-9.:-]{1,255}", host) else ""
+    return HTMLResponse(content, headers={
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+            f"media-src 'self' blob: mediastream:; script-src 'self'; connect-src 'self'{sockets}; "
+            "frame-ancestors 'none'"
+        ),
+        "Permissions-Policy": "camera=(self), microphone=(self)",
         "Referrer-Policy": "no-referrer",
         "X-Frame-Options": "DENY",
         "X-Content-Type-Options": "nosniff",
@@ -4239,15 +4500,59 @@ async def ws_camera_esp(ws: WebSocket):
 @app.websocket("/ws/camera_thermal")
 async def ws_camera_thermal_esp(ws: WebSocket):
     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
-    if esp32_camera_ws is not None:
+    global camera_source, _camera_conn
+    # ?source=phone|glasses. No param means glasses, so the ESP32 is unchanged.
+    # Anything else is refused rather than recorded as glasses.
+    source = ws.query_params.get("source") or "glasses"
+    if source not in CAMERA_SOURCES:
+        await ws.close(code=1008, reason="source must be phone or glasses")
+        return
+    # ?device=<id>: optional, names the physical device (the ESP32 sends none).
+    device = ws.query_params.get("device") or None
+    if device is not None and not _CAMERA_DEVICE_ID.match(device):
+        await ws.close(code=1008, reason="device must be 1-64 of A-Z a-z 0-9 . _ : -")
+        return
+    device_id = _device_id(ws)
+    # Decide and take over the slot with no await in between, so two
+    # reconnects arriving together cannot both win.
+    held = _camera_conn
+    decision = _camera_slot_decision(held, source, device)
+    if decision not in ("take", "replace"):
+        print(
+            f"[WS-INGEST] device={device_id} socket=camera_thermal event=refused "
+            f"source={source} device_param={device} reason={decision}",
+            flush=True,
+        )
         await ws.close(code=1013)
         return
+    conn = {"ws": ws, "source": source, "device": device, "peer": device_id, "replaced": False}
+    if decision == "replace":
+        held["replaced"] = True
+        # Not awaited: on a dead socket the close handshake can hang for the
+        # websockets close timeout, and the reconnecting device must not wait.
+        task = asyncio.create_task(_close_replaced_camera(held["ws"]))
+        _camera_close_tasks.add(task)
+        task.add_done_callback(_camera_close_tasks.discard)
+    _camera_conn = conn
     esp32_camera_ws = ws
     await ws.accept()
-    device_id = _device_id(ws)
+    camera_source = source
+    if decision == "replace":
+        print(
+            f"[WS-INGEST] device={device_id} socket=camera_thermal event=replaced "
+            f"source={source} device_param={device} old_device={held['peer']} "
+            f"old_device_param={held['device']} reason=replaced_by_reconnect",
+            flush=True,
+        )
+        trial_recorder.camera_replaced(source, held["device"], device, held["peer"], device_id)
+    trial_recorder.sensor_source(source)
     connected_at = time.monotonic()
     backend_metrics["camera_sensor_connects"] += 1
-    print(f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect", flush=True)
+    print(
+        f"[WS-INGEST] device={device_id} socket=camera_thermal event=connect "
+        f"source={source} device_param={device}",
+        flush=True,
+    )
 
     # Initialize the blind-path navigator
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -4365,18 +4670,30 @@ async def ws_camera_thermal_esp(ws: WebSocket):
 
     async def _publish_canonical(data: bytes, received_at: float):
         nonlocal frame_counter
+        if conn["replaced"]:
+            return      # a stale frame must not land after the new socket's
         frame_counter = await _handle_camera_frame(
             data, frame_counter, holder, frame_event,
             gemini_frame_holder, gemini_frame_event, gemini_pump_task,
             received_at,
         )
 
-    canonicalizer_task = asyncio.create_task(
-        run_latest_rgb_canonicalizer(
-            raw_holder, raw_event, _publish_canonical,
-            rgb_canonicalizer_telemetry,
+    if source == "phone":
+        # Phone frames are already upright: same pipeline, no rotation.
+        canonicalizer_task = asyncio.create_task(
+            run_latest_rgb_canonicalizer(
+                raw_holder, raw_event, _publish_canonical,
+                rgb_canonicalizer_telemetry,
+                transform=canonicalize_phone_rgb_jpeg,
+            )
         )
-    )
+    else:
+        canonicalizer_task = asyncio.create_task(
+            run_latest_rgb_canonicalizer(
+                raw_holder, raw_event, _publish_canonical,
+                rgb_canonicalizer_telemetry,
+            )
+        )
     canonicalizer_health_task = asyncio.create_task(
         log_rgb_canonicalizer_health(rgb_canonicalizer_telemetry)
     )
@@ -4384,6 +4701,8 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive()
+            if conn["replaced"]:
+                break       # anything still buffered here belongs to a dead socket
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 try:
@@ -4396,6 +4715,13 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                 if msg_type == MSG_TYPE_CAM:
                     received_at = time.monotonic()
                     camera_received_count += 1
+                    # Read before canonicalize_phone_rgb_jpeg: the re-encode drops COM.
+                    trial_recorder.frame_recv(
+                        source,
+                        jpeg_comment_seq(payload) if source == "phone" else None,
+                        camera_received_count,
+                        len(payload),
+                    )
                     queue_latest_raw_rgb(
                         payload, received_at, raw_holder, raw_event,
                         rgb_canonicalizer_telemetry,
@@ -4441,8 +4767,9 @@ async def ws_camera_thermal_esp(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[CAMERA-THERMAL ERROR] {e}")
-        trial_recorder.error("ws_camera_thermal", e)
+        if not conn["replaced"]:    # a replaced socket failing is expected
+            print(f"[CAMERA-THERMAL ERROR] {e}")
+            trial_recorder.error("ws_camera_thermal", e)
     finally:
         canonicalizer_health_task.cancel()
         try:
@@ -4480,24 +4807,32 @@ async def ws_camera_thermal_esp(ws: WebSocket):
                 await ws.close(code=1000)
         except Exception:
             pass
-        esp32_camera_ws = None
+        # Shared state is cleared only while this socket still holds the slot:
+        # after a replace, the new socket owns it and this finally runs late.
+        still_held = _camera_conn is conn
+        if still_held:
+            _camera_conn = None
+            esp32_camera_ws = None
         backend_metrics["camera_sensor_disconnects"] += 1
         print(
             f"[WS-INGEST] device={device_id} socket=camera_thermal event=disconnect "
-            f"reason=client_or_receive_end connected_s={time.monotonic() - connected_at:.1f} "
+            f"source={source} device_param={device} "
+            f"reason={'replaced_by_reconnect' if conn['replaced'] else 'client_or_receive_end'} "
+            f"connected_s={time.monotonic() - connected_at:.1f} "
             f"camera_frames={frame_counter} thermal_frames={thermal_frame_count} "
             f"thermal_dropped={thermal_dropped}",
             flush=True,
         )
 
         # Clean up navigation state
-        if blind_path_navigator:
-            blind_path_navigator.reset()
-        if cross_street_navigator:
-            cross_street_navigator.reset()
-        if orchestrator:
-            orchestrator.reset()
-            if DEBUG: print("[NAV MASTER] Master reset")
+        if still_held:
+            if blind_path_navigator:
+                blind_path_navigator.reset()
+            if cross_street_navigator:
+                cross_street_navigator.reset()
+            if orchestrator:
+                orchestrator.reset()
+                if DEBUG: print("[NAV MASTER] Master reset")
 
 # ---------- WebSocket: browser subscribes to camera frames ----------
 @app.websocket("/ws/viewer")

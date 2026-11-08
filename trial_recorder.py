@@ -285,6 +285,8 @@ class TrialRecorder:
             # Questions asked so far: one per speech_start, seeded from the log
             # on resume so a restart does not reset the count the UI shows.
             "turns": int(turns),
+            # Last camera source this session saw; None until a device is known.
+            "sensor_source": start_fields.get("sensor_source"),
         }
         self._turn_uids.clear()
         self._turn_agg.clear()
@@ -390,6 +392,17 @@ class TrialRecorder:
             "uptime_ms": data.get("uptime_ms"),
             "age_ms": round((time.monotonic() - stamp) * 1000, 1) if stamp else None,
         }
+
+    def frame_recv(self, source: str, phone_seq: Optional[int], n: int, size: int) -> None:
+        """Every camera frame on arrival, before drop-to-latest or the re-encode.
+
+        Counts what reached the server, so the phone's own copy can show the
+        gap. phone_seq is the phone's frame number (None for glasses). Never
+        opens the untitled fallback: frames arrive on an idle box too.
+        """
+        if not self.enabled or self._session is None:
+            return
+        self._emit("frame_recv", None, source=source, phone_seq=phone_seq, n=n, bytes=size)
 
     def frame_sent(self, server_turn_id: Optional[int], seq: Optional[int], jpeg: bytes,
                    captured_at: Optional[float], source: str) -> None:
@@ -499,6 +512,34 @@ class TrialRecorder:
         if not self.enabled or self._session is None:
             return
         self._emit("mic_streaming", None, value=bool(value), reason=reason, conn=conn)
+
+    def sensor_source(self, source: Optional[str]) -> None:
+        """Called when a camera socket connects. Logs phone<->glasses switches only.
+
+        The first source a session learns (from None) is not a change, and a
+        reconnect of the same device is not one either.
+        """
+        if not self.enabled or self._session is None or source is None:
+            return
+        try:
+            previous = self._session.get("sensor_source")
+            self._session["sensor_source"] = source
+            if previous is not None and previous != source:
+                self._emit("sensor_source_change", None, **{"from": previous, "to": source})
+        except Exception as exc:
+            self._note_internal_error("sensor_source", exc)
+
+    def camera_replaced(self, source: str, old_device: Optional[str], new_device: Optional[str],
+                        old_peer: str, new_peer: str) -> None:
+        """A same-device reconnect took the camera slot from a stale socket.
+
+        Not a sensor_source_change: the source is the same. device is the
+        ?device= id (None when the client sends none); peer is host:port.
+        """
+        if not self.enabled or self._session is None:
+            return
+        self._emit("camera_replaced", None, source=source, old_device=old_device,
+                   device=new_device, old_peer=old_peer, peer=new_peer)
 
     def error(self, where: str, exc: Any, turn: Optional[int] = None) -> None:
         if not self.enabled or self._session is None:
@@ -719,6 +760,10 @@ class TrialRecorder:
         trial_meta.update({key: meta.get(key) for key in _TRIAL_TEXT_FIELDS})
         self._begin_session(session_id, trial_meta, None, "process_restart",
                             used_uids=used, untitled=untitled, resumed=True, turns=turns)
+        # A restarted process has no device connected yet, so carry over the
+        # source the trial was running on: a switch on reconnect is still a switch.
+        if self._session is not None and self._session["sensor_source"] is None:
+            self._session["sensor_source"] = meta.get("sensor_source")
 
     # ------------------------------------------------------------------ status
 

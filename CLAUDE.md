@@ -26,6 +26,11 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   Never rotate or flip again downstream.
 - `CAMERA_ROTATION_DEG = 0` (`app_main.py`). `POST /api/settings` returns 400
   for any nonzero `camera_rotation_deg`.
+- Phone frames are the exception: `/ws/camera_thermal?source=phone` frames arrive upright and
+  go through `canonicalize_phone_rgb_jpeg` (same decode + quality-75 re-encode, no rotation).
+  No param (the ESP32) means `glasses`; any other value is refused with 1008.
+  A phone's IMU must be sent in glasses units and sign (deg/s; m/s² reading +g up at rest).
+  iOS gives rad/s and g with the opposite sign; the backend does not convert.
 - Frames are stored and shown exactly as Gemini received them.
   Do not add a display rotation to the trial viewer.
 
@@ -92,7 +97,34 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   `session_config.observed()`, never from the request body, so the typed `cond` label
   and the arm that ran can be checked against each other (`condition_mismatch()`; the
   trial page warns on a disagreement).
-- `TRIAL_TOKEN` gates `/trials`, `/api/trials*`, frames and ZIPs. They fail closed with 401
+- `sensor_source` (`phone`/`glasses`, from `camera_source` in `app_main.py`) is a static field in
+  `meta.json` and `session_start`, not a `session_config` knob. It is `null` until a device first
+  connects. A phone<->glasses switch in an open trial writes `sensor_source_change`; the first
+  connect after `null`, and a same-device reconnect, do not.
+- One device holds the `/ws/camera_thermal` slot (`_camera_conn`). A reconnect with the same
+  `source` takes it from the held socket (a WiFi drop leaves that one dead but held): the old
+  socket is closed with `replaced_by_reconnect` and `camera_replaced` is recorded. If both sides
+  send `?device=` and they differ, or the source differs, the newcomer gets 1013. The old
+  handler's `finally` clears shared state only `if _camera_conn is conn`.
+- Every camera frame on `/ws/camera_thermal` logs `frame_recv` on arrival (only while a trial is
+  open). For `source=phone` it carries `phone_seq`, read from the JPEG's `seq=<n>` COM segment
+  *before* `canonicalize_phone_rgb_jpeg`, whose re-encode drops it; glasses log `phone_seq: null`.
+- `POST /internal/trial/{session_id}/phone_capture` (ZIP, max 300 MB, ended trials only; see
+  `phone_capture.py`) installs the phone's own copy as `<trial>/phone/`. The ZIP streams to
+  `PHONE_CAPTURE_TMP` (`/tmp`, container disk), unpacks to a dot-named staging folder, then is
+  renamed in. `phone/` goes to R2 on its own, with its own `phone/_complete.json`; the trial's
+  `put_folder` skips it and skips every dot-named path. After R2 confirms, only `manifest.json`
+  and `phone.jsonl` stay on `/data`. A failed push (`.phone_push.json`) is retried by the next
+  `/upload` for that trial. `/trials/{id}.zip` is built on `/tmp`, never in memory (1 GB VM).
+- `/test` is the browser field-test page: a tester opens `/test?token=<TRIAL_TOKEN>` in
+  Safari and the phone's camera and mic run a trial with nothing installed. It copies the iOS
+  app's wire protocol exactly (`static/field_test.js`, pure helpers in
+  `static/field_test_core.mjs`): push-to-talk `SPEECH_START`/`SPEECH_END` and 640-byte 16 kHz
+  PCM on `/ws_audio`, 8 kHz replies, `0x01`+seq-stamped JPEG at 4 fps, 640 px wide, on
+  `/ws/camera_thermal?source=phone&device=web-…`. It opens the camera socket *before*
+  `POST /internal/trial`, so `meta.json` gets `sensor_source: phone`. No IMU is sent from the
+  browser. `tests/test_field_test_page.py` pins its constants to the backend's.
+- `TRIAL_TOKEN` gates `/trials`, `/test`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds
   (`_trial_auth_failed`), so the control block on the page works without pasting a token.
