@@ -277,6 +277,14 @@ export function trialRequestBody(form) {
   return body;
 }
 
+// A trial id nobody has to type: T<MMDD>-<HHMMSS>, local time. Seconds keep
+// two quick trials apart (the same trial+tester would resume the first).
+export function autoTrialId(date = new Date()) {
+  const two = (n) => String(n).padStart(2, "0");
+  return `T${two(date.getMonth() + 1)}${two(date.getDate())}-`
+    + `${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}`;
+}
+
 export const TRIAL_ID_PATTERN = /^[A-Za-z0-9-]{1,32}$/;
 
 export function trialFormError(body) {

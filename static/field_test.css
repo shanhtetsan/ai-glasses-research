@@ -146,3 +146,14 @@ button:disabled { opacity: 0.45; }
 .landmarks li { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
 .landmarks .meta { color: var(--muted); font-size: 13px; }
 .landmarks button { width: auto; display: inline-block; padding: 4px 10px; font-size: 13px; margin-top: 6px; }
+
+#setup { display: grid; gap: 14px; }
+.cam { position: relative; }
+.cam-on {
+  position: absolute; inset: auto 16px 16px 16px; width: auto;
+  background: var(--accent); border-color: var(--accent); color: var(--accent-fg);
+}
+.big { min-height: 64px; font-size: 20px; }
+details { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+.details-body { display: grid; gap: 12px; margin-top: 12px; }

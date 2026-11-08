@@ -3815,6 +3815,27 @@ async def _run_whisper_and_dispatch(buf: bytes) -> None:
 #   # keepalive_loop fed silence when idle > 350 ms
 #   # On STOP: recognition.send_audio_frame(SILENCE_20MS) x15, then recognition.stop()
 #
+# Marks "the mic stopped" in a /ws_audio ingest queue (see send_audio_stream_end).
+_AUDIO_STREAM_END = object()
+
+
+def _queue_audio_stream_end(queue: "asyncio.Queue") -> None:
+    """Queue the stream-end marker after any audio still waiting.
+
+    The queue drops its oldest audio when full; the marker must never be the
+    thing lost, so room is made the same way rather than skipping it.
+    """
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(_AUDIO_STREAM_END)
+    except asyncio.QueueFull:
+        pass
+
+
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
     global esp32_audio_ws, _esp32_audio_send_lock, mic_streaming
@@ -3911,6 +3932,20 @@ async def ws_audio(ws: WebSocket):
     async def _gemini_audio_worker():
         while True:
             chunk = await audio_ingest_q.get()
+            if chunk is _AUDIO_STREAM_END:
+                # Queued behind the turn's last audio, so Gemini gets every
+                # chunk before it is told the mic stopped.
+                try:
+                    await gemini_live.send_audio_stream_end(
+                        turn_id=latency_tracker.active_turn_id
+                    )
+                except Exception as exc:
+                    print(
+                        f"[WS-INGEST] device={device_id} socket=audio "
+                        f"event=stream_end_error error={type(exc).__name__}",
+                        flush=True,
+                    )
+                continue
             started = time.monotonic()
             try:
                 await gemini_live.send_audio(chunk)
@@ -4058,6 +4093,8 @@ async def ws_audio(ws: WebSocket):
                         _start_turn(turn_id)
                     latency_tracker.mark("speech_end_detected", turn_id)
                     trial_recorder.speech_end(turn_id, latency_tracker.active_turn_id)
+                    if audio_worker_task is not None:
+                        _queue_audio_stream_end(audio_ingest_q)
                     continue
 
                 if cmd == "START" or (trial_recorder.enabled and cmd.startswith("START:")):
