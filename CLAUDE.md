@@ -78,6 +78,10 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
 - `STABILITY_MODE` defaults to true (`fly.toml` sets `'true'`). It disables navigation,
   YOLO/YOLOE (`general_detector`, `yolomedia`), local Whisper and torch imports.
   `requirements-cloud.txt` excludes torch and ultralytics.
+- Push-to-talk ends a turn explicitly: `SPEECH_END` on `/ws_audio` queues `_AUDIO_STREAM_END`
+  behind the turn's audio, and the worker sends `audio_stream_end=True`. Without it Gemini's
+  automatic activity detection waits for trailing silence that never comes (audio stops on
+  release), and replies only sometimes.
 - Gemini often files a reply under a server-opened turn (`answer_arrived_under`).
   Turn ids alone do not pair questions with answers.
 

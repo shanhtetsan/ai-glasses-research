@@ -516,6 +516,23 @@ class GeminiLiveClient:
             size=len(text.encode("utf-8")),
         )
 
+    async def send_audio_stream_end(self, *, turn_id=None) -> bool:
+        """Tell Gemini the mic stopped, so it ends the user's turn now.
+
+        With automatic activity detection, Gemini decides a turn is over from
+        trailing silence in the audio. Push-to-talk stops the audio the moment
+        the button is released, so no silence ever arrives and the turn can
+        hang until the next press. Google's Live API docs say to send
+        audioStreamEnd when the stream pauses (e.g. the mic is turned off) to
+        flush cached audio.
+        """
+        return await self._send_traced(
+            "audio_stream_end",
+            lambda session: session.send_realtime_input(audio_stream_end=True),
+            turn_id=turn_id,
+            source="speech_end",
+        )
+
     async def send_audio(self, audio_bytes: bytes) -> bool:
         if not self.connected or self.session is None:
             return False

@@ -211,10 +211,13 @@ async function startTrial(event) {
     connectSensor();
     await waitForSensor(SENSOR_OPEN_TIMEOUT_MS);
 
-    await postJSON("/internal/trial", body);
+    const opened = await postJSON("/internal/trial", body);
     writeStorage(STICKY_KEY, JSON.stringify({ pid: body.pid, site: body.site, cond: body.cond }));
 
     run.trialId = body.trial;
+    // The archive's id is the folder name, "<trial>_<pid>" (e.g. T00_shan),
+    // not the typed trial id: link to what the server says it opened.
+    run.sessionId = opened.session_id || `${body.trial}_${body.pid}`;
     $("#liveTrial").textContent = body.trial;
     showPanel("live");
 
@@ -269,7 +272,7 @@ async function endTrial() {
   try {
     await postJSON("/internal/trial/end", {});
     $("#doneTrial").textContent = run.trialId;
-    $("#doneLink").href = `/trials/${encodeURIComponent(run.trialId)}`;
+    $("#doneLink").href = `/trials/${encodeURIComponent(run.sessionId)}`;
     $("#doneStats").textContent =
       `${run.turnsAsked} questions, ${run.framesSent} frames sent, ${run.framesSkipped} skipped.`;
     showPanel("done");
