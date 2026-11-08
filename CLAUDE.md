@@ -123,7 +123,13 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   PCM on `/ws_audio`, 8 kHz replies, `0x01`+seq-stamped JPEG at 4 fps, 640 px wide, on
   `/ws/camera_thermal?source=phone&device=web-…`. It opens the camera socket *before*
   `POST /internal/trial`, so `meta.json` gets `sensor_source: phone`. No IMU is sent from the
-  browser. `tests/test_field_test_page.py` pins its constants to the backend's.
+  browser: a page cannot give gyro/accel in the glasses' axes and signs. It sends the compass
+  heading instead, `MSG_TYPE_HEADING = 0x05` + `<Iff` (seq, degrees from magnetic north
+  clockwise in [0, 360), accuracy or -1), at 4 Hz on the same socket. The recorder writes
+  `heading` events (`at: speech_start`, then `stream` at 2 Hz) only while a turn is open and
+  only when a phone has sent one; `latest_heading` is cleared when that socket gives up the slot.
+  Turning right raises `deg`. The scorer and viewer do not read `heading` yet.
+  `tests/test_field_test_page.py` and `tests/test_phone_heading.py` pin the formats.
 - `TRIAL_TOKEN` gates `/trials`, `/test`, `/api/trials*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds

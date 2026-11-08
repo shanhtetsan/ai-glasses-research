@@ -34,6 +34,7 @@ EVENT_SCHEMA_VERSION = 1
 QUEUE_MAXSIZE = 256
 UNTITLED_IDLE_CLOSE_SEC = 30 * 60
 IMU_STREAM_INTERVAL_SEC = 0.1          # 10 Hz while a turn is active
+HEADING_STREAM_INTERVAL_SEC = 0.5      # 2 Hz while a turn is active (phone compass)
 THERMAL_MAX_AGE_SEC = 3.0
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,31}$")
 _TRIAL_TEXT_FIELDS = ("site", "cond", "task", "success_criterion", "prompt_version")
@@ -91,6 +92,7 @@ class TrialRecorder:
         self._current_turn: Optional[int] = None   # last speech_start, until turn_end
         self._n_to_server: dict[int, int] = {}      # SPEECH_START n -> server turn id
         self._last_imu_stream = 0.0
+        self._last_heading_stream = 0.0
 
         # Writer-thread state.
         self._fh = None
@@ -333,7 +335,8 @@ class TrialRecorder:
 
     # ------------------------------------------------------------------ events
 
-    def speech_start(self, n: int, server_turn_id: int, thermal: Optional[tuple], imu: Optional[dict]) -> None:
+    def speech_start(self, n: int, server_turn_id: int, thermal: Optional[tuple], imu: Optional[dict],
+                     heading: Optional[dict] = None) -> None:
         if not self.enabled:
             return
         try:
@@ -352,6 +355,9 @@ class TrialRecorder:
             age_sec = None if captured_at is None else max(0.0, time.monotonic() - captured_at)
             self._emit("thermal", uid, _thermal=(matrix, age_sec, calibration))
             self._emit("imu", uid, **self._imu_fields(imu, "speech_start"))
+            # Only when a phone has sent a heading: glasses trials stay as they were.
+            if heading and heading.get("data"):
+                self._emit("heading", uid, **self._heading_fields(heading, "speech_start"))
         except Exception as exc:
             self._note_internal_error("speech_start", exc)
 
@@ -375,6 +381,30 @@ class TrialRecorder:
             return
         self._last_imu_stream = now
         self._emit("imu", self.turn_uid(self._current_turn), **self._imu_fields(imu, "stream"))
+
+    def heading_sample(self, heading: Optional[dict]) -> None:
+        """Called per phone heading packet; records at 2 Hz only while a turn is active."""
+        if not self.enabled or self._session is None or self._current_turn is None:
+            return
+        if not heading or not heading.get("data"):
+            return
+        now = time.monotonic()
+        if now - self._last_heading_stream < HEADING_STREAM_INTERVAL_SEC:
+            return
+        self._last_heading_stream = now
+        self._emit("heading", self.turn_uid(self._current_turn), **self._heading_fields(heading, "stream"))
+
+    @staticmethod
+    def _heading_fields(heading: dict, at: str) -> dict:
+        data = heading.get("data") or {}
+        stamp = heading.get("timestamp") or 0.0
+        return {
+            "at": at,
+            "seq": data.get("sequence"),
+            "deg": data.get("heading_deg"),
+            "accuracy_deg": data.get("accuracy_deg"),
+            "age_ms": round(max(0.0, time.monotonic() - stamp) * 1000) if stamp else None,
+        }
 
     @staticmethod
     def _imu_fields(imu: Optional[dict], at: str) -> dict:
