@@ -5,7 +5,7 @@ import {
   DEVICE_ID_PATTERN, MIC_CHUNK_BYTES, PcmChunker, cameraMessage, decodeServerEvent,
   compassHeading, floatToInt16, frameSize, headingMessage, makeDeviceId, newResampleState,
   normalizeDegrees, pcm16BytesToFloat, landmarkId, siteName, SITE_PATTERN, parseSteps,
-  removeLandmark, graphPayload,
+  removeLandmark, graphPayload, autoTrialId,
   resampleToInt16, stampJpegSequence, trialFormError, trialRequestBody,
 } from '../static/field_test_core.mjs';
 
@@ -199,4 +199,10 @@ test('trial body carries the experiment arms only when chosen', () => {
     { pin_frame_every_turn: false, landmark_graph: 'home' });
   assert.deepEqual(trialRequestBody({ trial: 'T1', pid: 'e', pin: 'on' }).config,
     { pin_frame_every_turn: true });
+});
+
+test('auto trial id is valid, local time, to the second', () => {
+  const id = autoTrialId(new Date(2026, 10, 8, 14, 5, 9));
+  assert.equal(id, 'T1108-140509');
+  assert.equal(trialFormError({ trial: id, pid: 'evis' }), '');
 });

@@ -20,59 +20,66 @@
 
     <!-- 1. Setup: what the trial is, before anything records. -->
     <section id="setup">
+      <!-- Camera first: the tester sees it working before anything else. -->
+      <div class="cam" id="previewWrap">
+        <video id="preview" playsinline muted autoplay></video>
+        <button id="camOn" class="cam-on" type="button" hidden>Turn on camera</button>
+      </div>
       <form id="setupForm" autocomplete="off">
-        <label>Trial ID <span class="req">required</span>
-          <input id="f_trial" inputmode="text" autocapitalize="characters" placeholder="e.g. T03" maxlength="32" required>
-        </label>
-        <label>Tester <span class="req">required</span>
-          <input id="f_pid" placeholder="e.g. evis" maxlength="32" required>
+        <label>Tester
+          <input id="f_pid" placeholder="your name, e.g. evis" maxlength="32" required>
         </label>
         <div class="row">
-          <label>Site
-            <input id="f_site" placeholder="e.g. BMCC">
+          <label>Map
+            <select id="f_graph">
+              <option value="">no map</option>
+            </select>
           </label>
-          <label>Condition
-            <input id="f_cond" placeholder="e.g. no-graph">
+          <label>Pinned frame
+            <select id="f_pin">
+              <option value="">server default</option>
+              <option value="on">on</option>
+              <option value="off">off</option>
+            </select>
           </label>
         </div>
-        <label>Task
-          <input id="f_task" placeholder="e.g. find the door from the hallway">
-        </label>
-        <label>Success criterion
-          <input id="f_success_criterion" placeholder="e.g. reaches the door">
-        </label>
-        <fieldset>
-          <legend>Ground truth (for scoring)</legend>
-          <label>Room
-            <input id="f_room" placeholder="e.g. hallway 3rd floor">
-          </label>
-          <label>Present <span class="hint">comma separated</span>
-            <input id="f_present" placeholder="door, stairs, exit sign">
-          </label>
-          <label>Absent <span class="hint">comma separated</span>
-            <input id="f_absent" placeholder="elevator, chair">
-          </label>
-        </fieldset>
-        <fieldset>
-          <legend>Experiment arm</legend>
-          <div class="row">
-            <label>Pinned frame
-              <select id="f_pin">
-                <option value="">server default</option>
-                <option value="on">on</option>
-                <option value="off">off</option>
-              </select>
+        <button id="start" class="primary big" type="submit">Start</button>
+        <button id="openMap" type="button">Make or edit a map</button>
+        <details id="details">
+          <summary>Details — trial ID, task, ground truth</summary>
+          <div class="details-body">
+            <label>Trial ID <span class="hint">filled in for you</span>
+              <input id="f_trial" autocapitalize="characters" maxlength="32" required>
             </label>
-            <label>Map
-              <select id="f_graph">
-                <option value="">no map</option>
-              </select>
+            <div class="row">
+              <label>Site
+                <input id="f_site" placeholder="e.g. home">
+              </label>
+              <label>Condition
+                <input id="f_cond" placeholder="e.g. map-on">
+              </label>
+            </div>
+            <label>Task
+              <input id="f_task" placeholder="e.g. find the door from the hallway">
             </label>
+            <label>Success criterion
+              <input id="f_success_criterion" placeholder="e.g. reaches the door">
+            </label>
+            <fieldset>
+              <legend>Ground truth (for scoring)</legend>
+              <label>Room
+                <input id="f_room" placeholder="e.g. hallway">
+              </label>
+              <label>Present <span class="hint">comma separated</span>
+                <input id="f_present" placeholder="door, stairs, exit sign">
+              </label>
+              <label>Absent <span class="hint">comma separated</span>
+                <input id="f_absent" placeholder="elevator, chair">
+              </label>
+            </fieldset>
           </div>
-          <button id="openMap" type="button">Make or edit a map</button>
-        </fieldset>
-        <button id="start" class="primary" type="submit">Start trial</button>
-        <p class="fine">Allow motion, camera and microphone when Safari asks. Use earbuds. Keep this page open and the screen on for the whole trial.</p>
+        </details>
+        <p class="fine">Allow camera, microphone and motion when Safari asks. Use earbuds. Keep this page open and the screen on during a trial.</p>
       </form>
     </section>
 

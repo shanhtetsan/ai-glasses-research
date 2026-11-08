@@ -16,7 +16,7 @@ const {
   headingMessage, makeDeviceId,
   newResampleState, pcm16BytesToFloat, resampleToInt16, stampJpegSequence,
   trialFormError, trialRequestBody, LANDMARK_KINDS, SITE_PATTERN, graphPayload, landmarkId,
-  parseSteps, removeLandmark, siteName,
+  parseSteps, removeLandmark, siteName, autoTrialId,
 } = await import(`./field_test_core.mjs${new URL(import.meta.url).search}`);
 
 const $ = (selector) => document.querySelector(selector);
@@ -164,9 +164,11 @@ function showPanel(name) {
 function loadSticky() {
   let saved = {};
   try { saved = JSON.parse(readStorage(STICKY_KEY) || "{}"); } catch { saved = {}; }
-  for (const key of ["pid", "site", "cond"]) {
+  for (const key of ["pid", "site", "cond", "pin"]) {
     if (saved[key]) $(`#f_${key}`).value = saved[key];
   }
+  $("#f_trial").value = autoTrialId();
+  return saved;
 }
 
 function formValues() {
@@ -196,11 +198,8 @@ async function startTrial(event) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("This browser cannot open the camera here. Use Safari over https.");
     }
-    // Both permissions in one prompt, from this tap (Safari requires a gesture).
-    run.stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-    });
+    // The preview usually already holds camera + mic; open them here if not.
+    if (!streamLive()) run.stream = await openMedia();
     const Ctx = window.AudioContext || window.webkitAudioContext;
     run.audioCtx = new Ctx();
     await run.audioCtx.resume();
@@ -212,7 +211,10 @@ async function startTrial(event) {
     await waitForSensor(SENSOR_OPEN_TIMEOUT_MS);
 
     const opened = await postJSON("/internal/trial", body);
-    writeStorage(STICKY_KEY, JSON.stringify({ pid: body.pid, site: body.site, cond: body.cond }));
+    writeStorage(STICKY_KEY, JSON.stringify({
+      pid: body.pid, site: body.site, cond: body.cond,
+      pin: $("#f_pin").value, graph: $("#f_graph").value,
+    }));
 
     run.trialId = body.trial;
     // The archive's id is the folder name, "<trial>_<pid>" (e.g. T00_shan),
@@ -241,8 +243,46 @@ async function startTrial(event) {
     }
     stopMedia();
     showError(error.message || String(error));
+    startPreview();
   } finally {
     button.disabled = false;
+  }
+}
+
+// ---------- camera preview (setup screen) ----------
+
+const MEDIA_CONSTRAINTS = {
+  video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+  audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+};
+
+function openMedia() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return Promise.reject(new Error("This browser cannot open the camera here. Use Safari over https."));
+  }
+  // Camera and mic in one prompt.
+  return navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
+}
+
+function streamLive() {
+  return Boolean(run.stream && run.stream.getVideoTracks().some((track) => track.readyState === "live"));
+}
+
+// Shown as soon as the page opens. If the browser wants a tap first (or the
+// prompt was dismissed), a "Turn on camera" button covers the preview.
+async function startPreview() {
+  const preview = $("#preview");
+  const button = $("#camOn");
+  try {
+    if (!streamLive()) run.stream = await openMedia();
+    preview.srcObject = run.stream;
+    await preview.play().catch(() => {});
+    button.hidden = true;
+  } catch (error) {
+    button.hidden = false;
+    if (error && error.name === "NotAllowedError") {
+      showError("Camera or microphone is blocked. In Safari: aA → Website Settings → allow Camera and Microphone, then tap Turn on camera.");
+    }
   }
 }
 
@@ -302,8 +342,10 @@ function stopMedia() {
   if (run.stream) for (const track of run.stream.getTracks()) track.stop();
   run.stream = null;
   if (run.audioCtx) { run.audioCtx.close().catch(() => {}); run.audioCtx = null; }
-  const video = $("#video");
-  if (video) video.srcObject = null;
+  for (const id of ["#video", "#preview"]) {
+    const element = $(id);
+    if (element) element.srcObject = null;
+  }
 }
 
 // ---------- microphone ----------
@@ -816,7 +858,7 @@ window.addEventListener("pagehide", () => {
 // ---------- wiring ----------
 
 function wire() {
-  loadSticky();
+  const sticky = loadSticky();
   const kinds = $("#m_kind");
   for (const kind of LANDMARK_KINDS) kinds.append(new Option(kind, kind));
   $("#openMap").addEventListener("click", openMap);
@@ -824,13 +866,15 @@ function wire() {
   $("#m_load").addEventListener("click", loadMap);
   $("#m_save").addEventListener("click", saveMap);
   $("#m_back").addEventListener("click", leaveMap);
-  refreshGraphOptions();
+  refreshGraphOptions(sticky.graph || "");
+  $("#camOn").addEventListener("click", () => { showError(""); startPreview(); });
   $("#setupForm").addEventListener("submit", startTrial);
   $("#end").addEventListener("click", endTrial);
   $("#again").addEventListener("click", () => {
-    $("#f_trial").value = "";
+    $("#f_trial").value = autoTrialId();
     showError("");
     showPanel("setup");
+    startPreview();
   });
   const ask = $("#ask");
   ask.addEventListener("pointerdown", (event) => {
@@ -848,6 +892,7 @@ function wire() {
   });
   showPanel("setup");
   render();
+  startPreview();
 }
 
 wire();
