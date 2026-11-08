@@ -461,6 +461,23 @@ class TrialRecorder:
         if agg is not None:
             agg["thermal_text"] = text
 
+    def graph_context(self, server_turn_id: Optional[int], site: str, sha256: Optional[str],
+                      heading_deg: Optional[float], text: Optional[str], sent: bool,
+                      error: Optional[str] = None) -> None:
+        """The landmark map text sent with a question (the landmark_graph arm).
+
+        Stored in full, with the map's sha256 and the heading it was rotated to,
+        so a trial shows exactly what the model was told and which map version.
+        """
+        if not self.enabled or self._session is None:
+            return
+        try:
+            self._emit("graph_context", self.turn_uid(server_turn_id), site=site, sha256=sha256,
+                       heading_deg=None if heading_deg is None else round(heading_deg, 1),
+                       text=text, sent=bool(sent), error=error)
+        except Exception as exc:
+            self._note_internal_error("graph_context", exc)
+
     def note_audio(self, byte_count: int) -> None:
         """Mic PCM forwarded to Gemini (16 kHz mono s16 -> 32 bytes per ms)."""
         if not self.enabled or self._current_turn is None:

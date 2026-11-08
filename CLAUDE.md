@@ -135,7 +135,18 @@ Facts and gotchas. Check the code before acting on any of this; fix this file if
   only when a phone has sent one; `latest_heading` is cleared when that socket gives up the slot.
   Turning right raises `deg`. The scorer and viewer do not read `heading` yet.
   `tests/test_field_test_page.py` and `tests/test_phone_heading.py` pin the formats.
-- `TRIAL_TOKEN` gates `/trials`, `/test`, `/api/trials*`, frames and ZIPs. They fail closed with 401
+- Landmark maps (`landmark_graph.py`): one JSON per site in `LANDMARK_GRAPH_ROOT`
+  (`/data/graphs`), made in map mode on `/test` (stand at a spot, point the phone, name the
+  landmark; the compass bearing is stored). Any place is a site. `GET/PUT /api/graphs[/{site}]`,
+  same token as `/trials`; a PUT to the map the open trial uses is refused (409).
+  The `landmark_graph` knob (per trial, `config.landmark_graph = "<site>"`, default off) sends
+  `context_text()` once per question (`_graph_submitted_for_turn`, `source=landmark_graph`),
+  rotated to the phone heading if it is under 2 s old, else with no left/right. It never
+  carries step counts: the scorer marks any distance or "steps" in an answer as a bad guess.
+  Each send is recorded as a `graph_context` event with the full text, the map's sha256 and
+  the heading used. The phone gives heading, not position, so the map is described from the
+  spot each bearing was measured at.
+- `TRIAL_TOKEN` gates `/trials`, `/test`, `/api/trials*`, `/api/graphs*`, frames and ZIPs. They fail closed with 401
   when it is unset. It also gates `/internal/trial*` when set, carried either as the
   `X-Trial-Token` header or as the `trial_token` cookie the viewer already holds
   (`_trial_auth_failed`), so the control block on the page works without pasting a token.

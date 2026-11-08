@@ -194,6 +194,61 @@ export function decodeServerEvent(text) {
   return { type: "unknown", text };
 }
 
+// ---------- landmark map (landmark_graph.py) ----------
+
+export const LANDMARK_KINDS = ["door", "stairs", "exit", "elevator", "hallway", "room", "turn", "other"];
+export const SITE_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+// "Front Door!" -> "front-door"; never empty, max 40, unique against `taken`.
+export function landmarkId(name, taken = new Set()) {
+  let base = String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  base = (base || "landmark").slice(0, 36).replace(/-+$/g, "") || "landmark";
+  if (base === "start") base = "start-point";
+  let id = base;
+  for (let n = 2; taken.has(id); n += 1) id = `${base}-${n}`;
+  return id;
+}
+
+export function siteName(value) {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+/, "").slice(0, 32);
+}
+
+// Map-mode list -> PUT /api/graphs/<site> body. `from` must point at an
+// earlier landmark (the server checks the same rule).
+export function graphPayload(landmarks) {
+  return {
+    landmarks: landmarks.map((item) => ({
+      id: item.id,
+      name: item.name,
+      kind: item.kind,
+      from: item.from || "start",
+      bearing_deg: Math.round(item.bearing_deg * 10) / 10 >= 360 ? 0 : Math.round(item.bearing_deg * 10) / 10,
+      steps: Number.isInteger(item.steps) ? item.steps : null,
+      note: item.note || "",
+    })),
+  };
+}
+
+// Removing a landmark also removes the ones measured from it.
+export function removeLandmark(landmarks, id) {
+  const gone = new Set([id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of landmarks) {
+      if (!gone.has(item.id) && gone.has(item.from)) { gone.add(item.id); changed = true; }
+    }
+  }
+  return landmarks.filter((item) => !gone.has(item.id));
+}
+
+export function parseSteps(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const number = Number(text);
+  return Number.isInteger(number) && number >= 0 && number <= 500 ? number : undefined;
+}
+
 // Trial form -> POST /internal/trial body. Same field names as the /trials form.
 export function trialRequestBody(form) {
   const list = (value) =>
@@ -214,6 +269,11 @@ export function trialRequestBody(form) {
   if (groundTruth.room || groundTruth.present.length || groundTruth.absent.length) {
     body.ground_truth = groundTruth;
   }
+  // Experiment arms, per trial (trial_config.py). Unset = the server default.
+  const config = {};
+  if (form.pin === "on" || form.pin === "off") config.pin_frame_every_turn = form.pin === "on";
+  if (form.graph) config.landmark_graph = String(form.graph);
+  if (Object.keys(config).length) body.config = config;
   return body;
 }
 

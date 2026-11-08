@@ -4,7 +4,8 @@ import test from 'node:test';
 import {
   DEVICE_ID_PATTERN, MIC_CHUNK_BYTES, PcmChunker, cameraMessage, decodeServerEvent,
   compassHeading, floatToInt16, frameSize, headingMessage, makeDeviceId, newResampleState,
-  normalizeDegrees, pcm16BytesToFloat,
+  normalizeDegrees, pcm16BytesToFloat, landmarkId, siteName, SITE_PATTERN, parseSteps,
+  removeLandmark, graphPayload,
   resampleToInt16, stampJpegSequence, trialFormError, trialRequestBody,
 } from '../static/field_test_core.mjs';
 
@@ -159,4 +160,43 @@ test('heading packet is 0x05 + <Iff and never sends 360', () => {
   assert.equal(view.getFloat32(9, true), 15);
   assert.equal(new DataView(headingMessage(1, 10, null).buffer).getFloat32(9, true), -1);
   assert.equal(new DataView(headingMessage(1, 359.99999999, 1).buffer).getFloat32(5, true), 0);
+});
+
+test('landmark ids are slugs, unique, never "start"', () => {
+  assert.equal(landmarkId('Front Door!'), 'front-door');
+  assert.equal(landmarkId('front door', new Set(['front-door'])), 'front-door-2');
+  assert.equal(landmarkId('Start'), 'start-point');
+  assert.equal(landmarkId('!!!'), 'landmark');
+  assert.ok(landmarkId('x'.repeat(80)).length <= 40);
+});
+
+test('site names, steps, removal cascade', () => {
+  assert.equal(siteName(' My Home '), 'my-home');
+  assert.ok(SITE_PATTERN.test(siteName('BMCC hall 3')));
+  assert.equal(parseSteps(''), null);
+  assert.equal(parseSteps('6'), 6);
+  assert.equal(parseSteps('6.5'), undefined);
+  assert.equal(parseSteps('-1'), undefined);
+  const list = [
+    { id: 'door', from: 'start' }, { id: 'hall', from: 'door' },
+    { id: 'stairs', from: 'hall' }, { id: 'exit', from: 'start' },
+  ];
+  assert.deepEqual(removeLandmark(list, 'door').map((x) => x.id), ['exit']);
+});
+
+test('graph payload rounds bearings and never sends 360', () => {
+  const body = graphPayload([
+    { id: 'a', name: 'a', kind: 'door', from: 'start', bearing_deg: 359.97, steps: null, note: '' },
+    { id: 'b', name: 'b', kind: 'exit', bearing_deg: 12.34, steps: 4 },
+  ]);
+  assert.deepEqual(body.landmarks.map((x) => [x.bearing_deg, x.from, x.steps, x.note]),
+    [[0, 'start', null, ''], [12.3, 'start', 4, '']]);
+});
+
+test('trial body carries the experiment arms only when chosen', () => {
+  assert.equal(trialRequestBody({ trial: 'T1', pid: 'e' }).config, undefined);
+  assert.deepEqual(trialRequestBody({ trial: 'T1', pid: 'e', pin: 'off', graph: 'home' }).config,
+    { pin_frame_every_turn: false, landmark_graph: 'home' });
+  assert.deepEqual(trialRequestBody({ trial: 'T1', pid: 'e', pin: 'on' }).config,
+    { pin_frame_every_turn: true });
 });

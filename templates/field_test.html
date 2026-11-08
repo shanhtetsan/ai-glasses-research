@@ -53,9 +53,64 @@
             <input id="f_absent" placeholder="elevator, chair">
           </label>
         </fieldset>
+        <fieldset>
+          <legend>Experiment arm</legend>
+          <div class="row">
+            <label>Pinned frame
+              <select id="f_pin">
+                <option value="">server default</option>
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select>
+            </label>
+            <label>Map
+              <select id="f_graph">
+                <option value="">no map</option>
+              </select>
+            </label>
+          </div>
+          <button id="openMap" type="button">Make or edit a map</button>
+        </fieldset>
         <button id="start" class="primary" type="submit">Start trial</button>
         <p class="fine">Allow motion, camera and microphone when Safari asks. Use earbuds. Keep this page open and the screen on for the whole trial.</p>
       </form>
+    </section>
+
+    <!-- Map mode: record fixed landmarks at a site with the compass. -->
+    <section id="map" hidden>
+      <div class="row">
+        <label>Site name
+          <input id="m_site" placeholder="e.g. home" maxlength="32" autocapitalize="none">
+        </label>
+        <label>&nbsp;
+          <button id="m_load" type="button">Load saved</button>
+        </label>
+      </div>
+      <p class="compass" id="m_heading" aria-live="polite">compass …</p>
+      <p class="fine">Stand at the spot, point the top of the phone at the landmark, then tap Add.</p>
+      <label>Measured standing at
+        <select id="m_from"><option value="start">the start spot</option></select>
+      </label>
+      <div class="row">
+        <label>Landmark name
+          <input id="m_name" placeholder="e.g. front door" maxlength="60">
+        </label>
+        <label>Kind
+          <select id="m_kind"></select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Steps to it <span class="hint">optional</span>
+          <input id="m_steps" inputmode="numeric" placeholder="e.g. 6">
+        </label>
+        <label>Note <span class="hint">optional</span>
+          <input id="m_note" placeholder="e.g. push to open" maxlength="200">
+        </label>
+      </div>
+      <button id="m_add" class="primary" type="button">Add — facing it now</button>
+      <ol class="landmarks" id="m_list"></ol>
+      <button id="m_save" class="primary" type="button">Save map</button>
+      <button id="m_back" type="button">Back</button>
     </section>
 
     <!-- 2. Live: camera running, push-to-talk. -->

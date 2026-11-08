@@ -62,6 +62,16 @@ input {
   padding: 10px 12px;
   width: 100%;
 }
+select {
+  font: inherit;
+  font-size: 17px;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  width: 100%;
+}
 input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 fieldset { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px 12px; margin: 0; display: grid; gap: 10px; }
@@ -129,3 +139,10 @@ button:disabled { opacity: 0.45; }
 
 #done { display: grid; gap: 12px; }
 .done-title { font-size: 20px; margin: 8px 0 0; }
+
+#map { display: grid; gap: 12px; }
+.compass { text-align: center; font-size: 28px; font-weight: 600; margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.landmarks { margin: 0; padding-left: 22px; display: grid; gap: 6px; }
+.landmarks li { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.landmarks .meta { color: var(--muted); font-size: 13px; }
+.landmarks button { width: auto; display: inline-block; padding: 4px 10px; font-size: 13px; margin-top: 6px; }

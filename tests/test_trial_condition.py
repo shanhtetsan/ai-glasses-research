@@ -362,7 +362,7 @@ class ArchiveSurfacesTheConfigTests(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self._trial(os.path.join(self.root, "T40_P1"), cond="unpinned arm B",
-                    pin_frame_every_turn=True, gemini_video_interval_sec=0.75,
+                    pin_frame_every_turn=True, landmark_graph=None, gemini_video_interval_sec=0.75,
                     vision_frame_max_age_sec=3.0, stability_mode=True, model="m",
                     config_overridden=None)
         self._trial(os.path.join(self.root, "T41_P1"), cond="unpinned")   # before the stamp

@@ -171,6 +171,7 @@
   // The runtime config observed when the session opened, in meta.json order.
   const CONFIG_ROWS = [
     ["pin_frame_every_turn", "Frame pinned every turn"],
+    ["landmark_graph", "Landmark map"],
     ["gemini_video_interval_sec", "Video pump"],
     ["vision_frame_max_age_sec", "Max frame age"],
     ["stability_mode", "Stability mode"],
@@ -178,6 +179,8 @@
   ];
 
   function configValue(key, value) {
+    // Present and null means the arm was off (no map), not unknown.
+    if (key === "landmark_graph" && value === null) return "off";
     if (value == null) return "not recorded";
     if (typeof value === "boolean") return value ? "yes" : "no";
     if (key.endsWith("_sec")) return `${value} s`;
