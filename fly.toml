@@ -14,9 +14,14 @@ primary_region = 'ewr'
 [http_service]
   internal_port = 8081
   force_https = true
+  # Runs only while someone is connected: the first request (the /test page,
+  # the glasses, /trials) starts the machine in a few seconds, and Fly stops it
+  # a few minutes after the last connection closes. Open websockets count as
+  # connections, so it stays up for a whole trial. Scoring cut off by a stop is
+  # resumed on the next start (_schedule_pending_trial_scores in app_main.py).
   auto_start_machines = true
-  auto_stop_machines = false
-  min_machines_running = 1
+  auto_stop_machines = 'stop'
+  min_machines_running = 0
 
 [http_service.concurrency]
   type = "connections"

@@ -1436,6 +1436,66 @@ def _schedule_pending_trial_uploads() -> None:
             _schedule_trial_upload(name, directory)
 
 
+# With auto-stop on (fly.toml), Fly can stop the machine minutes after the last
+# connection closes, which may cut off a trial's background scoring. On the
+# next start, a recently ended trial that has questions but no summary.json is
+# scored again (resumable: only missing windows are judged). A marker makes it
+# one automatic retry per trial, so a trial the judge keeps failing on does not
+# cost judge calls on every cold start; the trial page's Score button remains.
+PENDING_SCORE_MAX_AGE_SEC = float(os.getenv("PENDING_SCORE_MAX_AGE_SEC", str(48 * 3600)))
+PENDING_SCORE_MARKER = ".score_resumed"
+
+
+def _trial_needs_resumed_score(directory: str, now: Optional[float] = None) -> bool:
+    session_log = os.path.join(directory, "session.jsonl")
+    if not os.path.isfile(session_log):
+        return False
+    if os.path.isfile(os.path.join(directory, "summary.json")):
+        return False
+    if os.path.exists(os.path.join(directory, PENDING_SCORE_MARKER)):
+        return False
+    age = (time.time() if now is None else now) - os.path.getmtime(session_log)
+    if age > PENDING_SCORE_MAX_AGE_SEC:
+        return False
+    closed = False
+    turns = 0
+    with open(session_log, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                kind = json.loads(line).get("t")
+            except ValueError:
+                continue
+            if kind == "session_end":
+                closed = True
+            elif kind == "speech_start":
+                turns += 1
+    return closed and turns > 0
+
+
+def _schedule_pending_trial_scores() -> None:
+    if not trial_recorder.enabled or not os.path.isdir(trial_recorder.root):
+        return
+    open_id = trial_recorder.status().get("session_id")
+    for name in os.listdir(trial_recorder.root):
+        directory = os.path.join(trial_recorder.root, name)
+        if (
+            os.path.isdir(directory)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,64}", name)
+            and name != open_id
+            and _trial_needs_resumed_score(directory)
+        ):
+            try:
+                with open(os.path.join(directory, PENDING_SCORE_MARKER), "w", encoding="utf-8") as handle:
+                    handle.write(datetime.now(timezone.utc).isoformat())
+            except OSError as exc:
+                print(f"[TRIAL-SCORE] resume skipped id={name}: {exc}", flush=True)
+                continue
+            print(f"[TRIAL-SCORE] resuming unscored trial id={name}", flush=True)
+            _schedule_trial_score(name, directory)
+
+
 trial_recorder = TrialRecorder(
     thermal_summarizer=_trial_thermal_summary,
     static_fields=_trial_static_fields,
@@ -5157,6 +5217,7 @@ async def startup_research_exporter():
 @app.on_event("startup")
 async def startup_trial_recorder():
     await trial_recorder.start()
+    _schedule_pending_trial_scores()
     _schedule_pending_trial_uploads()
 
 
